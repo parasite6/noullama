@@ -1,6 +1,7 @@
-use crate::runtime::{model_directory, AppState, DownloadState};
+use crate::runtime::{model_directory, AppState, DownloadState, Settings};
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     path::{Component, Path},
     process::Stdio,
     time::Duration,
@@ -53,43 +54,99 @@ fn parse_hf_progress(line: &str) -> Option<HfProgress> {
     })
 }
 
-async fn track_hf_progress(mut stderr: tokio::process::ChildStderr, state: AppState) {
+fn redact_diagnostic(line: &str, secrets: &[String]) -> String {
+    use std::sync::OnceLock;
+    static SENSITIVE: OnceLock<regex::Regex> = OnceLock::new();
+    static ANSI: OnceLock<regex::Regex> = OnceLock::new();
+    let mut line = line.to_owned();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        line = line.replace(secret, "[redacted]");
+    }
+    let line = ANSI
+        .get_or_init(|| regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap())
+        .replace_all(&line, "");
+    let line = SENSITIVE
+        .get_or_init(|| {
+            regex::Regex::new(r"(?i)https?://[^\s]+|bearer\s+[^\s]+|hf_[a-z0-9_]+").unwrap()
+        })
+        .replace_all(&line, "[redacted]");
+    line.chars()
+        .filter(|c| !c.is_control())
+        .take(512)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+async fn handle_hf_line(
+    line: &[u8],
+    state: &AppState,
+    secrets: &[String],
+    tail: &mut VecDeque<String>,
+) {
+    let line = String::from_utf8_lossy(line);
+    if let Some(progress) = parse_hf_progress(&line) {
+        let mut download = state.download.lock().await;
+        if let Some(percent) = progress.percent {
+            download.progress = Some(percent);
+        }
+        if let Some(bytes) = progress.completed {
+            download.downloaded_bytes = bytes.min(download.total_bytes.unwrap_or(u64::MAX));
+        }
+        if let Some(bytes) = progress.transferred {
+            download.transferred_bytes = bytes;
+        }
+        download.message = if download.progress.is_some_and(|p| p >= 100.0) {
+            "Finalizing downloaded file…".into()
+        } else {
+            "Downloading with Hugging Face…".into()
+        };
+    } else {
+        let line = redact_diagnostic(&line, secrets);
+        if !line.is_empty() {
+            if tail.len() == 12 {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+    }
+}
+
+async fn track_hf_progress(
+    mut stderr: tokio::process::ChildStderr,
+    state: AppState,
+    secrets: Vec<String>,
+) -> VecDeque<String> {
     let mut chunk = [0u8; 4096];
     let mut pending = Vec::new();
+    let mut tail = VecDeque::new();
+    let mut oversized = false;
     loop {
         let count = match stderr.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(count) => count,
         };
-        pending.extend_from_slice(&chunk[..count]);
-        while let Some(end) = pending
-            .iter()
-            .position(|byte| *byte == b'\r' || *byte == b'\n')
-        {
-            let line: Vec<_> = pending.drain(..=end).collect();
-            if let Some(progress) = parse_hf_progress(&String::from_utf8_lossy(&line)) {
-                let mut download = state.download.lock().await;
-                if let Some(percent) = progress.percent {
-                    download.progress = Some(percent);
+        for byte in &chunk[..count] {
+            if *byte == b'\r' || *byte == b'\n' {
+                if !oversized {
+                    handle_hf_line(&pending, &state, &secrets, &mut tail).await;
                 }
-                if let Some(bytes) = progress.completed {
-                    download.downloaded_bytes = bytes.min(download.total_bytes.unwrap_or(u64::MAX));
-                }
-                if let Some(bytes) = progress.transferred {
-                    download.transferred_bytes = bytes;
-                }
-                download.message = if download.progress.is_some_and(|p| p >= 100.0) {
-                    "Finalizing downloaded file…".into()
+                pending.clear();
+                oversized = false;
+            } else if !oversized {
+                if pending.len() == 16_384 {
+                    pending.clear();
+                    oversized = true;
                 } else {
-                    "Downloading with Hugging Face…".into()
-                };
+                    pending.push(*byte);
+                }
             }
         }
-        // Ignore unstructured stderr; never surface credential-bearing CLI URLs.
-        if pending.len() > 16_384 {
-            pending.clear();
-        }
     }
+    if !oversized && !pending.is_empty() {
+        handle_hf_line(&pending, &state, &secrets, &mut tail).await;
+    }
+    tail
 }
 
 pub fn decision_metadata(model: &Value) -> bool {
@@ -113,6 +170,7 @@ pub fn decision_metadata(model: &Value) -> bool {
 fn valid_repo(repo: &str) -> bool {
     let parts: Vec<_> = repo.split('/').collect();
     parts.len() == 2
+        && !repo.starts_with('-')
         && parts.iter().all(|p| {
             !p.is_empty()
                 && *p != "."
@@ -196,27 +254,103 @@ async fn list_local_models(state: &AppState) -> Result<Value, String> {
     let settings = state.settings.lock().await.clone();
     let base = model_directory(&settings, &state.data_dir);
     let original = state.data_dir.join("models");
-    tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        let mut pending = vec![(base, 0)];
-        if pending[0].0 != original { pending.push((original, 0)); }
-        while let Some((dir, depth)) = pending.pop() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.file_name().is_some_and(|s| s.to_string_lossy().starts_with('.')) { continue; }
-                    if let Ok(kind) = entry.file_type() {
-                        if kind.is_dir() && depth < 5 { pending.push((path, depth + 1)); }
-                        else if kind.is_file() && path.extension().is_some_and(|e| e == "gguf") {
-                            files.push(json!({"path": path, "name": entry.file_name().to_string_lossy(), "size": entry.metadata().ok().map(|m| m.len())}));
+    let mut roots = vec![(base.clone(), !settings.download_dir.trim().is_empty())];
+    if base != original {
+        roots.push((original, false));
+    }
+    tokio::task::spawn_blocking(move || scan_local_models(roots, 20_000, Duration::from_secs(2)))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn scan_local_models(
+    roots: Vec<(std::path::PathBuf, bool)>,
+    max_entries: usize,
+    budget: Duration,
+) -> Value {
+    let started = std::time::Instant::now();
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    let mut incomplete = false;
+    let mut count = 0;
+    let mut pending: Vec<_> = roots
+        .into_iter()
+        .map(|(path, required)| (path, 0, required))
+        .collect();
+    'scan: while let Some((dir, depth, required)) = pending.pop() {
+        if count >= max_entries || started.elapsed() >= budget {
+            incomplete = true;
+            warnings.push("Model scan reached its entry or time limit. Choose a smaller model directory to see all files.".into());
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                incomplete = true;
+                if warnings.len() < 8 {
+                    warnings.push(format!("Cannot scan {}: {error}", dir.display()));
+                }
+                continue;
+            }
+        };
+        for entry in entries {
+            if count >= max_entries || started.elapsed() >= budget {
+                incomplete = true;
+                warnings.push("Model scan reached its entry or time limit. Choose a smaller model directory to see all files.".into());
+                break 'scan;
+            }
+            count += 1;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    incomplete = true;
+                    if warnings.len() < 8 {
+                        warnings.push(format!(
+                            "Cannot read an entry in {}: {error}",
+                            dir.display()
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => {
+                    if depth < 5 {
+                        pending.push((path, depth + 1, true));
+                    } else {
+                        incomplete = true;
+                        if warnings.len() < 8 {
+                            warnings
+                                .push(format!("Scan depth limit reached at {}", path.display()));
                         }
                     }
                 }
+                Ok(kind)
+                    if kind.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("gguf")) =>
+                {
+                    files.push(json!({"path": path, "name": entry.file_name().to_string_lossy(), "size": entry.metadata().ok().map(|m| m.len())}));
+                }
+                Err(error) => {
+                    incomplete = true;
+                    if warnings.len() < 8 {
+                        warnings.push(format!("Cannot inspect {}: {error}", path.display()));
+                    }
+                }
+                _ => {}
             }
         }
-        files.sort_by_key(|f| f["path"].as_str().unwrap_or_default().to_owned());
-        Value::Array(files)
-    }).await.map_err(|e| e.to_string())
+    }
+    files.sort_by_key(|f| f["path"].as_str().unwrap_or_default().to_owned());
+    files.dedup_by(|a, b| a["path"] == b["path"]);
+    json!({"models": files, "warnings": warnings, "incomplete": incomplete})
 }
 
 #[tauri::command]
@@ -304,46 +438,85 @@ pub async fn download_model(
     filename: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    if !filename.ends_with(".gguf")
-        || Path::new(&filename)
+    begin_download(state.inner(), repo, filename).await
+}
+
+fn valid_filename(filename: &str) -> bool {
+    filename.ends_with(".gguf")
+        && !filename.starts_with('-')
+        && Path::new(filename)
             .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
-    {
-        return Err("Choose a relative GGUF filename from the repository.".into());
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
+fn download_revision(model: &Value) -> Result<&str, String> {
+    model["sha"]
+        .as_str()
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| "Hub returned an invalid commit revision".into())
+}
+
+async fn begin_download(state: &AppState, repo: String, filename: String) -> Result<(), String> {
+    if !valid_repo(&repo) || !valid_filename(&filename) {
+        return Err("Choose a relative GGUF filename (not starting with '-') from an owner/model repository.".into());
     }
-    let mut download = state.download.lock().await;
-    if download.active {
-        return Err("A model download is already in progress.".into());
+    let settings = {
+        let _guard = state.lifecycle.lock().await;
+        let mut download = state.download.lock().await;
+        if download.active {
+            return Err("A model download is already in progress.".into());
+        }
+        *download = DownloadState {
+            active: true,
+            repo: repo.clone(),
+            file: filename.clone(),
+            message: "Checking repository access and preparing download…".into(),
+            ..Default::default()
+        };
+        state.settings.lock().await.clone()
+    };
+    if let Err(error) = prepare_download(state, &settings, &repo, &filename).await {
+        let mut download = state.download.lock().await;
+        download.active = false;
+        download.error = Some(error.clone());
+        download.message = "Download could not start.".into();
+        return Err(error);
     }
-    let model = metadata(&state, &repo).await?;
+    Ok(())
+}
+
+async fn prepare_download(
+    state: &AppState,
+    settings: &Settings,
+    repo: &str,
+    filename: &str,
+) -> Result<(), String> {
+    let model = metadata(state, repo).await?;
     if !model["siblings"]
         .as_array()
         .is_some_and(|a| a.iter().any(|f| f["rfilename"] == filename))
     {
         return Err("This file is not present in the selected repository.".into());
     }
-    let revision = model["sha"]
-        .as_str()
-        .ok_or("Hub did not return a revision")?
-        .to_owned();
-    let directory = model_directory(&*state.settings.lock().await, &state.data_dir)
-        .join(repo.replace('/', "--"));
+    let revision = download_revision(&model)?;
+    let directory = model_directory(settings, &state.data_dir).join(repo.replace('/', "--"));
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|e| e.to_string())?;
     let destination = directory.join(&filename).to_string_lossy().into_owned();
-    let mut command = Command::new(state.settings.lock().await.hf_path.clone());
+    let mut command = Command::new(&settings.hf_path);
     command
         .args([
             "download",
-            &repo,
-            &filename,
+            repo,
+            filename,
             "--revision",
-            &revision,
+            revision,
             "--local-dir",
         ])
         .arg(&directory);
-    if let Some(token) = hf_token(&state).await {
+    let token = hf_token(state).await;
+    if let Some(token) = &token {
         command.env("HF_TOKEN", token);
     }
     command
@@ -351,56 +524,74 @@ pub async fn download_model(
         .env("TQDM_POSITION", "-1")
         .env("TQDM_MININTERVAL", "0.2");
     let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().map_err(|e| format!("Cannot start hf: {e}. Install the Hugging Face CLI or configure its executable path."))?;
-    *download = DownloadState {
-        active: true,
-        repo: repo.clone(),
-        file: filename.clone(),
-        message: "Downloading with hf; resumable files are kept on disk…".into(),
-        total_bytes: model["siblings"]
+    {
+        let mut download = state.download.lock().await;
+        download.message = "Downloading with hf; resumable files are kept on disk…".into();
+        download.total_bytes = model["siblings"]
             .as_array()
             .and_then(|files| files.iter().find(|file| file["rfilename"] == filename))
-            .and_then(|file| file["size"].as_u64()),
-        ..Default::default()
-    };
-    drop(download);
+            .and_then(|file| file["size"].as_u64());
+    }
     state
         .log(format!(
             "Downloading {repo}/{filename} at {}",
-            &revision[..revision.len().min(12)]
+            revision.chars().take(12).collect::<String>()
         ))
         .await;
-    let state = state.inner().clone();
+    let state = state.clone();
+    let repo = repo.to_owned();
+    let filename = filename.to_owned();
     tokio::spawn(async move {
         let stderr = child.stderr.take();
         let progress_state = state.clone();
         let reader = tokio::spawn(async move {
             if let Some(stderr) = stderr {
-                track_hf_progress(stderr, progress_state).await;
+                track_hf_progress(stderr, progress_state, token.into_iter().collect()).await
+            } else {
+                VecDeque::new()
             }
         });
         let result = child.wait().await;
-        let _ = reader.await;
-        let success = result.is_ok_and(|s| s.success()) && Path::new(&destination).is_file();
+        let diagnostics = reader
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let size = tokio::fs::metadata(&destination)
+            .await
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        let success = result.as_ref().is_ok_and(|s| s.success()) && size.is_some();
         let mut download = state.download.lock().await;
         download.active = false;
         if success {
-            let size = tokio::fs::metadata(&destination)
-                .await
-                .ok()
-                .map(|metadata| metadata.len());
             download.downloaded_bytes = size.unwrap_or(download.downloaded_bytes);
             download.total_bytes = size.or(download.total_bytes);
             download.progress = Some(100.0);
             download.path = Some(destination);
             download.message = "Download complete. Ready to load.".into();
-            state.log(format!("Download complete: {filename}")).await;
         } else {
-            download.error = Some("hf download failed. Check your connection, disk space, and repository access; retry resumes the download.".into());
+            let status = match result {
+                Ok(status) => status.to_string(),
+                Err(error) => error.to_string(),
+            };
+            download.error = Some(if diagnostics.is_empty() {
+                format!("hf download failed ({status}). Check connection, disk space, and repository access; retry resumes the download.")
+            } else {
+                format!("hf download failed ({status}):\n{diagnostics}")
+            });
             download.message = "Download failed; partial files were preserved.".into();
-            state
-                .log(format!("Download failed: {repo}/{filename}"))
-                .await;
         }
+        drop(download);
+        state
+            .log(if success {
+                format!("Download complete: {filename}")
+            } else {
+                format!("Download failed: {repo}/{filename}\n{diagnostics}")
+            })
+            .await;
     });
     Ok(())
 }
@@ -408,6 +599,159 @@ pub async fn download_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_hub_revisions_return_errors_without_utf8_slicing() {
+        for sha in [
+            "",
+            "main",
+            "aaaaaaaaaaaéaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "----------------------------------------",
+        ] {
+            assert!(download_revision(&json!({"sha":sha})).is_err());
+        }
+        assert!(download_revision(&json!({})).is_err());
+        assert_eq!(
+            download_revision(&json!({"sha":"0123456789abcdef0123456789abcdef01234567"})).unwrap(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+    #[test]
+    fn option_like_and_escaping_download_paths_are_rejected() {
+        for name in [
+            "--revision=main.gguf",
+            "../weights.gguf",
+            "/tmp/weights.gguf",
+            "folder/../../weights.gguf",
+        ] {
+            assert!(!valid_filename(name), "{name}");
+        }
+        assert!(valid_filename("weights.gguf"));
+        assert!(valid_filename("folder/weights.gguf"));
+        assert!(!valid_repo("--help/model"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_keep_a_bounded_redacted_tail_and_final_unterminated_line() {
+        let base =
+            std::env::temp_dir().join(format!("noullama-diagnostics-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let mut child = Command::new("sh").args(["-c", "i=0; while [ $i -lt 20 ]; do printf 'old diagnostic %s\\n' $i >&2; i=$((i+1)); done; printf 'Disk full: custom-secret hf_fakeToken Bearer other-secret https://example.com/file?token=private' >&2"])
+            .stderr(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let tail = track_hf_progress(
+            child.stderr.take().unwrap(),
+            state,
+            vec!["custom-secret".into()],
+        )
+        .await;
+        child.wait().await.unwrap();
+        assert_eq!(tail.len(), 12);
+        let final_line = tail.back().unwrap();
+        assert!(final_line.contains("Disk full"));
+        for secret in [
+            "custom-secret",
+            "hf_fakeToken",
+            "other-secret",
+            "https://",
+            "private",
+        ] {
+            assert!(!final_line.contains(secret), "{secret}");
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn discovery_preserves_variants_and_reports_limits_and_missing_custom_roots() {
+        let base = std::env::temp_dir().join(format!("noullama-scan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        for name in ["Q4.gguf", "Q8.gguf", "mmproj.gguf"] {
+            std::fs::write(base.join(name), "weights").unwrap();
+        }
+        let scan = scan_local_models(vec![(base.clone(), true)], 100, Duration::from_secs(2));
+        assert_eq!(scan["models"].as_array().unwrap().len(), 3);
+        assert_eq!(scan["incomplete"], false);
+        let limited = scan_local_models(vec![(base.clone(), true)], 1, Duration::from_secs(2));
+        assert_eq!(limited["models"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["incomplete"], true);
+        assert!(!limited["warnings"].as_array().unwrap().is_empty());
+        let missing = scan_local_models(
+            vec![(base.join("unmounted"), true)],
+            100,
+            Duration::from_secs(2),
+        );
+        assert_eq!(missing["incomplete"], true);
+        assert!(!missing["warnings"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_metadata_does_not_block_snapshots_or_settings_and_reserves_one_download() {
+        use tokio::io::AsyncWriteExt;
+        let base =
+            std::env::temp_dir().join(format!("noullama-download-lock-{}", uuid::Uuid::new_v4()));
+        let mut state = AppState::new(base.clone()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        state.client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::https(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        *state.token.lock().await = Some("fake-test-token".into());
+        let worker_state = state.clone();
+        let worker = tokio::spawn(async move {
+            begin_download(
+                &worker_state,
+                "LiquidAI/d1-2B-GGUF".into(),
+                "model.gguf".into(),
+            )
+            .await
+        });
+        let (mut connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = tokio::time::timeout(
+            Duration::from_millis(500),
+            crate::runtime::state_snapshot(&state),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot["download"]["active"], true);
+        let mut settings = state.settings.lock().await.clone();
+        settings.hf_path = "/custom/hf".into();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            crate::runtime::persist_settings(&state, settings.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        settings.download_dir = base.join("different").to_string_lossy().into_owned();
+        assert!(crate::runtime::persist_settings(&state, settings)
+            .await
+            .is_err());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(500),
+            begin_download(&state, "LiquidAI/d1-2B-GGUF".into(), "second.gguf".into())
+        )
+        .await
+        .unwrap()
+        .is_err());
+        connection
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        drop(connection);
+        assert!(tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(!state.download.lock().await.active);
+        std::fs::remove_dir_all(base).unwrap();
+    }
     #[test]
     fn hf_progress_tracks_reconstruction_and_network_bytes_separately() {
         let progress =
@@ -431,7 +775,7 @@ mod tests {
         // Exercise the actual stderr framing path, not a file-size approximation.
         let mut child = Command::new("sh").args(["-c", "printf 'model: downloading bytes: | 12.3MB, 2MB/s\\rmodel: reconstructing file: 40%%|#### | 67.8MB / 168MB\\n' >&2"])
             .stderr(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
-        track_hf_progress(child.stderr.take().unwrap(), state.clone()).await;
+        track_hf_progress(child.stderr.take().unwrap(), state.clone(), Vec::new()).await;
         child.wait().await.unwrap();
         let download = state.download.lock().await.clone();
         assert_eq!(download.progress, Some(40.0));
@@ -467,7 +811,7 @@ mod tests {
         state.settings.lock().await.download_dir =
             base.join("custom directory").to_string_lossy().into_owned();
         let files = list_local_models(&state).await.unwrap();
-        assert_eq!(files.as_array().unwrap().len(), 2);
+        assert_eq!(files["models"].as_array().unwrap().len(), 2);
         assert!(original.join("model.gguf").exists());
         std::fs::remove_dir_all(base).unwrap();
     }

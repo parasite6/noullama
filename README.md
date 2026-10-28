@@ -77,6 +77,8 @@ Enter a name beneath the questions editor and choose **Save custom** to save the
 
 While the app is open, the gateway listens on `http://127.0.0.1:11435` by default. The managed llama-server uses port `11436`. Both bind to localhost; changing the gateway port requires an app restart.
 
+Local SDK and curl clients use the gateway without an API key. The gateway accepts requests addressed to `127.0.0.1` or `localhost` on its configured port and rejects foreign browser origins. The private llama-server uses a temporary key generated for each model load; connect integrations to the gateway rather than the private port.
+
 Native System One request:
 
 ```sh

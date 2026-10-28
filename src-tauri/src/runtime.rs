@@ -52,6 +52,8 @@ pub struct AppState {
     pub settings: Arc<Mutex<Settings>>,
     pub child: Arc<Mutex<Option<Child>>>,
     pub lifecycle: Arc<Mutex<()>>,
+    pub session: Arc<Mutex<Option<Arc<RuntimeSession>>>>,
+    pub startup_warning: Option<String>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
     pub token: Arc<Mutex<Option<String>>>,
     pub download: Arc<Mutex<DownloadState>>,
@@ -63,6 +65,56 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub api_port: u16,
     pub client: reqwest::Client,
+}
+
+// A launch owns its credentials until all its requests and polling tasks finish.
+// Never serialize or log this structure.
+pub struct RuntimeSession {
+    alias: String,
+    key: String,
+    key_path: PathBuf,
+    port: u16,
+    cancel: tokio::sync::Notify,
+}
+
+impl Drop for RuntimeSession {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.key_path);
+    }
+}
+
+impl RuntimeSession {
+    fn new(data_dir: &Path, port: u16) -> Result<Arc<Self>, String> {
+        use std::io::Write;
+        let alias = format!("noullama-{}", uuid::Uuid::new_v4());
+        let key_path = data_dir.join(format!("runtime-{}.key", uuid::Uuid::new_v4()));
+        let key = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&key_path)
+            .map_err(|e| format!("Cannot create runtime credentials: {e}"))?;
+        if let Err(error) = writeln!(file, "{key}") {
+            let _ = std::fs::remove_file(&key_path);
+            return Err(format!("Cannot write runtime credentials: {error}"));
+        }
+        Ok(Arc::new(Self {
+            alias,
+            key,
+            key_path,
+            port,
+            cancel: tokio::sync::Notify::new(),
+        }))
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -89,16 +141,35 @@ impl AppState {
     pub fn new(data_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&data_dir)?;
         let settings_path = data_dir.join("settings.json");
-        let settings: Settings = if settings_path.exists() {
-            serde_json::from_slice(&std::fs::read(settings_path)?)?
-        } else {
-            Settings::default()
+        let (settings, startup_warning) = match std::fs::read(&settings_path) {
+            Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
+                Ok(settings) => (settings, None),
+                Err(error) => {
+                    use std::io::Write;
+                    let backup =
+                        data_dir.join(format!("settings-{}.json.bak", uuid::Uuid::new_v4()));
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&backup)?;
+                    file.write_all(&bytes)?;
+                    (Settings::default(), Some(format!("Settings could not be read ({error}). Using defaults. Your original settings were preserved at {}.", backup.display())))
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Settings::default(), None)
+            }
+            Err(error) => {
+                return Err(format!("Cannot read {}: {error}", settings_path.display()).into())
+            }
         };
         Ok(Self {
             api_port: settings.api_port,
             settings: Arc::new(Mutex::new(settings)),
             child: Default::default(),
             lifecycle: Default::default(),
+            session: Default::default(),
+            startup_warning,
             logs: Default::default(),
             token: Default::default(),
             download: Default::default(),
@@ -124,6 +195,13 @@ impl AppState {
         logs.push_back(line);
     }
     pub async fn shutdown(&self) {
+        let _guard = self.lifecycle.lock().await;
+        self.shutdown_locked().await;
+    }
+    async fn shutdown_locked(&self) {
+        if let Some(session) = self.session.lock().await.take() {
+            session.cancel.notify_one();
+        }
         *self.ready.lock().await = false;
         if let Some(mut child) = self.child.lock().await.take() {
             let _ = child.kill().await;
@@ -131,22 +209,33 @@ impl AppState {
         }
         *self.loaded_model.lock().await = None;
     }
-    pub async fn infer(&self, payload: Value) -> Result<Value, String> {
+    pub async fn infer(&self, mut payload: Value) -> Result<Value, String> {
         validate_request(&payload)?;
         if !*self.ready.lock().await {
             return Err("Load a decision model before running inference.".into());
         }
-        let port = self.settings.lock().await.runtime_port;
+        let session = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .ok_or("The runtime has stopped.")?;
+        payload["model"] = json!(session.alias);
         let response = self
             .local_client
-            .post(format!("http://127.0.0.1:{port}/v1/systemone"))
+            .post(format!("http://127.0.0.1:{}/v1/systemone", session.port))
+            .bearer_auth(&session.key)
             .json(&payload)
             .send()
             .await
             .map_err(|e| format!("Runtime connection failed: {e}"))?;
         let status = response.status();
-        let body = response.text().await.map_err(|e| e.to_string())?;
-        let value: Value = serde_json::from_str(&body).map_err(|_| {
+        let body = response
+            .text()
+            .await
+            .map_err(|e| e.to_string())?
+            .replace(&session.key, "[redacted]");
+        let mut value: Value = serde_json::from_str(&body).map_err(|_| {
             format!(
                 "Runtime returned non-JSON ({status}): {}",
                 body.chars().take(500).collect::<String>()
@@ -154,6 +243,9 @@ impl AppState {
         })?;
         if !status.is_success() {
             return Err(format!("Runtime {status}: {value}"));
+        }
+        if let Some(model) = value.get_mut("model") {
+            *model = json!("noullama");
         }
         Ok(value)
     }
@@ -285,16 +377,24 @@ fn runtime_settings_changed(a: &Settings, b: &Settings) -> bool {
 
 #[tauri::command]
 pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    state_snapshot(state.inner()).await
+}
+
+pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
+    let _guard = state.lifecycle.lock().await;
     let mut child = state.child.lock().await;
     let running = if let Some(c) = child.as_mut() {
         c.try_wait().map_err(|e| e.to_string())?.is_none()
     } else {
-        false
+        state.session.lock().await.is_some()
     };
     if !running {
         *child = None;
         *state.ready.lock().await = false;
         *state.loaded_model.lock().await = None;
+        if let Some(session) = state.session.lock().await.take() {
+            session.cancel.notify_one();
+        }
     }
     drop(child);
     let settings = state.settings.lock().await.clone();
@@ -307,7 +407,7 @@ pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Value, String
         json!({"settings": settings, "running": running, "ready": ready,
         "logs": logs, "download": download, "loaded_model":loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
-        "api_port": state.api_port, "api_error": api_error, "data_dir": state.data_dir}),
+        "api_port": state.api_port, "api_error": api_error, "startup_warning": state.startup_warning, "data_dir": state.data_dir}),
     )
 }
 
@@ -321,7 +421,7 @@ pub async fn save_settings(
 
 pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<(), String> {
     let _guard = state.lifecycle.lock().await;
-    if state.child.lock().await.is_some()
+    if state.session.lock().await.is_some()
         && runtime_settings_changed(&*state.settings.lock().await, &settings)
     {
         return Err("Stop the runtime before changing its configuration.".into());
@@ -407,7 +507,7 @@ pub async fn start_runtime(state: tauri::State<'_, AppState>) -> Result<(), Stri
 
 pub async fn load_model(state: &AppState) -> Result<(), String> {
     let _guard = state.lifecycle.lock().await;
-    if state.child.lock().await.is_some() {
+    if state.session.lock().await.is_some() || state.child.lock().await.is_some() {
         return Err("Runtime is already started. Stop it before loading another model.".into());
     }
     let settings = state.settings.lock().await.clone();
@@ -419,19 +519,95 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
     if !settings.mmproj_path.is_empty() && !Path::new(&settings.mmproj_path).is_file() {
         return Err("The multimodal projector path does not exist.".into());
     }
-    // Never attach to or kill an unrelated process already using this port.
-    let reservation =
-        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, settings.runtime_port))
-            .await
-            .map_err(|e| format!("Private runtime port is unavailable: {e}"))?;
-    let binary = server_binary(&settings.runtime_path);
+    let session = RuntimeSession::new(&state.data_dir, settings.runtime_port)?;
+    *state.session.lock().await = Some(session.clone());
+    *state.ready.lock().await = false;
+    state
+        .log("Loading model; checking the runtime and waiting for readiness…".into())
+        .await;
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(90), prepare_and_poll(&state, &settings, &session)) => result,
+            _ = session.cancel.notified() => return,
+        };
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error,
+            Err(_) => "Model loading timed out after 90 seconds.".into(),
+        };
+        let _guard = state.lifecycle.lock().await;
+        if is_current_session(&state, &session).await {
+            state.log(error.replace(&session.key, "[redacted]")).await;
+            state.shutdown_locked().await;
+        }
+    });
+    Ok(())
+}
+
+async fn is_current_session(state: &AppState, session: &RuntimeSession) -> bool {
+    state
+        .session
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|current| current.alias == session.alias)
+}
+
+fn runtime_args(settings: &Settings, session: &RuntimeSession) -> Vec<String> {
+    let mut args = vec![
+        "--model".into(),
+        settings.model_path.clone(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        session.port.to_string(),
+        "--alias".into(),
+        session.alias.clone(),
+        "--api-key-file".into(),
+        session.key_path.to_string_lossy().into_owned(),
+        "--ctx-size".into(),
+        settings.context_size.to_string(),
+        "--batch-size".into(),
+        settings.context_size.min(2048).to_string(),
+        "--ubatch-size".into(),
+        settings.context_size.min(512).to_string(),
+        "--n-gpu-layers".into(),
+        settings.gpu_layers.to_string(),
+        "--parallel".into(),
+        "1".into(),
+    ];
+    if !settings.mmproj_path.is_empty() {
+        args.extend(["--mmproj".into(), settings.mmproj_path.clone()]);
+    }
+    args
+}
+
+async fn prepare_and_poll(
+    state: &AppState,
+    settings: &Settings,
+    session: &Arc<RuntimeSession>,
+) -> Result<(), String> {
+    // Keep the port reserved during preflight, then verify the launch's random
+    // alias over an authenticated endpoint before ever accepting inference.
+    let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))
+        .await
+        .map_err(|e| format!("Private runtime port is unavailable: {e}"))?;
     let devices = tokio::time::timeout(
         Duration::from_secs(15),
-        runtime_command(&settings).arg("--list-devices").output(),
+        runtime_command(settings)
+            .kill_on_drop(true)
+            .arg("--list-devices")
+            .output(),
     )
     .await
     .map_err(|_| "GPU detection timed out")?
     .map_err(|e| format!("Cannot detect runtime devices: {e}"))?;
+    if !devices.status.success() {
+        return Err(
+            "Runtime device detection failed. Check the runtime path and shared libraries.".into(),
+        );
+    }
     let devices = format!(
         "{}{}",
         String::from_utf8_lossy(&devices.stdout),
@@ -440,11 +616,9 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
     let gpu = devices
         .lines()
         .find(|line| {
-            line.trim_start().starts_with("CUDA")
-                || line.trim_start().starts_with("Vulkan")
-                || line.trim_start().starts_with("Metal")
-                || line.trim_start().starts_with("ROCm")
-                || line.trim_start().starts_with("SYCL")
+            ["CUDA", "Vulkan", "Metal", "ROCm", "SYCL"]
+                .iter()
+                .any(|prefix| line.trim_start().starts_with(prefix))
         })
         .map(|line| {
             line.trim()
@@ -461,138 +635,124 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
     } else {
         gpu.unwrap_or_default()
     };
-    let mut command = runtime_command(&settings);
-    command.args([
-        "--model",
-        &settings.model_path,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &settings.runtime_port.to_string(),
-        "--alias",
-        "noullama",
-        "--ctx-size",
-        &settings.context_size.to_string(),
-        "--batch-size",
-        &settings.context_size.to_string(),
-        "--ubatch-size",
-        &settings.context_size.to_string(),
-        "--n-gpu-layers",
-        &settings.gpu_layers.to_string(),
-        "--parallel",
-        "1",
-    ]);
-    if !settings.mmproj_path.is_empty() {
-        command.args(["--mmproj", &settings.mmproj_path]);
-    }
-    drop(reservation);
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("Could not start {}: {e}", binary.display()))?;
-    for pipe in [
-        child
-            .stdout
-            .take()
-            .map(|p| Box::pin(p) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
-        child
-            .stderr
-            .take()
-            .map(|p| Box::pin(p) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
-    ]
-    .into_iter()
-    .flatten()
     {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                state.log(line).await;
-            }
-        });
-    }
-    *state.child.lock().await = Some(child);
-    *state.loaded_model.lock().await = Some(LoadedModel {
-        path: settings.model_path.clone(),
-        device: device.clone(),
-    });
-    state
-        .log(format!("Loading {} on {device}", settings.model_path))
-        .await;
-    state
-        .log("Loading model; waiting for the runtime health check…".into())
-        .await;
-    let state = state.clone();
-    tokio::spawn(async move {
-        // Serialize startup against Stop and configuration changes.
         let _guard = state.lifecycle.lock().await;
-        for _ in 0..180 {
-            let mut child = state.child.lock().await;
-            match child.as_mut().map(|c| c.try_wait()) {
-                Some(Ok(None)) => {}
-                _ => {
-                    *child = None;
-                    *state.loaded_model.lock().await = None;
-                    state.log("Runtime exited during startup. Check the log for model/runtime compatibility.".into()).await;
-                    return;
+        if !is_current_session(state, session).await {
+            return Ok(());
+        }
+        drop(reservation);
+        let mut child = runtime_command(settings)
+            .args(runtime_args(settings, session))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "Could not start {}: {e}",
+                    server_binary(&settings.runtime_path).display()
+                )
+            })?;
+        for pipe in [
+            child
+                .stdout
+                .take()
+                .map(|p| Box::pin(p) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
+            child
+                .stderr
+                .take()
+                .map(|p| Box::pin(p) as std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let state = state.clone();
+            let key = session.key.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(pipe).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    state.log(line.replace(&key, "[redacted]")).await;
                 }
+            });
+        }
+        *state.child.lock().await = Some(child);
+        *state.loaded_model.lock().await = Some(LoadedModel {
+            path: settings.model_path.clone(),
+            device: device.clone(),
+        });
+        state
+            .log(format!("Loading {} on {device}", settings.model_path))
+            .await;
+    }
+    loop {
+        {
+            let _guard = state.lifecycle.lock().await;
+            if !is_current_session(state, session).await {
+                return Ok(());
             }
-            drop(child);
-            let url = format!("http://127.0.0.1:{}", settings.runtime_port);
-            if state
-                .local_client
-                .get(format!("{url}/health"))
-                .timeout(Duration::from_secs(1))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
-                let models = state
-                    .local_client
-                    .get(format!("{url}/v1/models"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await;
-                let decision = match models {
-                    Ok(r) => r.json::<Value>().await.ok().is_some_and(|v| {
-                        v["data"].as_array().is_some_and(|m| {
-                            m.iter().any(|m| {
-                                m["architecture"]["output_modalities"]
-                                    .as_array()
-                                    .is_some_and(|a| a.iter().any(|x| x == "decisions"))
-                            })
-                        })
-                    }),
-                    Err(_) => false,
-                };
+            let mut child = state.child.lock().await;
+            if !matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(None))) {
+                return Err(
+                    "Runtime exited during startup. Check the log for model/runtime compatibility."
+                        .into(),
+                );
+            }
+        }
+        // /health may be public in llama.cpp. Only the authenticated model
+        // listing and the unpredictable per-launch alias establish readiness.
+        let models = state
+            .local_client
+            .get(format!("http://127.0.0.1:{}/v1/models", session.port))
+            .bearer_auth(&session.key)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await;
+        if let Ok(response) = models {
+            if response.status().is_success() {
+                let models = response
+                    .json::<Value>()
+                    .await
+                    .map_err(|_| "Runtime returned an invalid model listing")?;
+                if !models["data"]
+                    .as_array()
+                    .is_some_and(|models| models.iter().any(|model| model["id"] == session.alias))
+                {
+                    return Err(
+                        "Runtime identity did not match this launch; refusing to connect.".into(),
+                    );
+                }
+                let decision = models["data"].as_array().is_some_and(|models| {
+                    models.iter().any(|model| {
+                        model["id"] == session.alias
+                            && model["architecture"]["output_modalities"]
+                                .as_array()
+                                .is_some_and(|a| a.iter().any(|x| x == "decisions"))
+                    })
+                });
                 if !decision {
-                    state.log("Runtime did not advertise native decision support. Use a decision GGUF and a compatible llama.cpp build (b11954 for d1-2B).".into()).await;
-                    state.shutdown().await;
-                    return;
+                    return Err("Runtime did not advertise native decision support. Use a decision GGUF and a compatible llama.cpp build.".into());
+                }
+                let _guard = state.lifecycle.lock().await;
+                if !is_current_session(state, session).await {
+                    return Ok(());
+                }
+                let mut child = state.child.lock().await;
+                if !matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(None))) {
+                    return Err("Runtime exited before becoming ready.".into());
                 }
                 *state.ready.lock().await = true;
                 state
                     .log("Decision model is ready. Local API is accepting requests.".into())
                     .await;
-                return;
+                return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        state
-            .log("Model loading timed out after 90 seconds.".into())
-            .await;
-        state.shutdown().await;
-    });
-    Ok(())
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 #[tauri::command]
 pub async fn stop_runtime(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    // Startup may be in progress; kill the owned child first so its polling exits.
-    state.shutdown().await;
-    let _guard = state.lifecycle.lock().await;
     state.shutdown().await;
     state.log("Runtime stopped; model unloaded.".into()).await;
     Ok(())
@@ -606,6 +766,182 @@ pub async fn decide(payload: Value, state: tauri::State<'_, AppState>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_credentials_are_private_temporary_and_absent_from_snapshots() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("noullama-key-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let session = RuntimeSession::new(&base, 18439).unwrap();
+        let key_path = session.key_path.clone();
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap().trim(),
+            session.key
+        );
+        *state.session.lock().await = Some(session.clone());
+        let snapshot = state_snapshot(&state).await.unwrap().to_string();
+        assert!(!snapshot.contains(&session.key));
+        let args = runtime_args(&Settings::default(), &session);
+        assert!(!args.iter().any(|arg| arg.contains(&session.key)));
+        state.shutdown().await;
+        drop(session);
+        assert!(!key_path.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[cfg(unix)]
+    fn fake_runtime(base: &Path, name: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = base.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_cancels_preflight_without_blocking_settings_or_a_replacement_launch() {
+        let base = std::env::temp_dir().join(format!("noullama-cancel-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let runtime = fake_runtime(&base, "slow-runtime", "#!/bin/sh\nexec sleep 60\n");
+        let model = base.join("model.gguf");
+        std::fs::write(&model, "test").unwrap();
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = runtime.to_string_lossy().into_owned();
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.runtime_port = port;
+            settings.gpu_layers = 0;
+        }
+        load_model(&state).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let snapshot = tokio::time::timeout(Duration::from_millis(500), state_snapshot(&state))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot["running"], true);
+        let old = state.session.lock().await.clone().unwrap();
+        let mut settings = state.settings.lock().await.clone();
+        settings.download_dir = base.join("downloads").to_string_lossy().into_owned();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            persist_settings(&state, settings),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(500), state.shutdown())
+            .await
+            .unwrap();
+        assert!(!is_current_session(&state, &old).await);
+        drop(old);
+        load_model(&state).await.unwrap();
+        let replacement = state.session.lock().await.clone().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(is_current_session(&state, &replacement).await);
+        assert!(state.child.lock().await.is_none());
+        state.shutdown().await;
+        drop(replacement);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(!std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|e| e == "key")));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrelated_listener_cannot_satisfy_runtime_readiness() {
+        let base = std::env::temp_dir().join(format!("noullama-identity-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let runtime = fake_runtime(
+            &base,
+            "idle-runtime",
+            "#!/bin/sh\nif [ \"$1\" = \"--list-devices\" ]; then exit 0; fi\nexec sleep 60\n",
+        );
+        let model = base.join("model.gguf");
+        std::fs::write(&model, "test").unwrap();
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = runtime.to_string_lossy().into_owned();
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.runtime_port = port;
+            settings.gpu_layers = 0;
+        }
+        load_model(&state).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.child.lock().await.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let app = axum::Router::new().route("/v1/models", axum::routing::get(|| async {
+            axum::Json(json!({"data":[{"id":"noullama", "architecture":{"output_modalities":["decisions"]}}]}))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.session.lock().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!*state.ready.lock().await);
+        assert!(state.child.lock().await.is_none());
+        assert!(state
+            .logs
+            .lock()
+            .await
+            .iter()
+            .any(|line| line.contains("identity did not match")));
+        server.abort();
+        let _ = server.await;
+        state.shutdown().await;
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn malformed_settings_are_preserved_and_defaults_recover() {
+        for contents in [r#"{"context_size":"8192"}"#, r#"{"model_path":"truncated"#] {
+            let base =
+                std::env::temp_dir().join(format!("noullama-recovery-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&base).unwrap();
+            std::fs::write(base.join("settings.json"), contents).unwrap();
+            let state =
+                AppState::new(base.clone()).expect("Malformed settings must not prevent startup");
+            assert_eq!(state.settings.try_lock().unwrap().context_size, 8192);
+            let backups: Vec<_> = std::fs::read_dir(&base)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(backups[0].path()).unwrap(),
+                contents
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
     #[test]
     fn old_settings_keep_default_downloads_and_allow_custom_roots() {
         let settings: Settings = serde_json::from_value(json!({"gpu_layers":0})).unwrap();

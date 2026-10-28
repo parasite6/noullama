@@ -1,7 +1,8 @@
 use crate::runtime::{validate_request, AppState};
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -23,7 +24,35 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/systemone", post(systemone))
         .route("/v1/chat/completions", post(chat))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(state.clone(), loopback_only))
         .with_state(state)
+}
+
+async fn loopback_only(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let hosts = [
+        format!("127.0.0.1:{}", state.api_port),
+        format!("localhost:{}", state.api_port),
+    ];
+    let headers = request.headers();
+    let host_valid = headers.get_all("host").iter().count() == 1
+        && headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| hosts.iter().any(|allowed| h.eq_ignore_ascii_case(allowed)));
+    let origin_valid = !headers.contains_key("origin")
+        || (headers.get_all("origin").iter().count() == 1
+            && headers
+                .get("origin")
+                .and_then(|h| h.to_str().ok())
+                .is_some_and(|origin| hosts.iter().any(|host| origin == format!("http://{host}"))));
+    if !host_valid || !origin_valid {
+        return ApiError(
+            StatusCode::FORBIDDEN,
+            "Only requests addressed to the local API from a local origin are allowed.".into(),
+        )
+        .into_response();
+    }
+    next.run(request).await
 }
 
 pub async fn serve(state: AppState) -> Result<(), std::io::Error> {
@@ -135,6 +164,45 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn gateway_rejects_foreign_hosts_and_browser_origins() {
+        let path = std::env::temp_dir().join(format!("noullama-origin-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let app = router(state);
+        for (host, origin, expected) in [
+            ("127.0.0.1:11435", None, StatusCode::OK),
+            ("localhost:11435", None, StatusCode::OK),
+            ("attacker.example:11435", None, StatusCode::FORBIDDEN),
+            (
+                "127.0.0.1:11435",
+                Some("https://evil.example"),
+                StatusCode::FORBIDDEN,
+            ),
+            ("127.0.0.1:11435", Some("null"), StatusCode::FORBIDDEN),
+            (
+                "127.0.0.1:11435",
+                Some("http://localhost:11435"),
+                StatusCode::OK,
+            ),
+            ("127.0.0.1:11436", None, StatusCode::FORBIDDEN),
+        ] {
+            let mut request = Request::builder().uri("/health").header("host", host);
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "host={host}, origin={origin:?}"
+            );
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
     fn request() -> Value {
         json!({"state":"charged twice", "questions":{"route":{"type":"choice","instructions":"Which team?", "criteria":{"billing":null,"technical":null}}}})
     }
@@ -167,6 +235,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/v1/models")
+                    .header("host", "127.0.0.1:11435")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -180,6 +249,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/systemone")
+                    .header("host", "127.0.0.1:11435")
                     .header("content-type", "application/json")
                     .body(Body::from(request().to_string()))
                     .unwrap(),
@@ -207,6 +277,10 @@ mod tests {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
+            settings.context_size = std::env::var("NOULLAMA_TEST_CONTEXT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8192);
             settings.runtime_port = 18437;
         }
         crate::runtime::load_model(&state).await.unwrap();
@@ -214,7 +288,7 @@ mod tests {
             if *state.ready.lock().await {
                 break;
             }
-            if state.child.lock().await.is_none() {
+            if state.session.lock().await.is_none() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -224,6 +298,15 @@ mod tests {
             state.shutdown().await;
             panic!("Model failed to start: {logs:#?}");
         }
+        let private_port = state.settings.lock().await.runtime_port;
+        let unauthenticated = state
+            .local_client
+            .post(format!("http://127.0.0.1:{private_port}/v1/systemone"))
+            .json(&request())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
         let app = router(state.clone());
         let loaded_path = state
             .loaded_model
@@ -250,6 +333,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/systemone")
+                    .header("host", "127.0.0.1:11435")
                     .header("content-type", "application/json")
                     .body(Body::from(decision_request.to_string()))
                     .unwrap(),
@@ -265,6 +349,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
+                    .header("host", "127.0.0.1:11435")
                     .header("content-type", "application/json")
                     .body(Body::from(chat_body.to_string()))
                     .unwrap(),
@@ -286,6 +371,7 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
         assert_eq!(status, StatusCode::OK, "Native response: {result}");
         assert_eq!(result["answers"]["route"]["choice"], "billing");
+        assert_eq!(result["model"], "noullama");
         assert!(result["answers"]["refund"]["noul"].as_f64().is_some());
         assert!(result["answers"]["urgency"]["score"].as_f64().is_some());
         assert_eq!(chat_status, StatusCode::OK, "OpenAI response: {envelope}");
