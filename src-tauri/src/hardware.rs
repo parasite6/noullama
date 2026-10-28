@@ -28,19 +28,25 @@ pub fn hardware() -> &'static Hardware {
 }
 
 pub fn fit(path: &str, context_size: u32, gpu_layers: i32) -> Option<Fit> {
-    let hardware = hardware();
-    if hardware.ram_bytes == 0 {
-        return None;
-    }
     let file = std::fs::metadata(path).ok()?;
     if !file.is_file() || file.len() == 0 {
         return None;
     }
-    let model_bytes = file.len();
+    fit_model_bytes(file.len(), context_size, gpu_layers, hardware())
+}
+
+pub fn fit_model_bytes(
+    model_bytes: u64,
+    context_size: u32,
+    gpu_layers: i32,
+    hardware: &Hardware,
+) -> Option<Fit> {
+    if model_bytes == 0 || hardware.ram_bytes == 0 {
+        return None;
+    }
     // Weight overhead plus a KV-cache allowance for the configured context.
-    let required_bytes = model_bytes
-        + (model_bytes as f64 * 0.12) as u64
-        + context_size as u64 * 24 * 1024;
+    let required_bytes =
+        model_bytes + (model_bytes as f64 * 0.12) as u64 + context_size as u64 * 24 * 1024;
     let (level, label, detail) = evaluate(required_bytes, hardware, gpu_layers != 0);
     Some(Fit {
         level,
@@ -232,7 +238,9 @@ fn amd() -> Option<(u64, String)> {
                         .map(|line| line.to_string())
                 }) {
                 Some(id) if id.to_ascii_lowercase().contains("1002") => "AMD Radeon".to_string(),
-                Some(id) if id.to_ascii_lowercase().contains("8086") => "Intel graphics".to_string(),
+                Some(id) if id.to_ascii_lowercase().contains("8086") => {
+                    "Intel graphics".to_string()
+                }
                 _ => "Graphics card".to_string(),
             };
             return Some((bytes, label));
@@ -312,14 +320,29 @@ mod tests {
     #[test]
     fn detail_mentions_the_budget_that_applies() {
         let gpu = machine(32, Some(12));
-        assert!(evaluate(15_000_000_000, &gpu, true).2.contains("system memory"));
+        assert!(evaluate(15_000_000_000, &gpu, true)
+            .2
+            .contains("system memory"));
         let ram = machine(16, None);
-        assert!(evaluate(11_000_000_000, &ram, true).2.contains("system memory"));
-        assert!(evaluate(2_000_000_000, &gpu, true).2.contains("graphics memory"));
+        assert!(evaluate(11_000_000_000, &ram, true)
+            .2
+            .contains("system memory"));
+        assert!(evaluate(2_000_000_000, &gpu, true)
+            .2
+            .contains("graphics memory"));
     }
 
     #[test]
     fn missing_or_empty_files_have_no_rating() {
         assert!(fit("/definitely/not/a/model.gguf", 8192, 99).is_none());
+    }
+
+    #[test]
+    fn fit_can_be_estimated_from_a_hub_file_size() {
+        let hw = machine(32, Some(12));
+        let fit = fit_model_bytes(2_000_000_000, 8192, 99, &hw).unwrap();
+        assert_eq!(fit.model_bytes, 2_000_000_000);
+        assert_eq!(fit.level, 1);
+        assert_eq!(fit.label, "Comfortable");
     }
 }

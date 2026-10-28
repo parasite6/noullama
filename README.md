@@ -15,14 +15,14 @@ npm install
 npm run desktop
 ```
 
-In the app: **Models** → download or browse for a GGUF → **Runtime** → select your llama.cpp path → **Load selected** → **Playground**.
+In the app: **Hub** → download a GGUF (or **Models** → browse for a local file) → **Runtime** → select your llama.cpp path → **Load selected** → **Playground**.
 
 ## Cheat sheet
 
 | I want to… | Do this |
 | --- | --- |
-| Download a model | Open **Models**, inspect a decision-model repository, and select a GGUF file. |
-| Use an existing model | Choose **Browse file**, select your GGUF, then click **Load selected**. |
+| Download a model | Open **Hub**, inspect a decision-model repository, and select a GGUF file. |
+| Use an existing model | Open **Models**, choose **Browse local model**, then click **Load selected**. |
 | Run a decision | Choose a preset in **Playground**, edit the questions and state, then click **Run decision**. |
 | Save a preset | Enter a name beneath the questions editor and click **Save custom**. |
 | Use CPU inference | Set **GPU layers** to `0` in **Runtime**. |
@@ -56,14 +56,14 @@ npm run desktop:build -- --debug  # debug
 
 On Linux, the binaries are written to `src-tauri/target/release/noullama` and `src-tauri/target/debug/noullama`. Standalone builds include the frontend and do not require a Vite server. Development builds use a separate target directory. Packaging is not yet configured.
 
-1. Open **Models**, search for a decision model or inspect a repository such as `LiquidAI/d1-2B-GGUF`, and download a GGUF. You can also browse for an existing local file.
+1. Open **Hub**, search for a decision model or inspect a repository such as `LiquidAI/d1-2B-GGUF`, and download a GGUF. Already have a file? Open **Models** and browse for it instead.
 2. In **Runtime**, set the path to your compatible llama.cpp directory or `llama-server` executable. Configure GPU layers and, if needed, a multimodal projector. Use **Check runtime** to inspect available devices; set GPU layers to `0` for CPU inference.
 3. Select a model and click **Load selected** in the model bar. The bar shows the loaded model and device and provides controls to switch or unload it.
 4. In **Playground**, choose a preset, edit the questions and state, and run a decision.
 
-The initial runtime path is machine-specific; change it in **Runtime** on another machine. For GPU builds, configure **CUDA / shared-library directories** if the runtime cannot find its libraries. On Linux, noullama also checks common CUDA 13 locations and passes the library paths to the runtime process.
+The runtime path starts unset. Noullama searches managed installs, nearby builds, and `PATH`; select a discovered runtime or enter a custom path in **Runtime**. For GPU builds, configure **CUDA / shared-library directories** if the runtime cannot find its libraries. On Linux, noullama also checks common CUDA 12 and 13 locations and passes the library paths to the runtime process.
 
-**Runtime → llama.cpp builds** scans the configured location, nearby builds, PATH, and managed installs before offering a download. Choose a backend and **Check official releases** to preview OS/architecture-matched assets from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/releases). Checking fetches metadata only. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the binary build linked by the latest official release. The fallback uses CPU, or Metal on macOS. Archives are checked against GitHub's SHA-256 digests and installed under the app-data `runtimes/` directory; existing custom paths are preserved. Select **Use** beside an installed runtime, then check or load it normally. Linux uses the official Ubuntu packages; unsupported platforms can use a custom build.
+**Runtime → llama.cpp builds** scans the configured location, nearby builds, PATH, and managed installs before offering a download. Choose a backend and **Check official releases** to preview OS/architecture-matched assets from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/releases). Checking fetches metadata only. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the binary build linked by the latest official release. The fallback uses CPU, or Metal on macOS. Archives are checked against GitHub's SHA-256 digests and installed under the app-data `runtimes/` directory; existing custom paths are preserved. Select **Use** beside an installed runtime, then check or load it normally. Linux uses the official Ubuntu-built archives; unsupported platforms can use a custom build.
 
 The **Selected llama.cpp** control on every page identifies a custom or downloaded runtime. While a model is running, it shows the build in use and marks any different selection as not applied.
 
@@ -77,9 +77,11 @@ On Linux, relaunching the same executable with the same app-data directory shuts
 
 Hugging Face discovery uses decision-model tags and architecture metadata. Downloads use `hf download` at the inspected repository revision. noullama supports the standard Hugging Face token locations and `HF_TOKEN`; a token entered in the app is held for the session and passed to `hf` through its environment.
 
-Author logos retain their original artwork and colors. Profile images are filtered at the display's pixel density for sharper small icons. Liquid AI has a bundled original profile logo for offline use; other authors fall back to initials.
+Author logos are fetched from each author's public Hugging Face profile the first time they appear in the Hub or a downloaded model, then cached for the session. Images are filtered at the display's pixel density for sharper small icons; authors without a profile image show their initials. No author artwork is bundled with the app.
 
-Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory. Download progress reports file reconstruction and network bytes separately; Xet compression and deduplication can make those values differ.
+**Models** lists the GGUF files on this machine; **Hub** is where you find and download more. Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory. Download progress reports file reconstruction and network bytes separately; Xet compression and deduplication can make those values differ.
+
+Hub search results show a local memory-fit estimate when a repository lists GGUF file sizes. Search cards use the smallest non-projector GGUF. Inspecting a repository shows a separate estimate beside each model weight file before downloading; projector files are excluded, and missing metadata is shown as “Fit unavailable”. Estimates use the current context-size and GPU-layer settings; they are a rough guide, not a guarantee.
 
 Questions use the `choice`, `noul`, and `score` types. The JSON editors provide syntax highlighting and inline lint diagnostics. The state editor accepts text or JSON; switching modes converts the representation while preserving the content.
 

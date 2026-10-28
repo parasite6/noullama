@@ -13,9 +13,6 @@ use tokio::{
     sync::Mutex,
 };
 
-pub const DEFAULT_RUNTIME: &str =
-    "/home/andrewunknown/llamacpp-new-patch/llama-b11954-bin-ubuntu-cuda-13.4-x64/llama-b11954";
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -33,7 +30,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            runtime_path: DEFAULT_RUNTIME.into(),
+            runtime_path: String::new(),
             model_path: String::new(),
             mmproj_path: String::new(),
             context_size: 8192,
@@ -356,22 +353,36 @@ pub fn runtime_library_dirs(settings: &Settings, binary: &Path) -> Vec<PathBuf> 
     }
     #[cfg(target_os = "linux")]
     for path in [
+        // Distribution packages and the usual CUDA toolkit locations.
+        "/usr/lib64",
+        "/usr/lib64/nvidia",
+        "/usr/lib",
         "/usr/local/cuda/lib64",
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/local/cuda/targets/aarch64-linux/lib",
         "/opt/cuda/lib64",
+        "/opt/cuda/targets/x86_64-linux/lib",
+        // Shared CUDA runtimes shipped beside an Ollama install.
+        "/usr/local/lib/ollama/cuda_v12",
         "/usr/local/lib/ollama/cuda_v13",
-        "/usr/local/lib/ollaya/cuda_v13",
+        "/usr/lib/ollama",
     ] {
         let path = PathBuf::from(path);
-        if ["libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"]
-            .iter()
-            .all(|file| path.join(file).is_file())
-            && !paths.contains(&path)
-        {
+        if has_cuda_runtime(&path) && !paths.contains(&path) {
             paths.push(path);
         }
     }
     paths.retain(|path| !path.as_os_str().is_empty());
     paths
+}
+
+#[cfg(target_os = "linux")]
+fn has_cuda_runtime(directory: &Path) -> bool {
+    ["12", "13"].iter().any(|major| {
+        ["libcudart", "libcublas", "libcublasLt"]
+            .iter()
+            .all(|name| directory.join(format!("{name}.so.{major}")).is_file())
+    })
 }
 
 fn runtime_command(settings: &Settings) -> Command {
@@ -995,6 +1006,23 @@ mod tests {
             PathBuf::from("/tmp/custom models")
         );
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cuda_runtime_detection_accepts_each_supported_major_version() {
+        let base = std::env::temp_dir().join(format!("noullama-cuda-{}", uuid::Uuid::new_v4()));
+        for major in ["12", "13"] {
+            let directory = base.join(major);
+            std::fs::create_dir_all(&directory).unwrap();
+            for name in ["libcudart", "libcublas", "libcublasLt"] {
+                std::fs::write(directory.join(format!("{name}.so.{major}")), "").unwrap();
+            }
+            assert!(has_cuda_runtime(&directory));
+        }
+        // A partially installed toolkit must not shadow the system loader path.
+        assert!(!has_cuda_runtime(&base));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn runtime_library_search_keeps_custom_and_inherited_paths_first() {
         let settings = Settings {
@@ -1010,6 +1038,37 @@ mod tests {
                 PathBuf::from("/custom/other")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn settings_survive_an_application_restart() {
+        let base = std::env::temp_dir().join(format!("noullama-persist-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let mut saved = state.settings.lock().await.clone();
+        saved.runtime_path = "/opt/llama.cpp/llama-server".into();
+        saved.model_path = "/models/demo.gguf".into();
+        saved.context_size = 4096;
+        saved.gpu_layers = 12;
+        saved.api_port = 12111;
+        saved.runtime_port = 12112;
+        saved.hf_path = "/usr/local/bin/hf".into();
+        saved.library_path = "/opt/cuda/lib64".into();
+        persist_settings(&state, saved.clone()).await.unwrap();
+        drop(state);
+
+        // A second AppState reads the same directory the way a fresh launch does.
+        let restarted = AppState::new(base.clone()).unwrap();
+        let loaded = restarted.settings.lock().await.clone();
+        assert!(restarted.startup_warning.is_none());
+        assert_eq!(loaded.runtime_path, saved.runtime_path);
+        assert_eq!(loaded.model_path, saved.model_path);
+        assert_eq!(loaded.context_size, saved.context_size);
+        assert_eq!(loaded.gpu_layers, saved.gpu_layers);
+        assert_eq!(loaded.api_port, saved.api_port);
+        assert_eq!(loaded.runtime_port, saved.runtime_port);
+        assert_eq!(loaded.hf_path, saved.hf_path);
+        assert_eq!(loaded.library_path, saved.library_path);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

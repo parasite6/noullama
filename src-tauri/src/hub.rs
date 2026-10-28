@@ -526,9 +526,12 @@ async fn lookup_author_avatar(state: &AppState, author: &str) -> Result<Option<S
 #[tauri::command]
 pub async fn search_models(
     query: String,
+    context_size: u32,
+    gpu_layers: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     let mut found = Vec::new();
+    let hardware = crate::hardware::hardware();
     for tag in ["decision", "decision-model", "system-one"] {
         let url = reqwest::Url::parse_with_params(
             "https://huggingface.co/api/models",
@@ -539,6 +542,7 @@ pub async fn search_models(
                 ("sort", "lastModified"),
                 ("direction", "-1"),
                 ("full", "true"),
+                ("blobs", "true"),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -550,20 +554,59 @@ pub async fn search_models(
             .filter(|m| decision_metadata(m))
         {
             if !found.iter().any(|m: &Value| m["id"] == model["id"]) {
-                found.push(json!({"id": model["id"], "downloads": model["downloads"], "likes": model["likes"], "tags": model["tags"]}));
+                let fit = model["siblings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|file| {
+                        file["rfilename"].as_str().is_some_and(|name| {
+                            name.ends_with(".gguf") && !name.to_lowercase().contains("mmproj")
+                        })
+                    })
+                    .filter_map(|file| file["size"].as_u64())
+                    .min()
+                    .and_then(|size| {
+                        crate::hardware::fit_model_bytes(size, context_size, gpu_layers, hardware)
+                    });
+                found.push(json!({"id": model["id"], "downloads": model["downloads"], "likes": model["likes"], "tags": model["tags"], "fit": fit}));
             }
         }
     }
     Ok(Value::Array(found))
 }
 
+fn inspection_files(
+    model: &Value,
+    context_size: u32,
+    gpu_layers: i32,
+    hardware: &crate::hardware::Hardware,
+) -> Vec<Value> {
+    model["siblings"].as_array().into_iter().flatten()
+        .filter(|file| file["rfilename"].as_str().is_some_and(|name| name.ends_with(".gguf")))
+        .map(|file| {
+            let projector = file["rfilename"].as_str().unwrap_or_default().to_lowercase().contains("mmproj");
+            let fit = if projector { None } else {
+                file["size"].as_u64().and_then(|size| crate::hardware::fit_model_bytes(size, context_size, gpu_layers, hardware))
+            };
+            json!({"name": file["rfilename"], "size": file["size"], "projector": projector, "fit": fit})
+        }).collect()
+}
+
 #[tauri::command]
 pub async fn inspect_model(
     repo: String,
+    context_size: Option<u32>,
+    gpu_layers: Option<i32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     let model = metadata(&state, &repo).await?;
-    let files: Vec<Value> = model["siblings"].as_array().into_iter().flatten().filter(|f| f["rfilename"].as_str().is_some_and(|s| s.ends_with(".gguf"))).map(|f| json!({"name": f["rfilename"], "size": f["size"], "projector": f["rfilename"].as_str().unwrap_or_default().to_lowercase().contains("mmproj")})).collect();
+    let settings = state.settings.lock().await.clone();
+    let files = inspection_files(
+        &model,
+        context_size.unwrap_or(settings.context_size),
+        gpu_layers.unwrap_or(settings.gpu_layers),
+        crate::hardware::hardware(),
+    );
     Ok(json!({"repo": repo, "sha": model["sha"], "files": files, "tags": model["tags"]}))
 }
 
@@ -787,35 +830,36 @@ mod tests {
             "Downscaling must retain filtered edge pixels"
         );
     }
-    #[tokio::test]
-    #[ignore = "reads the public Liquid AI logo to verify original image resolution"]
-    async fn author_logo_uses_original_resolution_instead_of_avatar_thumbnail() {
-        use base64::Engine;
-        let base =
-            std::env::temp_dir().join(format!("noullama-logo-test-{}", uuid::Uuid::new_v4()));
-        let state = AppState::new(base.clone()).unwrap();
-        let image = lookup_author_avatar(&state, "LiquidAI")
-            .await
-            .unwrap()
-            .unwrap();
-        let encoded = image
-            .strip_prefix("data:image/png;base64,")
-            .expect("Original PNG should load through the backend");
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .unwrap();
-        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    #[test]
+    fn inspection_rates_each_quantization_and_excludes_projectors() {
+        let hardware = crate::hardware::Hardware {
+            ram_bytes: 32_000_000_000,
+            vram_bytes: Some(12_000_000_000),
+            gpu: None,
+            cpu_cores: 8,
+        };
+        let model = json!({"siblings": [
+            {"rfilename": "model-Q4.gguf", "size": 4_000_000_000_u64},
+            {"rfilename": "model-Q8.gguf", "size": 28_600_000_000_u64},
+            {"rfilename": "mmproj-F16.gguf", "size": 930_000_000},
+            {"rfilename": "unknown.gguf"},
+            {"rfilename": "README.md", "size": 50}
+        ]});
+        let files = inspection_files(&model, 8192, 99, &hardware);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0]["fit"]["model_bytes"], 4_000_000_000_u64);
+        assert_eq!(files[1]["fit"]["model_bytes"], 28_600_000_000_u64);
+        assert_ne!(files[0]["fit"]["level"], files[1]["fit"]["level"]);
+        assert_eq!(files[2]["projector"], true);
+        assert!(files[2]["fit"].is_null());
+        assert!(files[3]["fit"].is_null());
+        let larger_context = inspection_files(&model, 32768, 99, &hardware);
         assert!(
-            width > 200 && height > 200,
-            "Expected original upload, got {width}x{height}"
+            larger_context[0]["fit"]["required_bytes"].as_u64().unwrap()
+                > files[0]["fit"]["required_bytes"].as_u64().unwrap()
         );
-        println!(
-            "Original Liquid AI logo: {width}x{height}, {} bytes",
-            bytes.len()
-        );
-        std::fs::remove_dir_all(base).unwrap();
     }
+
     #[test]
     fn invalid_hub_revisions_return_errors_without_utf8_slicing() {
         for sha in [
@@ -919,7 +963,7 @@ mod tests {
         let worker = tokio::spawn(async move {
             begin_download(
                 &worker_state,
-                "LiquidAI/d1-2B-GGUF".into(),
+                "acme/decision-model-GGUF".into(),
                 "model.gguf".into(),
             )
             .await
@@ -951,7 +995,11 @@ mod tests {
             .is_err());
         assert!(tokio::time::timeout(
             Duration::from_millis(500),
-            begin_download(&state, "LiquidAI/d1-2B-GGUF".into(), "second.gguf".into())
+            begin_download(
+                &state,
+                "acme/decision-model-GGUF".into(),
+                "second.gguf".into()
+            )
         )
         .await
         .unwrap()
@@ -1007,11 +1055,11 @@ mod tests {
             &json!({"config":{"architectures":["D1Model"]}})
         ));
         assert!(!decision_metadata(
-            &json!({"id":"LiquidAI/LFM3-1.7B", "tags":["text-generation"]})
+            &json!({"id":"acme/chat-model", "tags":["text-generation"]})
         ));
         assert!(!valid_repo("../escape"));
         assert!(!valid_repo("org/repo/extra"));
-        assert!(valid_repo("LiquidAI/d1-2B-GGUF"));
+        assert!(valid_repo("acme/decision-model-GGUF"));
     }
 
     #[tokio::test]

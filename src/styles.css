@@ -193,6 +193,8 @@ main { margin-left: 200px; flex: 1; min-width: 0; }
 .notice button { background: none; align-self: flex-start; }
 .auth-panel { display: flex; align-items: center; justify-content: space-between; padding: 16px; gap: 16px; }
 .auth-panel strong { font-weight: 500; font-size: 13px; }
+.auth-heading { display: inline-flex; align-items: center; gap: 8px; }
+.hf-logo { flex-shrink: 0; }
 .auth-panel p { font-size: 13px; color: var(--secondary); margin-top: 8px; }
 .auth-panel small { display: block; font-size: 12px; margin-top: 6px; }
 .token-details { margin: 12px 0 20px; font-size: 13px; color: var(--secondary); }
@@ -229,6 +231,13 @@ main { margin-left: 200px; flex: 1; min-width: 0; }
 .file-row>div { flex: 1; min-width: 0; }
 .file-row strong { font-size: 13px; font-weight: 450; overflow-wrap: anywhere; }
 .file-row small { display: block; margin-top: 5px; }
+.file-row .fit-unavailable { color: var(--muted); font-size: 12px; white-space: nowrap; }
+@media (max-width: 800px) {
+  .file-row { flex-wrap: wrap; }
+  .file-row>div { flex-basis: calc(100% - 40px); }
+  .file-row>.fit-badge, .file-row>.fit-unavailable { margin-left: 29px; }
+  .file-row>button { margin-left: auto; }
+}
 .compact { min-height: 30px; font-size: 12px; padding: 7px 9px; }
 .download-panel { padding: 16px; margin-top: 16px; }
 .download-panel>div:first-child { display: flex; gap: 12px; align-items: center; }

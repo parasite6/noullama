@@ -469,8 +469,7 @@ mod tests {
     #[ignore = "requires NOULLAMA_TEST_MODEL and a local llama-server runtime"]
     async fn real_runtime_native_and_openai_requests() {
         let model = std::env::var("NOULLAMA_TEST_MODEL").expect("Set NOULLAMA_TEST_MODEL");
-        let runtime = std::env::var("NOULLAMA_TEST_RUNTIME")
-            .unwrap_or_else(|_| crate::runtime::DEFAULT_RUNTIME.into());
+        let runtime = std::env::var("NOULLAMA_TEST_RUNTIME").unwrap_or_default();
         let path =
             std::env::temp_dir().join(format!("noullama-inference-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(path.clone()).unwrap();

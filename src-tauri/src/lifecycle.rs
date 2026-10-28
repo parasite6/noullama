@@ -130,8 +130,7 @@ mod tests {
         {
             let mut settings = state.settings.lock().await;
             settings.model_path = std::env::var("NOULLAMA_TEST_MODEL").unwrap();
-            settings.runtime_path = std::env::var("NOULLAMA_TEST_RUNTIME")
-                .unwrap_or_else(|_| crate::runtime::DEFAULT_RUNTIME.into());
+            settings.runtime_path = std::env::var("NOULLAMA_TEST_RUNTIME").unwrap_or_default();
             settings.runtime_port = runtime_port;
             settings.gpu_layers = std::env::var("NOULLAMA_TEST_GPU_LAYERS")
                 .ok()

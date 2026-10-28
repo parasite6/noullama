@@ -251,7 +251,6 @@ pub async fn discover_runtimes(state: tauri::State<'_, AppState>) -> Result<Valu
             if let Some(parent) = parent.parent().filter(|p| p.parent().is_some()) { roots.push((parent.to_path_buf(), 3, "near custom runtime")); }
         }
         if let Some(paths) = std::env::var_os("PATH") { roots.extend(std::env::split_paths(&paths).filter(|p| p.is_absolute()).map(|p| (p, 0, "PATH"))); }
-        if let Some(home) = std::env::var_os("HOME") { roots.push((PathBuf::from(home).join("llamacpp-new-patch"), 3, "local builds")); }
         let (local, warnings) = scan_runtimes(roots, 12_000);
         json!({"platform":format!("{} / {}",std::env::consts::OS,std::env::consts::ARCH), "backends": if cfg!(target_os="macos") { vec!["metal"] } else { vec!["cpu","vulkan","cuda12","cuda13"] }, "local":local,"warnings":warnings})
     }).await.map_err(|e| e.to_string())
@@ -831,9 +830,9 @@ mod tests {
             2,
             "Existing verified installs must be reused"
         );
-        assert_eq!(
-            state.settings.lock().await.runtime_path,
-            crate::runtime::DEFAULT_RUNTIME
+        assert!(
+            state.settings.lock().await.runtime_path.is_empty(),
+            "Installing a runtime must not silently change the selected path"
         );
         let mut bad = plan;
         bad.id = "corrupt".into();
