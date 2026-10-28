@@ -18,6 +18,9 @@ pub struct AppControl {
     pub api_stop: watch::Sender<bool>,
     pub api_task: Mutex<Option<JoinHandle<()>>>,
     pub download_task: Mutex<Option<JoinHandle<()>>>,
+    pub download_cancel: tokio::sync::Notify,
+    /// Partial files of cancelled downloads, deleted on full exit.
+    pub cancelled_partials: Mutex<Vec<std::path::PathBuf>>,
     exit_lock: Mutex<()>,
 }
 
@@ -32,6 +35,8 @@ impl Default for AppControl {
             api_stop: watch::channel(false).0,
             api_task: Mutex::new(None),
             download_task: Mutex::new(None),
+            download_cancel: tokio::sync::Notify::new(),
+            cancelled_partials: Mutex::new(Vec::new()),
             exit_lock: Mutex::new(()),
         }
     }
@@ -64,6 +69,9 @@ pub async fn shutdown_app(state: &AppState) {
             task.abort();
             let _ = task.await;
         }
+    }
+    for path in state.app.cancelled_partials.lock().await.drain(..) {
+        let _ = std::fs::remove_file(path);
     }
     if let Some(mut task) = state.app.api_task.lock().await.take() {
         if tokio::time::timeout(Duration::from_secs(2), &mut task)

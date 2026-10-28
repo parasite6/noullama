@@ -53,6 +53,7 @@ fn main() {
             hub::author_avatar,
             hub::download_model,
             hub::local_models,
+            hub::cancel_download,
             presets::list_presets,
             presets::save_preset,
             presets::delete_preset,

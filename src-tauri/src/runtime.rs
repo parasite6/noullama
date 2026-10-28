@@ -127,6 +127,7 @@ pub struct LoadedModel {
 #[derive(Clone, Default, Serialize)]
 pub struct DownloadState {
     pub active: bool,
+    pub cancelled: bool,
     pub repo: String,
     pub file: String,
     pub message: String,

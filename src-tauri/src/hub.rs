@@ -619,6 +619,14 @@ pub async fn download_model(
     begin_download(state.inner(), repo, filename).await
 }
 
+#[tauri::command]
+pub async fn cancel_download(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if state.download.lock().await.active {
+        state.app.download_cancel.notify_one();
+    }
+    Ok(())
+}
+
 fn valid_filename(filename: &str) -> bool {
     filename.ends_with(".gguf")
         && !filename.starts_with('-')
@@ -727,6 +735,10 @@ async fn prepare_download(
     let repo = repo.to_owned();
     let filename = filename.to_owned();
     let app = state.app.clone();
+    let cache_dir = directory.join(".cache/huggingface/download");
+    state.app.cancelled_partials.lock().await.retain(|p| p.parent() != Some(cache_dir.as_path()) || !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("{filename}."))));
+    // Drop a permit left over from a cancel that arrived after the last download ended.
+    let _ = tokio::time::timeout(Duration::ZERO, app.download_cancel.notified()).await;
     let task = tokio::spawn(async move {
         let mut stop = state.app.api_stop.subscribe();
         let stderr = child.stderr.take();
@@ -738,9 +750,11 @@ async fn prepare_download(
                 VecDeque::new()
             }
         });
+        let mut cancelled = false;
         let completed = tokio::select! {
             result = child.wait() => Some(result),
             _ = stop.wait_for(|stop| *stop) => None,
+            _ = state.app.download_cancel.notified() => { cancelled = true; None }
         };
         let result = match completed {
             Some(result) => result,
@@ -763,7 +777,16 @@ async fn prepare_download(
         let success = result.as_ref().is_ok_and(|s| s.success()) && size.is_some();
         let mut download = state.download.lock().await;
         download.active = false;
-        if success {
+        if cancelled {
+            // hf keeps partial data as <file>.incomplete beside its resume metadata;
+            // keep it until the app exits so an immediate retry can still resume.
+            let mut partials = state.app.cancelled_partials.lock().await;
+            for suffix in ["incomplete", "metadata", "lock"] {
+                partials.push(cache_dir.join(format!("{filename}.{suffix}")));
+            }
+            download.cancelled = true;
+            download.message = "Download cancelled; partial files are kept until you quit Noullama.".into();
+        } else if success {
             download.downloaded_bytes = size.unwrap_or(download.downloaded_bytes);
             download.total_bytes = size.or(download.total_bytes);
             download.progress = Some(100.0);
