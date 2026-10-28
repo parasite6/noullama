@@ -6,11 +6,13 @@
 
 <p align="center">A local workbench and API for native decision models using llama.cpp</p>
 
-[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Requirements](#requirements) · [Getting started](#getting-started) · [Models and presets](#models-and-presets) · [Local API](#local-api) · [Data and verification](#data-and-verification)
+[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Features](#features) · [Requirements](#requirements) · [Getting started](#getting-started) · [Runtime](#runtime) · [Models and presets](#models-and-presets) · [Local API](#local-api) · [Data and verification](#data-and-verification)
 
 ## Quick start
 
 ```sh
+git clone https://github.com/parasite6/noullama.git
+cd noullama
 npm install
 npm run desktop
 ```
@@ -28,7 +30,11 @@ In the app: **Hub** → download a GGUF (or **Models** → browse for a local fi
 | Use CPU inference | Set **GPU layers** to `0` in **Runtime**. |
 | Connect an application | Use `http://127.0.0.1:11435/v1`; native decisions are at `/systemone`. |
 
-Question types: **`choice`** selects an option, **`noul`** answers yes/no, and **`score`** rates an ordered set of levels.
+Question types:
+
+- **`choice`** selects an option.
+- **`noul`** answers yes/no.
+- **`score`** rates an ordered set of levels.
 
 ## Features
 
@@ -47,41 +53,82 @@ Question types: **`choice`** selects an option, **`noul`** answers yes/no, and *
 
 ## Getting started
 
-To build a standalone executable:
+### Install or build
+
+Tagged releases publish `.deb` and `.rpm` packages for 64-bit Linux, linked from [noullama.dev/download](https://noullama.dev/download/).
+
+To build a standalone executable instead:
 
 ```sh
 npm run desktop:build             # release
 npm run desktop:build -- --debug  # debug
 ```
 
-On Linux, the binaries are written to `src-tauri/target/release/noullama` and `src-tauri/target/debug/noullama`. Standalone builds include the frontend and do not require a Vite server. Development builds use a separate target directory. Packaging is not yet configured.
+- On Linux, the binaries are written to `src-tauri/target/release/noullama` and `src-tauri/target/debug/noullama`.
+- Standalone builds include the frontend and do not require a Vite server.
+- Development builds use a separate target directory.
+
+### First run
 
 1. Open **Hub**, search for a decision model or inspect a repository such as `LiquidAI/d1-2B-GGUF`, and download a GGUF. Already have a file? Open **Models** and browse for it instead.
 2. In **Runtime**, set the path to your compatible llama.cpp directory or `llama-server` executable. Configure GPU layers and, if needed, a multimodal projector. Use **Check runtime** to inspect available devices; set GPU layers to `0` for CPU inference.
 3. Select a model and click **Load selected** in the model bar. The bar shows the loaded model and device and provides controls to switch or unload it.
 4. In **Playground**, choose a preset, edit the questions and state, and run a decision.
 
-The runtime path starts unset. Noullama searches managed installs, nearby builds, and `PATH`; select a discovered runtime or enter a custom path in **Runtime**. For GPU builds, configure **CUDA / shared-library directories** if the runtime cannot find its libraries. On Linux, noullama also checks common CUDA 12 and 13 locations and passes the library paths to the runtime process.
+## Runtime
 
-**Runtime → llama.cpp builds** scans the configured location, nearby builds, PATH, and managed installs before offering a download. Choose a backend and **Check official releases** to preview OS/architecture-matched assets from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/releases). Checking fetches metadata only. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the binary build linked by the latest official release. The fallback uses CPU, or Metal on macOS. Archives are checked against GitHub's SHA-256 digests and installed under the app-data `runtimes/` directory; existing custom paths are preserved. Select **Use** beside an installed runtime, then check or load it normally. Linux uses the official Ubuntu-built archives; unsupported platforms can use a custom build.
+### Finding llama.cpp
+
+The runtime path starts unset. Noullama searches managed installs, nearby builds, and `PATH`; select a discovered runtime or enter a custom path in **Runtime**.
+
+For GPU builds, configure **CUDA / shared-library directories** if the runtime cannot find its libraries. On Linux, noullama also checks common CUDA 12 and 13 locations and passes the library paths to the runtime process.
 
 The **Selected llama.cpp** control on every page identifies a custom or downloaded runtime. While a model is running, it shows the build in use and marks any different selection as not applied.
 
-On desktops with an active system tray, closing the window keeps the model and local API running. Use **Open Noullama** in the tray menu to restore the window. **Quit Noullama**, available in the tray menu and sidebar, opens a centered confirmation. Confirming shuts down the API, owned runtime, and active downloads before exiting; **Keep running** or Escape cancels.
+### Downloading llama.cpp builds
 
-Linux tray mode needs an AppIndicator library and a desktop tray host. GNOME setups without tray support may need an AppIndicator extension. If the library or host is unavailable, closing the window asks for confirmation before quitting. Noullama releases its own ports on full exit; a port occupied by another service remains that service's responsibility.
+**Runtime → llama.cpp builds** scans the configured location, nearby builds, PATH, and managed installs before offering a download.
+
+1. Choose a backend and **Check official releases** to preview OS/architecture-matched assets from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/releases). Checking fetches metadata only.
+2. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the binary build linked by the latest official release. The fallback uses CPU, or Metal on macOS.
+3. Select **Use** beside an installed runtime, then check or load it normally.
+
+Archives are checked against GitHub's SHA-256 digests and installed under the app-data `runtimes/` directory; existing custom paths are preserved. Linux uses the official Ubuntu-built archives; unsupported platforms can use a custom build.
+
+### Tray and lifecycle
+
+On desktops with an active system tray, closing the window keeps the model and local API running. Use **Open Noullama** in the tray menu to restore the window.
+
+**Quit Noullama**, available in the tray menu and sidebar, opens a centered confirmation. Confirming shuts down the API, owned runtime, and active downloads before exiting; **Keep running** or Escape cancels.
+
+Linux tray mode needs an AppIndicator library and a desktop tray host. GNOME setups without tray support may need an AppIndicator extension. If the library or host is unavailable, closing the window asks for confirmation before quitting.
+
+Noullama releases its own ports on full exit; a port occupied by another service remains that service's responsibility.
 
 On Linux, relaunching the same executable with the same app-data directory shuts down its older instance before starting the API. Startup also cleans up orphaned llama-server processes carrying Noullama's runtime identity and app-data key-file markers. Processes belonging to other applications or app-data directories are left running.
 
 ## Models and presets
 
+### Hub and downloads
+
 Hugging Face discovery uses decision-model tags and architecture metadata. Downloads use `hf download` at the inspected repository revision. noullama supports the standard Hugging Face token locations and `HF_TOKEN`; a token entered in the app is held for the session and passed to `hf` through its environment.
 
 Author logos are fetched from each author's public Hugging Face profile the first time they appear in the Hub or a downloaded model, then cached for the session. Images are filtered at the display's pixel density for sharper small icons; authors without a profile image show their initials. No author artwork is bundled with the app.
 
-**Models** lists the GGUF files on this machine; **Hub** is where you find and download more. Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory. Download progress reports file reconstruction and network bytes separately; Xet compression and deduplication can make those values differ.
+Hub search results show a local memory-fit estimate when a repository lists GGUF file sizes:
 
-Hub search results show a local memory-fit estimate when a repository lists GGUF file sizes. Search cards use the smallest non-projector GGUF. Inspecting a repository shows a separate estimate beside each model weight file before downloading; projector files are excluded, and missing metadata is shown as “Fit unavailable”. Estimates use the current context-size and GPU-layer settings; they are a rough guide, not a guarantee.
+- Search cards use the smallest non-projector GGUF.
+- Inspecting a repository shows a separate estimate beside each model weight file before downloading.
+- Projector files are excluded, and missing metadata is shown as “Fit unavailable”.
+- Estimates use the current context-size and GPU-layer settings; they are a rough guide, not a guarantee.
+
+### Local models
+
+**Models** lists the GGUF files on this machine; **Hub** is where you find and download more. Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory.
+
+Download progress reports file reconstruction and network bytes separately; Xet compression and deduplication can make those values differ.
+
+### Questions and presets
 
 Questions use the `choice`, `noul`, and `score` types. The JSON editors provide syntax highlighting and inline lint diagnostics. The state editor accepts text or JSON; switching modes converts the representation while preserving the content.
 
@@ -89,11 +136,15 @@ Enter a name beneath the questions editor and choose **Save custom** to save the
 
 ## Local API
 
-While the app is open, the gateway prefers `http://127.0.0.1:11435` by default. If that port is occupied, Noullama binds a nearby free port, skips the private runtime port, and saves the replacement as its preferred port for future launches. The actual endpoint appears in **Local API** and a one-time notice when it changes. Copy that endpoint into your client; the examples below assume the default port. The managed llama-server uses port `11436`. Both bind to localhost; changing the preferred gateway port takes effect after restarting the app.
+### Ports and access
+
+While the app is open, the gateway prefers `http://127.0.0.1:11435` by default. If that port is occupied, Noullama binds a nearby free port, skips the private runtime port, and saves the replacement as its preferred port for future launches. The actual endpoint appears in **Local API** and a one-time notice when it changes. Copy that endpoint into your client; the examples below assume the default port.
+
+The managed llama-server uses port `11436`. Both bind to localhost; changing the preferred gateway port takes effect after restarting the app.
 
 Local SDK and curl clients use the gateway without an API key. The gateway accepts requests addressed to `127.0.0.1` or `localhost` on its active port and rejects foreign browser origins. The private llama-server uses a temporary key generated for each model load; connect integrations to the gateway rather than the private port.
 
-Native System One request:
+### Native System One request
 
 ```sh
 curl http://127.0.0.1:11435/v1/systemone \
@@ -110,6 +161,8 @@ curl http://127.0.0.1:11435/v1/systemone \
     }
   }'
 ```
+
+### OpenAI-compatible adapter
 
 The gateway also exposes `/v1/models`, `/v1/chat/completions`, and `/health`. The OpenAI adapter expects one user message containing a JSON object with `state` and `questions`; the assistant message contains the native decision result as JSON.
 
@@ -151,4 +204,6 @@ blaze test --manifest-path src-tauri/Cargo.toml \
   real_runtime_native_and_openai_requests -- --ignored --nocapture
 ```
 
-The current prototype supports one loaded model, one model download, and one runtime installation at a time. It has no download cancellation UI, bundled runtime, application installer, or automatic playground history. Named custom presets persist.
+## Current limits
+
+The current prototype supports one loaded model, one model download, and one runtime installation at a time. It has no download cancellation UI, bundled runtime, or automatic playground history. Named custom presets persist.
