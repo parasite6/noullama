@@ -1,0 +1,8 @@
+/target
+PLAN*
+local*
+docs*
+build*
+dist*
+node_modules/
+src-tauri/target

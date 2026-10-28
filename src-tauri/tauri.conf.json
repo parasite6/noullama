@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "noullama",
+  "version": "0.1.0",
+  "identifier": "dev.noullama.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{"title": "noullama", "width": 1360, "height": 900, "minWidth": 960, "minHeight": 700, "backgroundColor": "#080808"}],
+    "security": {"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420"}
+  },
+  "bundle": {"active": false}
+}
