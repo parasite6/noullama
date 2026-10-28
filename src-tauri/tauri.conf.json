@@ -13,5 +13,11 @@
     "windows": [{"title": "noullama", "width": 1360, "height": 900, "minWidth": 960, "minHeight": 700, "backgroundColor": "#101419"}],
     "security": {"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn-avatars.huggingface.co https://cdn-uploads.huggingface.co; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420"}
   },
-  "bundle": {"active": false}
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm"],
+    "category": "DeveloperTool",
+    "shortDescription": "Run and manage local decision models",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  }
 }
