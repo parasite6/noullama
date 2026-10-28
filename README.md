@@ -1,8 +1,36 @@
-# noullama
+<h1 align="center">Noullama</h1>
 
-![noullama](logox3x2.png)
+<p align="center">
+  <img src="logo33%25.png" alt="noullama logo">
+</p>
 
-A local workbench and API for native decision models, built with Tauri, Rust, React, and llama.cpp.
+<p align="center">A local workbench and API for native decision models using llama.cpp</p>
+
+[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Requirements](#requirements) · [Getting started](#getting-started) · [Models and presets](#models-and-presets) · [Local API](#local-api) · [Data and verification](#data-and-verification)
+
+## Quick start
+
+```sh
+npm install
+npm run desktop
+```
+
+In the app: **Models** → download or browse for a GGUF → **Runtime** → select your llama.cpp path → **Load selected** → **Playground**.
+
+## Cheat sheet
+
+| I want to… | Do this |
+| --- | --- |
+| Download a model | Open **Models**, inspect a decision-model repository, and select a GGUF file. |
+| Use an existing model | Choose **Browse file**, select your GGUF, then click **Load selected**. |
+| Run a decision | Choose a preset in **Playground**, edit the questions and state, then click **Run decision**. |
+| Save a preset | Enter a name beneath the questions editor and click **Save custom**. |
+| Use CPU inference | Set **GPU layers** to `0` in **Runtime**. |
+| Connect an application | Use `http://127.0.0.1:11435/v1`; native decisions are at `/systemone`. |
+
+Question types: **`choice`** selects an option, **`noul`** answers yes/no, and **`score`** rates an ordered set of levels.
+
+## Features
 
 - Discover and download decision-model GGUFs from Hugging Face using an existing login or a session token.
 - Load a local model with a compatible llama.cpp runtime and configure GPU offloading and an optional multimodal projector.
@@ -18,11 +46,6 @@ A local workbench and API for native decision models, built with Tauri, Rust, Re
 - On Linux, the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux), including GTK 3 and WebKitGTK 4.1 development packages.
 
 ## Getting started
-
-```sh
-npm install
-npm run desktop
-```
 
 To build a standalone executable:
 
