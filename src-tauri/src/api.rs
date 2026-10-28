@@ -30,8 +30,8 @@ pub fn router(state: AppState) -> Router {
 
 async fn loopback_only(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let hosts = [
-        format!("127.0.0.1:{}", state.api_port),
-        format!("localhost:{}", state.api_port),
+        format!("127.0.0.1:{}", state.listening_port()),
+        format!("localhost:{}", state.listening_port()),
     ];
     let headers = request.headers();
     let host_valid = headers.get_all("host").iter().count() == 1
@@ -55,20 +55,105 @@ async fn loopback_only(State(state): State<AppState>, request: Request, next: Ne
     next.run(request).await
 }
 
-pub async fn serve(state: AppState) -> Result<(), std::io::Error> {
-    let listener =
-        tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, state.api_port)).await?;
+pub async fn start(state: AppState) {
+    if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let runtime_port = state.settings.lock().await.runtime_port;
+    let listener = match bind_available(state.api_port, runtime_port).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            state.log(format!("API failed: {error}")).await;
+            *state.api_error.lock().await = Some(error.to_string());
+            return;
+        }
+    };
+    let port = listener
+        .local_addr()
+        .expect("Bound TCP listener has an address")
+        .port();
+    if port != state.api_port {
+        let mut settings = state.settings.lock().await.clone();
+        settings.api_port = port;
+        let saved = crate::runtime::persist_settings(&state, settings).await;
+        let notice = match saved {
+            Ok(())=>format!("Local API moved to http://127.0.0.1:{port}/v1 because port {} is in use. This endpoint is saved for future launches.",state.api_port),
+            Err(error)=>format!("Local API is available at http://127.0.0.1:{port}/v1, but its new port could not be saved: {error}"),
+        };
+        state.log(notice.clone()).await;
+        *state.api_notice.lock().await = Some(notice);
+    }
+    *state.api_error.lock().await = None;
+    start_with_listener(state, listener).await;
+}
+
+async fn bind_available(
+    preferred: u16,
+    runtime_port: u16,
+) -> Result<tokio::net::TcpListener, std::io::Error> {
+    for offset in 0..32u16 {
+        let Some(port) = preferred.checked_add(offset).filter(|port| *port != 0) else {
+            break;
+        };
+        if port == runtime_port {
+            continue;
+        }
+        match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "No free local API port near the configured port; choose another port in Runtime",
+    ))
+}
+
+pub async fn start_with_listener(state: AppState, listener: tokio::net::TcpListener) {
+    let _guard = state.lifecycle.lock().await;
+    if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if state.app.api_task.lock().await.is_some() {
+        return;
+    }
+    state.app.active_api_port.store(
+        listener.local_addr().expect("Bound listener").port(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let worker_state = state.clone();
+    let task = tokio::spawn(async move {
+        if let Err(error) = serve(listener, worker_state.clone()).await {
+            worker_state.log(format!("API failed: {error}")).await;
+            *worker_state.api_error.lock().await = Some(error.to_string());
+        }
+    });
+    *state.app.api_task.lock().await = Some(task);
+}
+
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+) -> Result<(), std::io::Error> {
+    let mut stop = state.app.api_stop.subscribe();
     state
         .log(format!(
             "Local API listening at http://127.0.0.1:{}/v1",
-            state.api_port
+            state.listening_port()
         ))
         .await;
-    axum::serve(listener, router(state)).await
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            let _ = stop.wait_for(|stop| *stop).await;
+        })
+        .await
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"status":"ok", "model_ready": *state.ready.lock().await}))
+    Json(
+        json!({"status":"ok", "service":"noullama", "api_port":state.listening_port(), "model_ready": *state.ready.lock().await}),
+    )
 }
 async fn models(State(state): State<AppState>) -> Json<Value> {
     let data = if *state.ready.lock().await {
@@ -164,6 +249,126 @@ mod tests {
         http::Request,
     };
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn replacement_port_is_saved_and_relaunch_does_not_repeat_the_conflict() {
+        let path =
+            std::env::temp_dir().join(format!("noullama-remember-port-{}", uuid::Uuid::new_v4()));
+        let mut state = AppState::new(path.clone()).unwrap();
+        // Keep this two-launch fixture outside the kernel's ephemeral client
+        // port range, so parallel HTTP tests cannot claim the freed endpoint.
+        let mut reservation = None;
+        for port in 22000..22500 {
+            if let Ok(listener) =
+                tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
+            {
+                reservation = Some(listener);
+                break;
+            }
+        }
+        let occupied = reservation.expect("A test port outside the ephemeral range");
+        let preferred = occupied.local_addr().unwrap().port();
+        state.api_port = preferred;
+        {
+            let mut settings = state.settings.lock().await;
+            settings.api_port = preferred;
+            settings.runtime_port = preferred + 1;
+        }
+        start(state.clone()).await;
+        let actual = state.listening_port();
+        assert_ne!(actual, preferred);
+        crate::lifecycle::shutdown_app(&state).await;
+        let relaunched = AppState::new(path.clone()).unwrap();
+        assert_eq!(
+            relaunched.api_port, actual,
+            "A replacement endpoint must survive restart"
+        );
+        start(relaunched.clone()).await;
+        assert_eq!(relaunched.listening_port(), actual);
+        assert!(relaunched.api_notice.lock().await.is_none());
+        crate::lifecycle::shutdown_app(&relaunched).await;
+        assert!(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, preferred))
+                .await
+                .is_err()
+        );
+        drop(occupied);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[tokio::test]
+    async fn occupied_preferred_port_uses_a_free_port_without_touching_its_owner() {
+        let path =
+            std::env::temp_dir().join(format!("noullama-port-conflict-{}", uuid::Uuid::new_v4()));
+        let mut state = AppState::new(path.clone()).unwrap();
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        state.api_port = occupied.local_addr().unwrap().port();
+        state.settings.lock().await.runtime_port = state.api_port.saturating_add(1);
+        start(state.clone()).await;
+        let port = state.listening_port();
+        assert_ne!(port, state.api_port);
+        assert_ne!(port, state.settings.lock().await.runtime_port);
+        let response = state
+            .local_client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(state.api_error.lock().await.is_none());
+        assert!(state
+            .api_notice
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .contains(&port.to_string()));
+        crate::lifecycle::shutdown_app(&state).await;
+        assert!(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, state.api_port))
+                .await
+                .is_err()
+        );
+        drop(occupied);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[tokio::test]
+    async fn runtime_cleanup_alone_does_not_release_the_gateway_listener() {
+        // This is the old Exit callback's cleanup path. Unloading a model must
+        // keep the gateway available, so full exit needs its own shutdown path.
+        let path =
+            std::env::temp_dir().join(format!("noullama-exit-baseline-{}", uuid::Uuid::new_v4()));
+        let mut state = AppState::new(path.clone()).unwrap();
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        state.api_port = reservation.local_addr().unwrap().port();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move { serve(reservation, server_state).await });
+        let url = format!("http://127.0.0.1:{}/health", state.api_port);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.local_client.get(&url).send().await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        state.shutdown().await;
+        assert!(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, state.api_port))
+                .await
+                .is_err()
+        );
+        server.abort();
+        let _ = server.await;
+        assert!(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, state.api_port))
+                .await
+                .is_ok()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
     #[tokio::test]
     async fn gateway_rejects_foreign_hosts_and_browser_origins() {
         let path = std::env::temp_dir().join(format!("noullama-origin-{}", uuid::Uuid::new_v4()));
@@ -316,10 +521,29 @@ mod tests {
             .unwrap()
             .path
             .clone();
+        let loaded_runtime = state
+            .loaded_model
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .runtime_path
+            .clone();
         state.settings.lock().await.model_path = "/a/different/selected.gguf".into();
+        state.settings.lock().await.runtime_path = "/a/different/runtime".into();
         assert_eq!(
             state.loaded_model.lock().await.as_ref().unwrap().path,
             loaded_path
+        );
+        assert_eq!(
+            state
+                .loaded_model
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .runtime_path,
+            loaded_runtime
         );
         let mut decision_request = request();
         decision_request["state"] =

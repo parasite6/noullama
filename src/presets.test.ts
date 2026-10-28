@@ -3,7 +3,32 @@ import assert from 'node:assert/strict';
 import * as stateHelpers from './presets.ts';
 import { modelStatus } from './model-state.ts';
 import { visibleBanner } from './ui-state.ts';
+import { runtimeStatus } from './runtime-state.ts';
+import { authorImageSources } from './author-image.ts';
 const { buildRequest, presets } = stateHelpers;
+
+test('author logos use the original upload with the existing avatar as fallback', () => {
+  const avatar = 'https://cdn-avatars.huggingface.co/v1/production/uploads/owner/logo.png';
+  assert.deepEqual(authorImageSources(avatar), { primary: 'https://cdn-uploads.huggingface.co/production/uploads/owner/logo.png', fallback: avatar });
+  const other = 'https://example.com/logo.png';
+  assert.deepEqual(authorImageSources(other), { primary: other, fallback: other });
+});
+
+test('runtime selection keeps the running custom build distinct from a pending download', () => {
+  const selected = '/data/runtimes/b11968-cpu/package-0/build/llama-server';
+  const active = '/custom/llama-b11954/llama-server';
+  const running = runtimeStatus(selected, active, true, '/data');
+  assert.equal(running.path, active);
+  assert.equal(running.source, 'Custom');
+  assert.equal(running.name, 'llama-b11954');
+  assert.equal(running.pending, true);
+  const stopped = runtimeStatus(selected, active, false, '/data');
+  assert.equal(stopped.source, 'Downloaded');
+  assert.equal(stopped.name, 'b11968-cpu');
+  assert.equal(stopped.inUse, false);
+  assert.equal(runtimeStatus('/custom/llama-b11954', active, true, '/data').pending, false);
+  assert.equal(runtimeStatus('/data/runtimes-other/llama-server', null, false, '/data').source, 'Custom');
+});
 
 test('persistent API banners can be dismissed and new errors are still shown', () => {
   assert.equal(visibleBanner(null, 'port occupied', null, true, false)?.error, true);

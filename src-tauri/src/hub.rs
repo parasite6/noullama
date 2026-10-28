@@ -389,6 +389,141 @@ pub async fn hf_session(state: tauri::State<'_, AppState>) -> Result<Value, Stri
 }
 
 #[tauri::command]
+pub async fn author_avatar(
+    author: String,
+    pixels: Option<u32>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let source = lookup_author_avatar(state.inner(), &author).await?;
+    let pixels = pixels.unwrap_or(64).clamp(24, 192);
+    Ok(tokio::task::spawn_blocking(move || {
+        source.map(|source| raster_avatar(&source, pixels).unwrap_or(source))
+    })
+    .await
+    .map_err(|e| e.to_string())?)
+}
+
+fn raster_avatar(source: &str, pixels: u32) -> Option<String> {
+    use base64::Engine;
+    let encoded = source
+        .strip_prefix("data:image/")?
+        .split_once(";base64,")?
+        .1;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let resized =
+        reader
+            .decode()
+            .ok()?
+            .resize(pixels, pixels, image::imageops::FilterType::Lanczos3);
+    let mut output = std::io::Cursor::new(Vec::new());
+    resized
+        .write_to(&mut output, image::ImageFormat::Png)
+        .ok()?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(output.into_inner())
+    ))
+}
+
+async fn original_avatar_data(state: &AppState, avatar: &str) -> Option<String> {
+    use base64::Engine;
+    let url = reqwest::Url::parse(avatar).ok()?;
+    if url.scheme() != "https" || url.host_str() != Some("cdn-avatars.huggingface.co") {
+        return None;
+    }
+    let path = url.path().strip_prefix("/v1/production/uploads/")?;
+    let mut response = state
+        .client
+        .get(format!(
+            "https://cdn-uploads.huggingface.co/production/uploads/{path}"
+        ))
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|size| size > 1_048_576)
+    {
+        return None;
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if data.len() + chunk.len() > 1_048_576 {
+            return None;
+        }
+        data.extend_from_slice(&chunk);
+    }
+    let mime = if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else if data.starts_with(b"GIF8") {
+        "image/gif"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(data)
+    ))
+}
+
+async fn lookup_author_avatar(state: &AppState, author: &str) -> Result<Option<String>, String> {
+    if author.is_empty()
+        || author.len() > 96
+        || !author
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Ok(None);
+    }
+    for kind in ["organizations", "users"] {
+        let response = state
+            .client
+            .get(format!(
+                "https://huggingface.co/api/{kind}/{author}/overview"
+            ))
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            continue;
+        }
+        let profile: Value = response.json().await.map_err(|e| e.to_string())?;
+        if let Some(url) = profile["avatarUrl"].as_str().filter(|url| {
+            reqwest::Url::parse(url).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && url.host_str() == Some("cdn-avatars.huggingface.co")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            })
+        }) {
+            return Ok(Some(
+                original_avatar_data(state, url)
+                    .await
+                    .unwrap_or_else(|| url.to_owned()),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
 pub async fn search_models(
     query: String,
     state: tauri::State<'_, AppState>,
@@ -462,6 +597,9 @@ async fn begin_download(state: &AppState, repo: String, filename: String) -> Res
     }
     let settings = {
         let _guard = state.lifecycle.lock().await;
+        if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Noullama is shutting down.".into());
+        }
         let mut download = state.download.lock().await;
         if download.active {
             return Err("A model download is already in progress.".into());
@@ -523,6 +661,10 @@ async fn prepare_download(
         .env("HF_HUB_DISABLE_PROGRESS_BARS", "0")
         .env("TQDM_POSITION", "-1")
         .env("TQDM_MININTERVAL", "0.2");
+    let _spawn_guard = state.lifecycle.lock().await;
+    if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("Noullama is shutting down.".into());
+    }
     let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().map_err(|e| format!("Cannot start hf: {e}. Install the Hugging Face CLI or configure its executable path."))?;
     {
         let mut download = state.download.lock().await;
@@ -541,7 +683,9 @@ async fn prepare_download(
     let state = state.clone();
     let repo = repo.to_owned();
     let filename = filename.to_owned();
-    tokio::spawn(async move {
+    let app = state.app.clone();
+    let task = tokio::spawn(async move {
+        let mut stop = state.app.api_stop.subscribe();
         let stderr = child.stderr.take();
         let progress_state = state.clone();
         let reader = tokio::spawn(async move {
@@ -551,7 +695,17 @@ async fn prepare_download(
                 VecDeque::new()
             }
         });
-        let result = child.wait().await;
+        let completed = tokio::select! {
+            result = child.wait() => Some(result),
+            _ = stop.wait_for(|stop| *stop) => None,
+        };
+        let result = match completed {
+            Some(result) => result,
+            None => {
+                let _ = child.kill().await;
+                child.wait().await
+            }
+        };
         let diagnostics = reader
             .await
             .unwrap_or_default()
@@ -593,12 +747,75 @@ async fn prepare_download(
             })
             .await;
     });
+    *app.download_task.lock().await = Some(task);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raster_logos_are_antialiased_at_the_requested_device_resolution() {
+        use base64::Engine;
+        let original = image::RgbaImage::from_fn(950, 950, |x, y| {
+            if x < y {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(original)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let source = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+        );
+        let result = raster_avatar(&source, 32).unwrap();
+        let encoded = result.split_once(',').unwrap().1;
+        let decoded = image::load_from_memory(
+            &base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+        )
+        .unwrap()
+        .to_rgba8();
+        assert_eq!(decoded.dimensions(), (32, 32));
+        assert!(
+            decoded.pixels().any(|pixel| pixel[0] > 0 && pixel[0] < 255),
+            "Downscaling must retain filtered edge pixels"
+        );
+    }
+    #[tokio::test]
+    #[ignore = "reads the public Liquid AI logo to verify original image resolution"]
+    async fn author_logo_uses_original_resolution_instead_of_avatar_thumbnail() {
+        use base64::Engine;
+        let base =
+            std::env::temp_dir().join(format!("noullama-logo-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let image = lookup_author_avatar(&state, "LiquidAI")
+            .await
+            .unwrap()
+            .unwrap();
+        let encoded = image
+            .strip_prefix("data:image/png;base64,")
+            .expect("Original PNG should load through the backend");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert!(
+            width > 200 && height > 200,
+            "Expected original upload, got {width}x{height}"
+        );
+        println!(
+            "Original Liquid AI logo: {width}x{height}, {} bytes",
+            bytes.len()
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
     #[test]
     fn invalid_hub_revisions_return_errors_without_utf8_slicing() {
         for sha in [

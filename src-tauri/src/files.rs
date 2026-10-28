@@ -1,12 +1,22 @@
 use std::path::Path;
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
 pub async fn pick_model_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    // Anchor the chooser to the app window so it opens as a modal over the
+    // window instead of a free-floating dialog.
+    let window = app.get_webview_window("main");
     tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
+        let mut dialog = app
+            .dialog()
             .file()
             .add_filter("GGUF model", &["gguf"])
+            .set_title("Choose a GGUF model");
+        if let Some(window) = window.as_ref() {
+            dialog = dialog.set_parent(window);
+        }
+        dialog
             .blocking_pick_file()
             .map(|file| {
                 file.into_path()

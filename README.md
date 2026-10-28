@@ -1,8 +1,8 @@
-<h1 align="center">Noullama</h1>
-
 <p align="center">
   <img src="logo33%25.png" alt="noullama logo">
 </p>
+
+<h1 align="center">Noullama</h1>
 
 <p align="center">A local workbench and API for native decision models using llama.cpp</p>
 
@@ -63,9 +63,21 @@ On Linux, the binaries are written to `src-tauri/target/release/noullama` and `s
 
 The initial runtime path is machine-specific; change it in **Runtime** on another machine. For GPU builds, configure **CUDA / shared-library directories** if the runtime cannot find its libraries. On Linux, noullama also checks common CUDA 13 locations and passes the library paths to the runtime process.
 
+**Runtime → llama.cpp builds** scans the configured location, nearby builds, PATH, and managed installs before offering a download. Choose a backend and **Check official releases** to preview OS/architecture-matched assets from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/releases). Checking fetches metadata only. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the binary build linked by the latest official release. The fallback uses CPU, or Metal on macOS. Archives are checked against GitHub's SHA-256 digests and installed under the app-data `runtimes/` directory; existing custom paths are preserved. Select **Use** beside an installed runtime, then check or load it normally. Linux uses the official Ubuntu packages; unsupported platforms can use a custom build.
+
+The **Selected llama.cpp** control on every page identifies a custom or downloaded runtime. While a model is running, it shows the build in use and marks any different selection as not applied.
+
+On desktops with an active system tray, closing the window keeps the model and local API running. Use **Open Noullama** in the tray menu to restore the window. **Quit Noullama**, available in the tray menu and sidebar, opens a centered confirmation. Confirming shuts down the API, owned runtime, and active downloads before exiting; **Keep running** or Escape cancels.
+
+Linux tray mode needs an AppIndicator library and a desktop tray host. GNOME setups without tray support may need an AppIndicator extension. If the library or host is unavailable, closing the window asks for confirmation before quitting. Noullama releases its own ports on full exit; a port occupied by another service remains that service's responsibility.
+
+On Linux, relaunching the same executable with the same app-data directory shuts down its older instance before starting the API. Startup also cleans up orphaned llama-server processes carrying Noullama's runtime identity and app-data key-file markers. Processes belonging to other applications or app-data directories are left running.
+
 ## Models and presets
 
 Hugging Face discovery uses decision-model tags and architecture metadata. Downloads use `hf download` at the inspected repository revision. noullama supports the standard Hugging Face token locations and `HF_TOKEN`; a token entered in the app is held for the session and passed to `hf` through its environment.
+
+Author logos retain their original artwork and colors. Profile images are filtered at the display's pixel density for sharper small icons. Liquid AI has a bundled original profile logo for offline use; other authors fall back to initials.
 
 Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory. Download progress reports file reconstruction and network bytes separately; Xet compression and deduplication can make those values differ.
 
@@ -75,9 +87,9 @@ Enter a name beneath the questions editor and choose **Save custom** to save the
 
 ## Local API
 
-While the app is open, the gateway listens on `http://127.0.0.1:11435` by default. The managed llama-server uses port `11436`. Both bind to localhost; changing the gateway port requires an app restart.
+While the app is open, the gateway prefers `http://127.0.0.1:11435` by default. If that port is occupied, Noullama binds a nearby free port, skips the private runtime port, and saves the replacement as its preferred port for future launches. The actual endpoint appears in **Local API** and a one-time notice when it changes. Copy that endpoint into your client; the examples below assume the default port. The managed llama-server uses port `11436`. Both bind to localhost; changing the preferred gateway port takes effect after restarting the app.
 
-Local SDK and curl clients use the gateway without an API key. The gateway accepts requests addressed to `127.0.0.1` or `localhost` on its configured port and rejects foreign browser origins. The private llama-server uses a temporary key generated for each model load; connect integrations to the gateway rather than the private port.
+Local SDK and curl clients use the gateway without an API key. The gateway accepts requests addressed to `127.0.0.1` or `localhost` on its active port and rejects foreign browser origins. The private llama-server uses a temporary key generated for each model load; connect integrations to the gateway rather than the private port.
 
 Native System One request:
 
@@ -137,4 +149,4 @@ blaze test --manifest-path src-tauri/Cargo.toml \
   real_runtime_native_and_openai_requests -- --ignored --nocapture
 ```
 
-The current prototype supports one loaded model and one download at a time. It has no download cancellation UI, bundled runtime, installer, or automatic playground history. Named custom presets persist.
+The current prototype supports one loaded model, one model download, and one runtime installation at a time. It has no download cancellation UI, bundled runtime, application installer, or automatic playground history. Named custom presets persist.

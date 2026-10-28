@@ -8,23 +8,23 @@ import { linter, lintGutter } from '@codemirror/lint';
 import { tags } from '@lezer/highlight';
 
 const colors = HighlightStyle.define([
-  { tag: tags.propertyName, color: '#dedede' },
-  { tag: tags.string, color: '#b9cad7' },
-  { tag: tags.number, color: '#c2cfb7' },
-  { tag: [tags.bool, tags.null], color: '#c7b9d4' },
-  { tag: [tags.punctuation, tags.bracket], color: '#999999' },
+  { tag: tags.propertyName, color: '#b9a8f0' },
+  { tag: tags.string, color: '#a7b3ad' },
+  { tag: tags.number, color: '#b9b199' },
+  { tag: [tags.bool, tags.null], color: '#b9a8f0' },
+  { tag: [tags.punctuation, tags.bracket], color: '#7d8995' },
 ]);
 const theme = EditorView.theme({
-  '&': { backgroundColor: '#0b0b0b', color: '#cccccc', height: '100%', fontSize: '12px' },
-  '.cm-scroller': { fontFamily: '"SFMono-Regular", Consolas, monospace', lineHeight: '1.7', overflow: 'auto' },
-  '.cm-content': { padding: '12px 0', caretColor: '#eeeeee' },
+  '&': { backgroundColor: '#0a0e14', color: '#adb6be', height: '100%', fontSize: '13px' },
+  '.cm-scroller': { fontFamily: '"SFMono-Regular", Consolas, monospace', lineHeight: '1.7', overflow: 'auto', overscrollBehavior: 'contain' },
+  '.cm-content': { padding: '12px 0', caretColor: '#c3cac4' },
   '.cm-line': { padding: '0 12px' },
-  '.cm-gutters': { backgroundColor: '#0b0b0b', color: '#777777', borderRight: '1px solid #252525' },
-  '.cm-activeLineGutter': { backgroundColor: '#202020' },
-  '.cm-cursor': { borderLeftColor: '#eeeeee' },
+  '.cm-gutters': { backgroundColor: '#0a0e14', color: '#596570', borderRight: '1px solid #202830' },
+  '.cm-activeLineGutter': { backgroundColor: '#171d25' },
+  '.cm-cursor': { borderLeftColor: '#c3cac4' },
   '&.cm-focused': { outline: 'none' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: '#3a3a3a' },
-  '.cm-tooltip': { backgroundColor: '#202020', color: '#dddddd', border: '1px solid #444444' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: '#2c3044' },
+  '.cm-tooltip': { backgroundColor: '#171d25', color: '#c3cac4', border: '1px solid #2b333b' },
   '.cm-diagnostic': { fontSize: '11px' },
 }, { dark: true });
 

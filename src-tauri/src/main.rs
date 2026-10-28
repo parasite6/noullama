@@ -1,10 +1,16 @@
 mod api;
+mod desktop;
 mod files;
+mod hardware;
 mod hub;
+mod instance;
+mod lifecycle;
 mod presets;
 mod runtime;
+mod runtimes;
 
 use runtime::AppState;
+use std::sync::atomic::Ordering;
 use tauri::Manager;
 
 fn main() {
@@ -12,17 +18,28 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let state = AppState::new(app.path().app_data_dir()?)?;
+            let data_dir = app.path().app_data_dir()?;
+            let lease = instance::acquire(&data_dir)?;
+            app.manage(lease);
+            let state = AppState::new(data_dir)?;
             app.manage(state.clone());
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = api::serve(state.clone()).await {
-                    state.log(format!("API failed: {error}")).await;
-                    *state.api_error.lock().await = Some(error.to_string());
-                }
-            });
+            desktop::install_signal_handler(app.handle().clone());
+            tauri::async_runtime::block_on(api::start(state));
+            if let Err(error) = desktop::install_tray(app) {
+                let message = format!("Tray unavailable: {error}");
+                eprintln!("{message}");
+                tauri::async_runtime::block_on(app.state::<AppState>().log(message));
+            }
             Ok(())
         })
+        .on_window_event(desktop::handle_window_event)
         .invoke_handler(tauri::generate_handler![
+            desktop::quit_app,
+            desktop::request_quit,
+            desktop::cancel_quit,
+            runtimes::discover_runtimes,
+            runtimes::runtime_releases,
+            runtimes::download_runtimes,
             runtime::snapshot,
             runtime::save_settings,
             runtime::probe_runtime,
@@ -33,6 +50,7 @@ fn main() {
             hub::set_hf_token,
             hub::search_models,
             hub::inspect_model,
+            hub::author_avatar,
             hub::download_model,
             hub::local_models,
             presets::list_presets,
@@ -44,11 +62,25 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("Could not initialize noullama")
         .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                let state = app.state::<AppState>();
-                tauri::async_runtime::block_on(async {
-                    state.shutdown().await;
-                });
+            match event {
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    if !app
+                        .state::<AppState>()
+                        .app
+                        .exit_ready
+                        .load(Ordering::SeqCst)
+                    {
+                        api.prevent_exit();
+                        desktop::request_exit(app, code.unwrap_or(0));
+                    }
+                }
+                tauri::RunEvent::Exit => {
+                    // Fallback for a platform exit that bypasses ExitRequested.
+                    tauri::async_runtime::block_on(lifecycle::shutdown_app(
+                        &app.state::<AppState>(),
+                    ));
+                }
+                _ => {}
             }
         });
 }

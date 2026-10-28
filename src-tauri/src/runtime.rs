@@ -49,6 +49,8 @@ impl Default for Settings {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub app: Arc<crate::lifecycle::AppControl>,
+    pub runtimes: Arc<crate::runtimes::RuntimeManager>,
     pub settings: Arc<Mutex<Settings>>,
     pub child: Arc<Mutex<Option<Child>>>,
     pub lifecycle: Arc<Mutex<()>>,
@@ -59,6 +61,7 @@ pub struct AppState {
     pub download: Arc<Mutex<DownloadState>>,
     pub ready: Arc<Mutex<bool>>,
     pub api_error: Arc<Mutex<Option<String>>>,
+    pub api_notice: Arc<Mutex<Option<String>>>,
     pub loaded_model: Arc<Mutex<Option<LoadedModel>>>,
     pub presets_lock: Arc<Mutex<()>>,
     pub local_client: reqwest::Client,
@@ -121,6 +124,7 @@ impl RuntimeSession {
 pub struct LoadedModel {
     pub path: String,
     pub device: String,
+    pub runtime_path: String,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -164,6 +168,8 @@ impl AppState {
             }
         };
         Ok(Self {
+            app: Default::default(),
+            runtimes: Default::default(),
             api_port: settings.api_port,
             settings: Arc::new(Mutex::new(settings)),
             child: Default::default(),
@@ -175,6 +181,7 @@ impl AppState {
             download: Default::default(),
             ready: Default::default(),
             api_error: Default::default(),
+            api_notice: Default::default(),
             loaded_model: Default::default(),
             presets_lock: Default::default(),
             local_client: reqwest::Client::builder()
@@ -193,6 +200,17 @@ impl AppState {
             logs.pop_front();
         }
         logs.push_back(line);
+    }
+    pub fn listening_port(&self) -> u16 {
+        let active = self
+            .app
+            .active_api_port
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if active == 0 {
+            self.api_port
+        } else {
+            active
+        }
     }
     pub async fn shutdown(&self) {
         let _guard = self.lifecycle.lock().await;
@@ -403,11 +421,19 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let loaded_model = state.loaded_model.lock().await.clone();
     let ready = *state.ready.lock().await;
     let api_error = state.api_error.lock().await.clone();
+    let api_notice = state.api_notice.lock().await.clone();
+    let runtime_download = state.runtimes.progress.lock().await.clone();
+    let hardware = crate::hardware::hardware();
+    let fit_path = loaded_model
+        .as_ref()
+        .map(|model| model.path.clone())
+        .unwrap_or_else(|| settings.model_path.clone());
+    let fit = crate::hardware::fit(&fit_path, settings.context_size, settings.gpu_layers);
     Ok(
         json!({"settings": settings, "running": running, "ready": ready,
         "logs": logs, "download": download, "loaded_model":loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
-        "api_port": state.api_port, "api_error": api_error, "startup_warning": state.startup_warning, "data_dir": state.data_dir}),
+        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit}),
     )
 }
 
@@ -431,6 +457,15 @@ pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<()
         || settings.api_port == settings.runtime_port
     {
         return Err("Choose two different, nonzero ports.".into());
+    }
+    let active_api = state
+        .app
+        .active_api_port
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if active_api != 0 && settings.runtime_port == active_api {
+        return Err(format!(
+            "The private runtime port must differ from the active local API port ({active_api})."
+        ));
     }
     if !(512..=131072).contains(&settings.context_size) || settings.gpu_layers < -1 {
         return Err("Use a context size of 512–131072 and GPU layers of -1 or higher.".into());
@@ -507,6 +542,9 @@ pub async fn start_runtime(state: tauri::State<'_, AppState>) -> Result<(), Stri
 
 pub async fn load_model(state: &AppState) -> Result<(), String> {
     let _guard = state.lifecycle.lock().await;
+    if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("Noullama is shutting down.".into());
+    }
     if state.session.lock().await.is_some() || state.child.lock().await.is_some() {
         return Err("Runtime is already started. Stop it before loading another model.".into());
     }
@@ -679,6 +717,7 @@ async fn prepare_and_poll(
         *state.loaded_model.lock().await = Some(LoadedModel {
             path: settings.model_path.clone(),
             device: device.clone(),
+            runtime_path: settings.runtime_path.clone(),
         });
         state
             .log(format!("Loading {} on {device}", settings.model_path))

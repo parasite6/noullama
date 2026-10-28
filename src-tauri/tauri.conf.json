@@ -10,8 +10,8 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [{"title": "noullama", "width": 1360, "height": 900, "minWidth": 960, "minHeight": 700, "backgroundColor": "#080808"}],
-    "security": {"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420"}
+    "windows": [{"title": "noullama", "width": 1360, "height": 900, "minWidth": 960, "minHeight": 700, "backgroundColor": "#101419"}],
+    "security": {"csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn-avatars.huggingface.co https://cdn-uploads.huggingface.co; connect-src ipc: http://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420"}
   },
   "bundle": {"active": false}
 }
