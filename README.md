@@ -46,6 +46,8 @@ Question types:
 
 ## Requirements
 
+Needed to build from source. The `.deb` and `.rpm` packages install the system libraries themselves, but still need `hf` and a `llama-server`.
+
 - Node.js 22+, Rust, and Blaze for the provided build commands.
 - The Hugging Face CLI (`hf`) for downloads. Public models do not require a login; gated models require access and authentication.
 - A compatible `llama-server`. Liquid d1-2B requires a build containing [llama.cpp PR #31275](https://github.com/ggml-org/llama.cpp/pull/31275), such as b11954 or a compatible newer build.
@@ -99,7 +101,7 @@ Archives are checked against GitHub's SHA-256 digests and installed under the ap
 
 On desktops with an active system tray, closing the window keeps the model and local API running. Use **Open Noullama** in the tray menu to restore the window.
 
-**Quit Noullama**, available in the tray menu and sidebar, opens a centered confirmation. Confirming shuts down the API, owned runtime, and active downloads before exiting; **Keep running** or Escape cancels.
+**Quit Noullama**, available in the tray menu and sidebar, opens a centered confirmation. Confirming shuts down the API, owned runtime, and active downloads and deletes partial files from cancelled downloads before exiting; **Keep running** or Escape cancels.
 
 Linux tray mode needs an AppIndicator library and a desktop tray host. GNOME setups without tray support may need an AppIndicator extension. If the library or host is unavailable, closing the window asks for confirmation before quitting.
 
@@ -126,7 +128,9 @@ Hub search results show a local memory-fit estimate when a repository lists GGUF
 
 **Models** lists the GGUF files on this machine; **Hub** is where you find and download more. Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory.
 
-Download progress reports file reconstruction and network bytes separately; Xet compression and deduplication can make those values differ.
+The download panel shows one progress bar filled from both ends: network bytes received fill from the left and file reconstruction fills from the right, meeting in the middle when the file is done. Xet compression and deduplication can make the two values differ. Use **Cancel download** to stop; partial files are kept so an immediate retry resumes, and are deleted when you quit Noullama.
+
+The **Models** list rescans the download directories every few seconds, so files added or removed outside the app show up without a refresh.
 
 ### Questions and presets
 
@@ -206,4 +210,11 @@ blaze test --manifest-path src-tauri/Cargo.toml \
 
 ## Current limits
 
-The current prototype supports one loaded model, one model download, and one runtime installation at a time. It has no download cancellation UI, bundled runtime, or automatic playground history. Named custom presets persist.
+Noullama is in early beta. Known limits:
+
+- One loaded model, one model download, and one runtime installation at a time.
+- No bundled runtime; use **Runtime → llama.cpp builds** or point to your own `llama-server`.
+- No automatic playground history. Only named custom presets are saved.
+- Linux packages only (64-bit `.deb` and `.rpm`). There are no macOS or Windows builds yet.
+
+Found a bug or missing something? [Open an issue](https://github.com/parasite6/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/parasite6/noullama/issues/new?template=feature_request.md).
