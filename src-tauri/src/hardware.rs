@@ -22,9 +22,15 @@ pub struct Fit {
     pub required_bytes: u64,
 }
 
+static CACHE: OnceLock<Hardware> = OnceLock::new();
+
 pub fn hardware() -> &'static Hardware {
-    static CACHE: OnceLock<Hardware> = OnceLock::new();
     CACHE.get_or_init(probe)
+}
+
+/// The probe result if it has finished; never waits on nvidia-smi.
+pub fn cached() -> Option<&'static Hardware> {
+    CACHE.get()
 }
 
 pub fn fit(path: &str, context_size: u32, gpu_layers: i32) -> Option<Fit> {
@@ -32,7 +38,7 @@ pub fn fit(path: &str, context_size: u32, gpu_layers: i32) -> Option<Fit> {
     if !file.is_file() || file.len() == 0 {
         return None;
     }
-    fit_model_bytes(file.len(), context_size, gpu_layers, hardware())
+    fit_model_bytes(file.len(), context_size, gpu_layers, cached()?)
 }
 
 pub fn fit_model_bytes(
@@ -267,6 +273,7 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     while child.try_wait().ok()?.is_none() {
         if start.elapsed() > Duration::from_secs(2) {
             let _ = child.kill();
+            let _ = child.wait();
             return None;
         }
         std::thread::sleep(Duration::from_millis(20));

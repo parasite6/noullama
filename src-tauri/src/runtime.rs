@@ -75,6 +75,8 @@ pub struct RuntimeSession {
     key_path: PathBuf,
     port: u16,
     cancel: tokio::sync::Notify,
+    /// When the runtime last wrote any output; loading only times out on silence.
+    last_output: std::sync::Mutex<std::time::Instant>,
 }
 
 impl Drop for RuntimeSession {
@@ -113,6 +115,7 @@ impl RuntimeSession {
             key_path,
             port,
             cancel: tokio::sync::Notify::new(),
+            last_output: std::sync::Mutex::new(std::time::Instant::now()),
         }))
     }
 }
@@ -411,22 +414,24 @@ pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Value, String
 }
 
 pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
-    let _guard = state.lifecycle.lock().await;
-    let mut child = state.child.lock().await;
-    let running = if let Some(c) = child.as_mut() {
-        c.try_wait().map_err(|e| e.to_string())?.is_none()
-    } else {
-        state.session.lock().await.is_some()
-    };
-    if !running {
-        *child = None;
-        *state.ready.lock().await = false;
-        *state.loaded_model.lock().await = None;
-        if let Some(session) = state.session.lock().await.take() {
-            session.cancel.notify_one();
+    let running = {
+        let _guard = state.lifecycle.lock().await;
+        let mut child = state.child.lock().await;
+        let running = if let Some(c) = child.as_mut() {
+            c.try_wait().map_err(|e| e.to_string())?.is_none()
+        } else {
+            state.session.lock().await.is_some()
+        };
+        if !running {
+            *child = None;
+            *state.ready.lock().await = false;
+            *state.loaded_model.lock().await = None;
+            if let Some(session) = state.session.lock().await.take() {
+                session.cancel.notify_one();
+            }
         }
-    }
-    drop(child);
+        running
+    };
     let settings = state.settings.lock().await.clone();
     let logs = state.logs.lock().await.clone();
     let download = state.download.lock().await.clone();
@@ -435,7 +440,9 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let api_error = state.api_error.lock().await.clone();
     let api_notice = state.api_notice.lock().await.clone();
     let runtime_download = state.runtimes.progress.lock().await.clone();
-    let hardware = crate::hardware::hardware();
+    // The probe runs in the background from startup; until it finishes the
+    // snapshot reports no hardware rather than waiting on nvidia-smi.
+    let hardware = crate::hardware::cached();
     let fit_path = loaded_model
         .as_ref()
         .map(|model| model.path.clone())
@@ -578,13 +585,13 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
     let state = state.clone();
     tokio::spawn(async move {
         let result = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(90), prepare_and_poll(&state, &settings, &session)) => result,
+            result = tokio::time::timeout(LOAD_LIMIT, prepare_and_poll(&state, &settings, &session)) => result,
             _ = session.cancel.notified() => return,
         };
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(error)) => error,
-            Err(_) => "Model loading timed out after 90 seconds.".into(),
+            Err(_) => "Model loading did not finish within 15 minutes.".into(),
         };
         let _guard = state.lifecycle.lock().await;
         if is_current_session(&state, &session).await {
@@ -594,6 +601,11 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
     });
     Ok(())
 }
+
+// Large models on slow disks or first-run CUDA kernel compilation can take
+// minutes, so the hard limit is generous and silence is what fails a load.
+const LOAD_LIMIT: Duration = Duration::from_secs(15 * 60);
+const LOAD_SILENCE: Duration = Duration::from_secs(5 * 60);
 
 async fn is_current_session(state: &AppState, session: &RuntimeSession) -> bool {
     state
@@ -717,15 +729,21 @@ async fn prepare_and_poll(
         .flatten()
         {
             let state = state.clone();
-            let key = session.key.clone();
+            let session = session.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(pipe).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    state.log(line.replace(&key, "[redacted]")).await;
+                    if let Ok(mut last) = session.last_output.lock() {
+                        *last = std::time::Instant::now();
+                    }
+                    state.log(line.replace(&session.key, "[redacted]")).await;
                 }
             });
         }
         *state.child.lock().await = Some(child);
+        if let Ok(mut last) = session.last_output.lock() {
+            *last = std::time::Instant::now();
+        }
         *state.loaded_model.lock().await = Some(LoadedModel {
             path: settings.model_path.clone(),
             device: device.clone(),
@@ -797,6 +815,16 @@ async fn prepare_and_poll(
                     .await;
                 return Ok(());
             }
+        }
+        if session
+            .last_output
+            .lock()
+            .is_ok_and(|last| last.elapsed() > LOAD_SILENCE)
+        {
+            return Err(format!(
+                "Model loading stalled: the runtime wrote nothing for {} seconds.",
+                LOAD_SILENCE.as_secs()
+            ));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

@@ -54,6 +54,12 @@ mod linux {
         args: Vec<String>,
     }
 
+    // A packaged install and a source build are different executables but share
+    // the app-data directory, so either one replaces the other on launch.
+    fn same_app(exe: &Path, this_exe: &Path) -> bool {
+        exe == this_exe || (exe.file_name().is_some() && exe.file_name() == this_exe.file_name())
+    }
+
     fn start_time(stat: &str) -> Option<u64> {
         stat.get(stat.rfind(')')? + 1..)?
             .split_whitespace()
@@ -77,7 +83,7 @@ mod linux {
         );
         let this_exe = std::env::current_exe().ok()?;
         if pid != std::process::id()
-            && exe != this_exe
+            && !same_app(&exe, &this_exe)
             && exe.file_name().is_none_or(|name| name != "llama-server")
         {
             return None;
@@ -181,7 +187,7 @@ mod linux {
             return Ok(());
         }
         let owned = app_exe
-            .map(|exe| current.exe == exe && current.data_dir.as_deref() == Some(root))
+            .map(|exe| same_app(&current.exe, exe) && current.data_dir.as_deref() == Some(root))
             .unwrap_or_else(|| owned_runtime(&current, root));
         if !owned {
             return Ok(());
@@ -229,7 +235,9 @@ mod linux {
             .ok_or_else(|| std::io::Error::other("Cannot verify this Noullama process identity"))?;
         let candidates: Vec<_> = processes()
             .into_iter()
-            .filter(|p| p.pid != me.pid && p.exe == me.exe && p.data_dir.as_deref() == Some(root))
+            .filter(|p| {
+                p.pid != me.pid && same_app(&p.exe, &me.exe) && p.data_dir.as_deref() == Some(root)
+            })
             .collect();
         if candidates
             .iter()
@@ -288,6 +296,14 @@ mod linux {
             process.args.push("/tmp/someone-elses.key".into());
             assert!(!owned_runtime(&process, &root));
             std::fs::remove_dir_all(root).unwrap();
+        }
+        #[test]
+        fn packaged_and_source_builds_are_the_same_app() {
+            assert!(same_app(
+                Path::new("/usr/bin/noullama"),
+                Path::new("/home/me/noullama/target/dev/debug/noullama")
+            ));
+            assert!(!same_app(Path::new("/usr/bin/ollama"), Path::new("/usr/bin/noullama")));
         }
         #[test]
         fn process_identity_parser_handles_spaces_and_parentheses_in_names() {

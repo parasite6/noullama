@@ -21,6 +21,12 @@ fn main() {
             let data_dir = app.path().app_data_dir()?;
             let lease = instance::acquire(&data_dir)?;
             app.manage(lease);
+            runtimes::sweep_staging(&data_dir);
+            // Probe GPU and memory once in the background; the first snapshot
+            // would otherwise wait on nvidia-smi.
+            std::thread::spawn(|| {
+                hardware::hardware();
+            });
             let state = AppState::new(data_dir)?;
             app.manage(state.clone());
             desktop::install_signal_handler(app.handle().clone());

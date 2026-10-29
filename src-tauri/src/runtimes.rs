@@ -14,6 +14,7 @@ use tokio::{io::AsyncWriteExt, sync::Mutex, task::JoinHandle};
 const REPO_API: &str = "https://api.github.com/repos/ggml-org/llama.cpp";
 const MAX_ARCHIVE: u64 = 1_500_000_000;
 const MAX_EXTRACTED: u64 = 8_000_000_000;
+const STALL: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 pub struct RuntimeManager {
@@ -550,9 +551,11 @@ async fn fetch_asset(state: &AppState, asset: &ReleaseAsset, target: &Path) -> R
         .client
         .get(&asset.url)
         .header("User-Agent", "Noullama/0.1")
-        .timeout(Duration::from_secs(900))
+        // Large archives on slow links can take hours; stalls are caught per chunk below.
+        .timeout(Duration::from_secs(24 * 60 * 60))
         .send();
-    let mut response = tokio::select! { r=request => r.map_err(|e|e.to_string())?, _=stop.wait_for(|s|*s) => return Err("Runtime download cancelled".into()) };
+    let request = tokio::time::timeout(STALL, request);
+    let mut response = tokio::select! { r=request => r.map_err(|_| "Runtime download timed out waiting for GitHub")?.map_err(|e|e.to_string())?, _=stop.wait_for(|s|*s) => return Err("Runtime download cancelled".into()) };
     if !response.status().is_success() {
         return Err(format!("Runtime download returned {}", response.status()));
     }
@@ -565,7 +568,7 @@ async fn fetch_asset(state: &AppState, asset: &ReleaseAsset, target: &Path) -> R
     let mut hash = Sha256::new();
     let mut bytes = 0u64;
     loop {
-        let chunk = tokio::select! { r=response.chunk()=>r.map_err(|e|e.to_string())?, _=stop.wait_for(|s|*s)=>return Err("Runtime download cancelled".into()) };
+        let chunk = tokio::select! { r=tokio::time::timeout(STALL, response.chunk())=>r.map_err(|_| "Runtime download stalled; no data received for 60 seconds")?.map_err(|e|e.to_string())?, _=stop.wait_for(|s|*s)=>return Err("Runtime download cancelled".into()) };
         let Some(chunk) = chunk else {
             break;
         };
@@ -695,6 +698,24 @@ async fn install_build(state: &AppState, build: &RuntimeBuild) -> Result<LocalRu
     .await;
     let _ = tokio::fs::remove_dir_all(&staging).await;
     result
+}
+
+/// Removes staging directories left by an install that was interrupted at exit.
+/// Runs at startup while this process holds the single-instance lock.
+pub fn sweep_staging(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("runtimes")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let staging = name
+            .strip_prefix('.')
+            .and_then(|n| n.strip_suffix("-partial"))
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+        if staging && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn walk_library_files(root: &Path) -> Vec<PathBuf> {
@@ -1011,6 +1032,21 @@ mod tests {
             std::fs::read(bin.join("llama-server")).unwrap(),
             b"not executed"
         );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn startup_sweep_removes_only_interrupted_staging_directories() {
+        let base = std::env::temp_dir().join(format!("noullama-sweep-{}", uuid::Uuid::new_v4()));
+        let runtimes = base.join("runtimes");
+        let staging = runtimes.join(format!(".{}-partial", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(staging.join("files")).unwrap();
+        std::fs::create_dir_all(runtimes.join("b1234-cpu")).unwrap();
+        std::fs::create_dir_all(runtimes.join(".not-a-uuid-partial")).unwrap();
+        sweep_staging(&base);
+        assert!(!staging.exists());
+        assert!(runtimes.join("b1234-cpu").exists());
+        assert!(runtimes.join(".not-a-uuid-partial").exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { EditorState } from '@codemirror/state';
-import { EditorView, keymap, lineNumbers, highlightActiveLineGutter } from '@codemirror/view';
+import { EditorView, drawSelection, keymap, lineNumbers, highlightActiveLineGutter } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, foldGutter, HighlightStyle, indentOnInput, syntaxHighlighting } from '@codemirror/language';
 import { json, jsonParseLinter } from '@codemirror/lang-json';
@@ -8,11 +8,12 @@ import { linter, lintGutter } from '@codemirror/lint';
 import { tags } from '@lezer/highlight';
 
 const colors = HighlightStyle.define([
-  { tag: tags.propertyName, color: '#b9a8f0' },
-  { tag: tags.string, color: '#a7b3ad' },
-  { tag: tags.number, color: '#b9b199' },
-  { tag: [tags.bool, tags.null], color: '#b9a8f0' },
-  { tag: [tags.punctuation, tags.bracket], color: '#7d8995' },
+  { tag: tags.propertyName, color: '#7cb7ff' },
+  { tag: tags.string, color: '#9ece6a' },
+  { tag: tags.number, color: '#ff9e64' },
+  { tag: [tags.bool, tags.null], color: '#f7768e' },
+  { tag: [tags.punctuation, tags.bracket, tags.separator], color: '#8a96a3' },
+  { tag: tags.invalid, color: '#ff5f5f', textDecoration: 'underline wavy' },
 ]);
 const theme = EditorView.theme({
   '&': { backgroundColor: '#0a0e14', color: '#adb6be', height: '100%', fontSize: '13px' },
@@ -23,7 +24,11 @@ const theme = EditorView.theme({
   '.cm-activeLineGutter': { backgroundColor: '#171d25' },
   '.cm-cursor': { borderLeftColor: '#c3cac4' },
   '&.cm-focused': { outline: 'none' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: '#2c3044' },
+  // Drawn by drawSelection(), so it shows in WebKitGTK where the native selection does not.
+  '.cm-selectionBackground': { backgroundColor: '#2a3a55' },
+  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: '#33507d' },
+  '.cm-selectionMatch': { backgroundColor: '#24324a' },
+  '.cm-matchingBracket, &.cm-focused .cm-matchingBracket': { backgroundColor: '#2d3b2a', color: '#e0e6e3' },
   '.cm-tooltip': { backgroundColor: '#171d25', color: '#c3cac4', border: '1px solid #2b333b' },
   '.cm-diagnostic': { fontSize: '11px' },
 }, { dark: true });
@@ -37,7 +42,7 @@ export function JsonEditor({ value, onChange, label, readOnly = false }: { value
     if (!host.current) return;
     const view = new EditorView({ parent: host.current, state: EditorState.create({ doc: value, extensions: [
       json(), theme, syntaxHighlighting(colors), lineNumbers(), highlightActiveLineGutter(),
-      bracketMatching(), foldGutter(), indentOnInput(), history(),
+      drawSelection(), bracketMatching(), foldGutter(), indentOnInput(), history(),
       linter(jsonParseLinter(), { delay: 200 }), lintGutter(),
       keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
       EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly),

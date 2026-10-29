@@ -19,7 +19,7 @@ const logoUrl = new URL('../logo.png', import.meta.url).href;
 
 type Settings = { runtime_path: string; model_path: string; mmproj_path: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string };
 
-type Snapshot = { settings: Settings; running: boolean; ready: boolean; api_port: number; api_error: string | null; api_notice: string | null; runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; download: DownloadState; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string } | null; hardware: Hardware; fit: Fit | null };
+type Snapshot = { settings: Settings; running: boolean; ready: boolean; api_port: number; api_error: string | null; api_notice: string | null; runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; download: DownloadState; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string } | null; hardware: Hardware | null; fit: Fit | null };
 type Hardware = { ram_bytes: number; vram_bytes: number | null; gpu: string | null; cpu_cores: number };
 type Fit = { level: number; label: string; detail: string; model_bytes: number; required_bytes: number };
 type SavedPreset = { id: string; name: string; questions: unknown; state: string; state_mode: 'text' | 'json' };

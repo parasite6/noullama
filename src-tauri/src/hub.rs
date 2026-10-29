@@ -621,8 +621,9 @@ pub async fn download_model(
 
 #[tauri::command]
 pub async fn cancel_download(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // Checked under the download lock so a cancel cannot leak into the next download.
     if state.download.lock().await.active {
-        state.app.download_cancel.notify_one();
+        state.app.download_cancel.send_replace(true);
     }
     Ok(())
 }
@@ -655,6 +656,7 @@ async fn begin_download(state: &AppState, repo: String, filename: String) -> Res
         if download.active {
             return Err("A model download is already in progress.".into());
         }
+        state.app.download_cancel.send_replace(false);
         *download = DownloadState {
             active: true,
             repo: repo.clone(),
@@ -664,9 +666,19 @@ async fn begin_download(state: &AppState, repo: String, filename: String) -> Res
         };
         state.settings.lock().await.clone()
     };
-    if let Err(error) = prepare_download(state, &settings, &repo, &filename).await {
+    let mut cancel = state.app.download_cancel.subscribe();
+    let prepared = tokio::select! {
+        result = prepare_download(state, &settings, &repo, &filename) => result,
+        _ = cancel.wait_for(|cancelled| *cancelled) => Err("Download cancelled.".into()),
+    };
+    if let Err(error) = prepared {
         let mut download = state.download.lock().await;
         download.active = false;
+        if *state.app.download_cancel.borrow() {
+            download.cancelled = true;
+            download.message = "Download cancelled before it started.".into();
+            return Ok(());
+        }
         download.error = Some(error.clone());
         download.message = "Download could not start.".into();
         return Err(error);
@@ -716,6 +728,10 @@ async fn prepare_download(
     if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("Noullama is shutting down.".into());
     }
+    if *state.app.download_cancel.borrow() {
+        return Err("Download cancelled.".into());
+    }
+    let started = std::time::SystemTime::now();
     let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().map_err(|e| format!("Cannot start hf: {e}. Install the Hugging Face CLI or configure its executable path."))?;
     {
         let mut download = state.download.lock().await;
@@ -735,12 +751,19 @@ async fn prepare_download(
     let repo = repo.to_owned();
     let filename = filename.to_owned();
     let app = state.app.clone();
-    let cache_dir = directory.join(".cache/huggingface/download");
-    state.app.cancelled_partials.lock().await.retain(|p| p.parent() != Some(cache_dir.as_path()) || !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("{filename}."))));
-    // Drop a permit left over from a cancel that arrived after the last download ended.
-    let _ = tokio::time::timeout(Duration::ZERO, app.download_cancel.notified()).await;
+    // hf keeps resume state under <local-dir>/.cache/huggingface/download/<filename>.*
+    let partial_base = directory.join(".cache/huggingface/download").join(&filename);
+    // A retry resumes from these files, so they no longer belong to a cancelled download.
+    state
+        .app
+        .cancelled_partials
+        .lock()
+        .await
+        .retain(|(base, _)| *base != partial_base);
+    let mut task_slot = app.download_task.lock().await;
     let task = tokio::spawn(async move {
         let mut stop = state.app.api_stop.subscribe();
+        let mut cancel = state.app.download_cancel.subscribe();
         let stderr = child.stderr.take();
         let progress_state = state.clone();
         let reader = tokio::spawn(async move {
@@ -754,7 +777,7 @@ async fn prepare_download(
         let completed = tokio::select! {
             result = child.wait() => Some(result),
             _ = stop.wait_for(|stop| *stop) => None,
-            _ = state.app.download_cancel.notified() => { cancelled = true; None }
+            _ = cancel.wait_for(|cancelled| *cancelled) => { cancelled = true; None }
         };
         let result = match completed {
             Some(result) => result,
@@ -778,12 +801,11 @@ async fn prepare_download(
         let mut download = state.download.lock().await;
         download.active = false;
         if cancelled {
-            // hf keeps partial data as <file>.incomplete beside its resume metadata;
-            // keep it until the app exits so an immediate retry can still resume.
+            // Keep the partial files until the app exits so an immediate retry can resume.
+            let files = cancelled_partial_files(&partial_base, started);
             let mut partials = state.app.cancelled_partials.lock().await;
-            for suffix in ["incomplete", "metadata", "lock"] {
-                partials.push(cache_dir.join(format!("{filename}.{suffix}")));
-            }
+            partials.retain(|(base, _)| *base != partial_base);
+            partials.push((partial_base, files));
             download.cancelled = true;
             download.message = "Download cancelled; partial files are kept until you quit Noullama.".into();
         } else if success {
@@ -813,8 +835,34 @@ async fn prepare_download(
             })
             .await;
     });
-    *app.download_task.lock().await = Some(task);
+    *task_slot = Some(task);
     Ok(())
+}
+
+// hf names the partial data `<hash>.<etag>.incomplete` beside `<filename>.metadata`
+// and `<filename>.lock`, so the data file is found by its write time instead of
+// its name: it is the one this download (or the resume it continued) touched.
+fn cancelled_partial_files(base: &Path, started: std::time::SystemTime) -> Vec<std::path::PathBuf> {
+    let with_suffix = |suffix: &str| {
+        let mut name = base.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+    let mut files = vec![with_suffix(".metadata"), with_suffix(".lock")];
+    let since = started - Duration::from_secs(2);
+    if let Some(entries) = base.parent().and_then(|dir| std::fs::read_dir(dir).ok()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let touched = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified >= since);
+            if touched && path.extension().is_some_and(|e| e == "incomplete") {
+                files.push(path);
+            }
+        }
+    }
+    files
 }
 
 #[cfg(test)]
@@ -1101,6 +1149,53 @@ mod tests {
         let files = list_local_models(&state).await.unwrap();
         assert_eq!(files["models"].as_array().unwrap().len(), 2);
         assert!(original.join("model.gguf").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cancelled_cleanup_finds_hashed_incomplete_files_written_by_this_download() {
+        let base = std::env::temp_dir().join(format!("noullama-partials-{}", uuid::Uuid::new_v4()));
+        let cache = base.join(".cache/huggingface/download/folder");
+        std::fs::create_dir_all(&cache).unwrap();
+        let started = std::time::SystemTime::now();
+        // hf names the data file after a hash of the metadata name, not the model file.
+        let current = cache.join("Xk3fQ0w=.0123abcd.incomplete");
+        std::fs::write(&current, b"partial").unwrap();
+        let older = cache.join("other=.4567.incomplete");
+        std::fs::write(&older, b"old").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(started - Duration::from_secs(3600))
+            .unwrap();
+        let files = cancelled_partial_files(&cache.join("model.gguf"), started);
+        assert!(files.contains(&current));
+        assert!(!files.contains(&older));
+        assert!(files.contains(&cache.join("model.gguf.metadata")));
+        assert!(files.contains(&cache.join("model.gguf.lock")));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_only_applies_while_a_download_is_active() {
+        let base = std::env::temp_dir().join(format!("noullama-cancel-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        // An idle cancel must not leak into the next download.
+        if state.download.lock().await.active {
+            state.app.download_cancel.send_replace(true);
+        }
+        assert!(!*state.app.download_cancel.borrow());
+        state.download.lock().await.active = true;
+        if state.download.lock().await.active {
+            state.app.download_cancel.send_replace(true);
+        }
+        // A waiter subscribing after the cancel (the download task) still sees it.
+        let mut late = state.app.download_cancel.subscribe();
+        tokio::time::timeout(Duration::from_millis(100), late.wait_for(|c| *c))
+            .await
+            .unwrap()
+            .unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
 }
