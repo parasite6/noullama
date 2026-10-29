@@ -389,6 +389,22 @@ label small { font-weight: 400; line-height: 1.6; }
 .quit-dialog h2 { font-size: 18px; margin-bottom: 10px; }
 .quit-dialog p { color: var(--secondary); font-size: 13px; line-height: 1.7; }
 .quit-dialog-actions { display: flex; justify-content: center; gap: 10px; margin-top: 24px; }
+.nav-item.has-update, .nav-item.has-update svg { color: var(--accent); }
+.updates-dialog { position: fixed; inset: 0; margin: auto; width: min(520px, calc(100vw - 40px)); max-width: none; max-height: calc(100vh - 60px); overflow: auto; padding: 26px 28px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 18px; color: var(--text); box-shadow: 0 24px 80px rgba(0, 0, 0, .6); }
+.updates-dialog::backdrop { background: rgba(10, 10, 12, .7); }
+.updates-dialog h2 { font-size: 18px; margin-bottom: 6px; }
+.updates-installed { color: var(--muted); font-size: 13px; }
+.updates-status { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; font-size: 14px; color: var(--secondary); line-height: 1.5; }
+.updates-status svg { flex-shrink: 0; margin-top: 3px; }
+.update-error { display: flex; gap: 8px; color: #f3c4c1; }
+.update-error svg { color: var(--bad); flex-shrink: 0; margin-top: 3px; }
+.update-offer { margin-top: 14px; padding: 14px; border-radius: 12px; background: var(--field); border: 1px solid var(--line); }
+.update-offer-head { display: flex; align-items: center; gap: 10px; }
+.update-offer-head a { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: var(--accent); }
+.update-notes { margin-top: 10px; max-height: 200px; overflow: auto; white-space: pre-wrap; font: 12.5px/1.6 var(--mono); color: var(--secondary); }
+.update-unsupported, .updates-hint { margin-top: 14px; font-size: 13px; line-height: 1.6; color: var(--muted); }
+.updates-prefs { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 18px; }
+.updates-dialog .quit-dialog-actions { justify-content: flex-end; }
 .author-logo { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; overflow: hidden; border-radius: 10px; background: var(--surface-2); color: var(--secondary); font-size: 12px; font-weight: 600; }
 .author-logo img { width: 100%; height: 100%; object-fit: contain; display: block; }
 

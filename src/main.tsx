@@ -4,9 +4,10 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Toggle } from './Toggle';
 import { ModelDetails, type MemoryUse } from './ModelDetails';
 import { ImageAttachments, MAX_TOTAL_BYTES, readImages, type Attachment } from './ImageAttachments';
-import { Activity, AlertCircle, ArrowDownToLine, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, ChevronUp, CircleCheck, Code2, Copy, Cpu, Download, ExternalLink, FileJson, FlaskConical, FolderOpen, Gauge, Layers3, Mail, MemoryStick, Microchip, Network, Play, Plus, RefreshCw, Route, Search, Settings2, Shield, ShieldCheck, Square, Terminal, Trash2, Save, Power, X } from 'lucide-react';
+import { Activity, AlertCircle, ArrowDownToLine, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, ChevronUp, CircleCheck, Code2, Copy, Cpu, Download, ExternalLink, FileJson, FlaskConical, FolderOpen, Gauge, Layers3, Mail, MemoryStick, Microchip, Network, Play, Plus, RefreshCw, Route, Search, Settings2, Shield, ShieldCheck, Square, Terminal, Trash2, Save, Power, X, CircleArrowUp } from 'lucide-react';
 import { buildRequest, convertState, presets } from './presets';
 import { QuitDialog } from './QuitDialog';
+import { UpdatesDialog, type UpdateView } from './UpdatesDialog';
 import { ContextMenu } from './ContextMenu';
 import { NumberField } from './NumberField';
 import { runtimeStatus } from './runtime-state';
@@ -98,6 +99,8 @@ function App() {
   const [token, setToken] = useState('');
   const [version, setVersion] = useState('');
   const [copied, setCopied] = useState('');
+  const [updates, setUpdates] = useState<UpdateView | null>(null);
+  const [updatesOpen, setUpdatesOpen] = useState(false);
   const desktop = isTauri();
 
   useEffect(() => { window.scrollTo({ top: 0, behavior: 'instant' }); }, [tab]);
@@ -118,7 +121,12 @@ function App() {
   }, [detailsOpen]);
 
   useEffect(() => { if (!desktop || tab !== 'models') return; const timer = setInterval(() => setScanTick(t => t + 1), 5000); return () => clearInterval(timer); }, [tab]);
-  async function refresh() { if (desktop) setSnapshot(await invoke<Snapshot>('snapshot')); }
+  async function refresh() { if (desktop) { setSnapshot(await invoke<Snapshot>('snapshot')); setUpdates(await invoke<UpdateView>('update_state')); } }
+  async function updateCommand(command: string, args?: Record<string, unknown>) {
+    try { const next = await invoke<UpdateView | null>(command, args); if (next) setUpdates(next); }
+    catch { /* the dialog shows the failure from update_state */ }
+    await refresh().catch(() => {});
+  }
   useEffect(() => {
     if (!desktop) return;
     invoke<SavedPreset[]>('list_presets').then(setSavedPresets).catch(e => setNotice({ text: errorText(e), error: true }));
@@ -273,6 +281,7 @@ function App() {
         ['playground', FlaskConical, 'Playground'], ['models', Layers3, 'Models'], ['hub', Network, 'Hub'], ['runtime', Cpu, 'Runtime'], ['api', Code2, 'Local API'],
       ].map(([id, Icon, title]) => { const I = Icon as typeof Cpu; return <button key={String(id)} className={`nav-item ${tab === id ? 'active' : ''}`} aria-current={tab === id ? 'page' : undefined} title={String(title)} onClick={() => setTab(String(id))}><I size={18}/><span>{String(title)}</span></button>; })}</nav>
       <div className="sidebar-bottom">
+        {desktop && <button className={`nav-item ${updates?.offer ? 'has-update' : ''}`} title={updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'} aria-haspopup="dialog" onClick={() => setUpdatesOpen(true)}><CircleArrowUp size={18}/><span>{updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'}</span></button>}
         <button className="nav-item" title="Runtime logs" aria-label="Runtime logs" aria-pressed={showLogs} onClick={() => setShowLogs(v => !v)}><Terminal size={18}/><span>Runtime logs</span></button>
         <button className="nav-item" title="Quit Noullama" aria-label="Quit Noullama" disabled={!desktop || busy === 'quit'} onClick={() => action('quit-prompt', async () => { await invoke('request_quit'); })}><Power size={18}/><span>Quit Noullama</span></button>
         <div className="runtime-card-wrap" onMouseEnter={() => setDetailsOpen(true)} onMouseLeave={() => setDetailsOpen(false)} onFocus={() => setDetailsOpen(true)} onBlur={() => setDetailsOpen(false)}>
@@ -390,6 +399,7 @@ function App() {
       {download.active && <div className="download-track" aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, download.progress ?? 0))}%` }}/></div>}</>}
     </aside>}
     <ContextMenu/>
+    {updates && <UpdatesDialog open={updatesOpen} view={updates} onClose={() => setUpdatesOpen(false)} onCheck={() => { void updateCommand('check_for_update'); }} onInstall={() => { void updateCommand('install_update'); }} onPrefs={(includePrereleases, checkOnLaunch) => { void updateCommand('set_update_prefs', { includePrereleases, checkOnLaunch }); }}/>}
     <QuitDialog open={snapshot?.quit_confirmation ?? false} pending={busy === 'quit' || busy === 'cancel-quit'} onCancel={() => { void action('cancel-quit', async () => { await invoke('cancel_quit'); }); }} onConfirm={() => { void action('quit', async () => { await invoke('quit_app'); }); }}/>
     {showLogs && <div className="log-drawer"><div className="panel-heading"><span><Terminal size={16}/> Runtime activity</span><button className="icon-button" aria-label="Close runtime logs" onClick={() => setShowLogs(false)}><X size={17}/></button></div><pre>{snapshot?.logs.join('\n') || 'No runtime activity yet.'}</pre></div>}
   </div>;

@@ -13,14 +13,17 @@ jobs:
     # 22.04 keeps the glibc baseline low and ships webkit2gtk-4.1.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Check the tag matches the app version
         run: |
           version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          # rpm rejects semver pre-release versions, so v1.2.3-pre and
+          # v1.2.3-nightly mark pre-releases of the plain app version 1.2.3.
+          tag=${GITHUB_REF_NAME%-pre}
+          if [ "v$version" != "${tag%-nightly}" ]; then
             echo "Tag $GITHUB_REF_NAME does not match tauri.conf.json version $version" >&2
             exit 1
           fi
@@ -32,9 +35,9 @@ jobs:
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
             libxdo-dev libssl-dev libgtk-3-dev patchelf
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -45,16 +48,26 @@ jobs:
 
       - run: npm ci
 
-      - name: Build deb and rpm
-        run: npm run tauri -- build --bundles deb,rpm
+      - name: Build and sign deb and rpm
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # Pre-release builds offer pre-release updates by default.
+          case "$GITHUB_REF_NAME" in *-pre|*-nightly) export NOULLAMA_PRERELEASE=1 ;; esac
+          # Signing is enabled here only, so local builds need no key.
+          npm run tauri -- build --bundles deb,rpm \
+            --config '{"bundle":{"createUpdaterArtifacts":true}}'
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-packages
           if-no-files-found: error
           path: |
             src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/deb/*.deb.sig
             src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/rpm/*.rpm.sig
 
   publish:
     needs: build
@@ -63,16 +76,36 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: linux-packages
           path: packages
+
+      # The in-app updater reads this manifest from the release it belongs to.
+      - name: Write update manifest
+        env:
+          BASE: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}
+        run: |
+          deb=$(find packages -type f -name '*.deb')
+          rpm=$(find packages -type f -name '*.rpm')
+          jq -n \
+            --arg version "$(echo "${GITHUB_REF_NAME#v}" | sed -E 's/-(pre|nightly)$//')" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg deb_url "$BASE/$(basename "$deb")" --rawfile deb_sig "$deb.sig" \
+            --arg rpm_url "$BASE/$(basename "$rpm")" --rawfile rpm_sig "$rpm.sig" \
+            '{version: $version, pub_date: $date, notes: "",
+              platforms: {
+                "linux-x86_64-deb": {url: $deb_url, signature: $deb_sig},
+                "linux-x86_64-rpm": {url: $rpm_url, signature: $rpm_sig}}}' \
+            > packages/latest.json
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          prerelease=
+          case "$GITHUB_REF_NAME" in *-pre|*-nightly) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" $prerelease \
             --title "$GITHUB_REF_NAME" --generate-notes \
-            $(find packages -type f \( -name '*.deb' -o -name '*.rpm' \))
+            $(find packages -type f \( -name '*.deb' -o -name '*.rpm' \)) packages/latest.json

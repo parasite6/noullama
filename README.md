@@ -56,7 +56,7 @@ Question types:
 
 Needed to build from source. The `.deb` and `.rpm` packages install the system libraries themselves, but still need `hf` and a `llama-server`.
 
-- Node.js 22+, Rust, and Blaze for the provided build commands.
+- Node.js 24+, Rust, and Blaze for the provided build commands.
 - The Hugging Face CLI (`hf`) for downloads. Public models do not require a login; gated models require access and authentication.
 - A compatible `llama-server`. Liquid d1-2B requires a build containing [llama.cpp PR #31275](https://github.com/ggml-org/llama.cpp/pull/31275), such as b11954 or a compatible newer build.
 - On Linux, the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux), including GTK 3 and WebKitGTK 4.1 development packages.
@@ -65,7 +65,7 @@ Needed to build from source. The `.deb` and `.rpm` packages install the system l
 
 ### Install or build
 
-Tagged releases publish `.deb` and `.rpm` packages for 64-bit Linux, linked from [noullama.dev/download](https://noullama.dev/download/).
+Tagged releases publish `.deb` and `.rpm` packages for 64-bit Linux, linked from [noullama.dev/download](https://noullama.dev/download/). Once installed from a package, Noullama can update itself; see [Updates](#updates).
 
 To build a standalone executable instead:
 
@@ -77,6 +77,16 @@ npm run desktop:build -- --debug  # debug
 - On Linux, the binaries are written to `src-tauri/target/release/noullama` and `src-tauri/target/debug/noullama`.
 - Standalone builds include the frontend and do not require a Vite server.
 - Development builds use a separate target directory.
+
+### Updates
+
+**Updates** in the sidebar shows the installed version and checks GitHub for a newer release. When one exists, the entry changes to **Update to** followed by the version.
+
+- **Install and restart** downloads the package for your install type (`.deb` or `.rpm`), verifies its signature, and asks for your password through the system prompt to install it. Noullama then unloads the model, stops the local API, and restarts.
+- **Check when noullama starts** checks once a few seconds after launch. Nothing is downloaded until you choose **Install and restart**.
+- **Include pre-releases** offers pre-release versions too. It starts on when the installed version is itself a pre-release.
+
+Only copies installed from the `.deb` or `.rpm` package can update themselves. A source build or standalone executable shows the newest version but must be updated by hand. Versions before 0.2.1 have no updater; install 0.2.1 or later from the package once.
 
 ### First run
 

@@ -8,6 +8,7 @@ mod lifecycle;
 mod presets;
 mod runtime;
 mod runtimes;
+mod updates;
 
 use runtime::AppState;
 use std::sync::atomic::Ordering;
@@ -17,6 +18,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let lease = instance::acquire(&data_dir)?;
@@ -27,6 +29,9 @@ fn main() {
             std::thread::spawn(|| {
                 hardware::hardware();
             });
+            let updates = updates::Updates::load(&data_dir);
+            updates.check_on_launch(app.handle().clone());
+            app.manage(updates);
             let state = AppState::new(data_dir)?;
             app.manage(state.clone());
             desktop::install_signal_handler(app.handle().clone());
@@ -65,7 +70,11 @@ fn main() {
             presets::save_preset,
             presets::delete_preset,
             files::pick_model_file,
-            files::reveal_model_file
+            files::reveal_model_file,
+            updates::update_state,
+            updates::set_update_prefs,
+            updates::check_for_update,
+            updates::install_update
         ])
         .build(tauri::generate_context!())
         .expect("Could not initialize noullama")
