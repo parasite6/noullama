@@ -60,6 +60,8 @@ pub struct AppState {
     pub api_error: Arc<Mutex<Option<String>>>,
     pub api_notice: Arc<Mutex<Option<String>>>,
     pub loaded_model: Arc<Mutex<Option<LoadedModel>>>,
+    // Why the last load failed or the runtime stopped on its own, shown in the UI.
+    pub load_error: Arc<Mutex<Option<String>>>,
     pub presets_lock: Arc<Mutex<()>>,
     pub local_client: reqwest::Client,
     pub data_dir: PathBuf,
@@ -125,6 +127,8 @@ pub struct LoadedModel {
     pub path: String,
     pub device: String,
     pub runtime_path: String,
+    // Loaded with a multimodal projector, so requests may carry images.
+    pub projector: bool,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -183,6 +187,7 @@ impl AppState {
             ready: Default::default(),
             api_error: Default::default(),
             api_notice: Default::default(),
+            load_error: Default::default(),
             loaded_model: Default::default(),
             presets_lock: Default::default(),
             local_client: reqwest::Client::builder()
@@ -261,7 +266,17 @@ impl AppState {
             )
         })?;
         if !status.is_success() {
-            return Err(format!("Runtime {status}: {value}"));
+            if status == reqwest::StatusCode::NOT_IMPLEMENTED && has_images(&payload) {
+                return Err("This model cannot read images as loaded. Turn on Vision for a model with a multimodal projector, then reload it.".into());
+            }
+            let detail = value["error"]["message"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            return Err(format!(
+                "Runtime {status}: {}",
+                detail.chars().take(500).collect::<String>()
+            ));
         }
         if let Some(model) = value.get_mut("model") {
             *model = json!("noullama");
@@ -270,9 +285,35 @@ impl AppState {
     }
 }
 
+fn has_images(payload: &Value) -> bool {
+    ["images", "files"]
+        .iter()
+        .any(|key| payload[key].as_array().is_some_and(|list| !list.is_empty()))
+}
+
 pub fn validate_request(payload: &Value) -> Result<(), String> {
     if !payload.is_object() || payload.get("state").is_none() {
         return Err("Request needs a state field and a questions object.".into());
+    }
+    // The runtime takes inline data URLs only; reject anything else here so
+    // the error names the field instead of surfacing as a runtime 400.
+    for key in ["images", "files"] {
+        let Some(list) = payload.get(key) else {
+            continue;
+        };
+        let valid = list.as_array().is_some_and(|list| {
+            list.iter().all(|item| {
+                item.as_str().is_some_and(|url| {
+                    (url.starts_with("data:image/") || url.starts_with("data:audio/"))
+                        && url.contains(";base64,")
+                })
+            })
+        });
+        if !valid {
+            return Err(format!(
+                "{key} must be an array of base64 data URLs (data:image/...;base64,...)."
+            ));
+        }
     }
     let questions = payload
         .get("questions")
@@ -418,7 +459,19 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
         let _guard = state.lifecycle.lock().await;
         let mut child = state.child.lock().await;
         let running = if let Some(c) = child.as_mut() {
-            c.try_wait().map_err(|e| e.to_string())?.is_none()
+            let status = c.try_wait().map_err(|e| e.to_string())?;
+            if let Some(status) = status {
+                // The load task reports its own failures; this catches a
+                // runtime that stopped after it was ready.
+                if *state.ready.lock().await {
+                    let logs = state.logs.lock().await;
+                    *state.load_error.lock().await = Some(with_runtime_detail(
+                        format!("The runtime stopped unexpectedly ({status})."),
+                        &logs,
+                    ));
+                }
+            }
+            status.is_none()
         } else {
             state.session.lock().await.is_some()
         };
@@ -439,6 +492,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let ready = *state.ready.lock().await;
     let api_error = state.api_error.lock().await.clone();
     let api_notice = state.api_notice.lock().await.clone();
+    let load_error = state.load_error.lock().await.clone();
     let runtime_download = state.runtimes.progress.lock().await.clone();
     // The probe runs in the background from startup; until it finishes the
     // snapshot reports no hardware rather than waiting on nvidia-smi.
@@ -447,12 +501,17 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
         .as_ref()
         .map(|model| model.path.clone())
         .unwrap_or_else(|| settings.model_path.clone());
-    let fit = crate::hardware::fit(&fit_path, settings.context_size, settings.gpu_layers);
+    let fit = crate::hardware::fit(
+        &fit_path,
+        &settings.mmproj_path,
+        settings.context_size,
+        settings.gpu_layers,
+    );
     Ok(
         json!({"settings": settings, "running": running, "ready": ready,
         "logs": logs, "download": download, "loaded_model":loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
-        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit}),
+        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_error": load_error, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit}),
     )
 }
 
@@ -577,11 +636,10 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
         return Err("The multimodal projector path does not exist.".into());
     }
     let session = RuntimeSession::new(&state.data_dir, settings.runtime_port)?;
+    *state.load_error.lock().await = None;
     *state.session.lock().await = Some(session.clone());
     *state.ready.lock().await = false;
-    state
-        .log("Loading model; checking the runtime and waiting for readiness…".into())
-        .await;
+    state.log(LOAD_MARKER.into()).await;
     let state = state.clone();
     tokio::spawn(async move {
         let result = tokio::select! {
@@ -595,11 +653,58 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
         };
         let _guard = state.lifecycle.lock().await;
         if is_current_session(&state, &session).await {
-            state.log(error.replace(&session.key, "[redacted]")).await;
+            let error = error.replace(&session.key, "[redacted]");
+            state.log(error.clone()).await;
+            let detail = {
+                let logs = state.logs.lock().await;
+                with_runtime_detail(error, &logs)
+            };
+            *state.load_error.lock().await = Some(detail);
             state.shutdown_locked().await;
         }
     });
     Ok(())
+}
+
+const LOAD_MARKER: &str = "Loading model; checking the runtime and waiting for readiness…";
+
+// llama-server explains most failures (bad file, out of memory, unsupported
+// architecture) in its own output, so attach its last error lines from this
+// load to the summary instead of only pointing at the log.
+fn with_runtime_detail(summary: String, logs: &VecDeque<String>) -> String {
+    let start = logs
+        .iter()
+        .rposition(|line| line == LOAD_MARKER)
+        .map_or(0, |i| i + 1);
+    let mut lines: Vec<&str> = logs
+        .iter()
+        .skip(start)
+        .map(|line| line.trim())
+        .filter(|line| *line != summary.as_str())
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            [
+                "error",
+                "failed",
+                "unable",
+                "cannot",
+                "invalid",
+                "out of memory",
+                "unknown model",
+                "not supported",
+                "abort",
+            ]
+            .iter()
+            .any(|word| lower.contains(word))
+        })
+        .collect();
+    lines.dedup();
+    let detail = lines[lines.len().saturating_sub(3)..].join("\n");
+    if detail.is_empty() {
+        summary
+    } else {
+        format!("{summary}\n{detail}")
+    }
 }
 
 // Large models on slow disks or first-run CUDA kernel compilation can take
@@ -748,6 +853,7 @@ async fn prepare_and_poll(
             path: settings.model_path.clone(),
             device: device.clone(),
             runtime_path: settings.runtime_path.clone(),
+            projector: !settings.mmproj_path.is_empty(),
         });
         state
             .log(format!("Loading {} on {device}", settings.model_path))
@@ -838,6 +944,15 @@ pub async fn stop_runtime(state: tauri::State<'_, AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
+pub async fn model_memory(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let pid = state.child.lock().await.as_ref().and_then(Child::id);
+    let usage = tokio::task::spawn_blocking(move || crate::hardware::memory_use(pid))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!(usage))
+}
+
+#[tauri::command]
 pub async fn decide(payload: Value, state: tauri::State<'_, AppState>) -> Result<Value, String> {
     state.infer(payload).await
 }
@@ -845,6 +960,45 @@ pub async fn decide(payload: Value, state: tauri::State<'_, AppState>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn images_must_be_inline_data_urls() {
+        let question = json!({"q": {"type": "noul", "instructions": "Is there a table?"}});
+        let ok = json!({"state": null, "questions": question, "images": ["data:image/png;base64,iVBORw0KGgo="]});
+        assert!(validate_request(&ok).is_ok());
+        assert!(has_images(&ok));
+        for images in [
+            json!(["https://example.com/a.png"]),
+            json!("data:image/png;base64,AA"),
+            json!([1]),
+        ] {
+            let request = json!({"state": "x", "questions": question, "images": images});
+            assert!(validate_request(&request)
+                .unwrap_err()
+                .contains("data URLs"));
+        }
+        assert!(!has_images(&json!({"state": "x", "images": []})));
+    }
+
+    #[test]
+    fn load_errors_carry_the_runtime_explanation_from_this_load() {
+        let logs: VecDeque<String> = [
+            "error: stale failure from an earlier load",
+            LOAD_MARKER,
+            "llama_model_load: loading model",
+            "llama_model_load: error loading model: unknown model architecture: 'foo'",
+            "main: exiting due to model loading error",
+        ]
+        .map(String::from)
+        .into();
+        let message = with_runtime_detail("Runtime exited during startup.".into(), &logs);
+        assert!(message.starts_with("Runtime exited during startup.\n"));
+        assert!(message.contains("unknown model architecture"));
+        assert!(!message.contains("stale failure"));
+        assert_eq!(
+            with_runtime_detail("Plain.".into(), &VecDeque::new()),
+            "Plain."
+        );
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn runtime_credentials_are_private_temporary_and_absent_from_snapshots() {

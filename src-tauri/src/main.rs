@@ -52,6 +52,7 @@ fn main() {
             runtime::start_runtime,
             runtime::stop_runtime,
             runtime::decide,
+            runtime::model_memory,
             hub::hf_session,
             hub::set_hf_token,
             hub::search_models,

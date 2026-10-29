@@ -1,6 +1,6 @@
 [package]
 name = "noullama"
-version = "0.1.2"
+version = "0.2.0"
 description = "Local inference for decision models"
 edition = "2021"
 

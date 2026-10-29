@@ -16,22 +16,35 @@ const colors = HighlightStyle.define([
   { tag: tags.invalid, color: '#ff5f5f', textDecoration: 'underline wavy' },
 ]);
 const theme = EditorView.theme({
-  '&': { backgroundColor: '#0a0e14', color: '#adb6be', height: '100%', fontSize: '13px' },
-  '.cm-scroller': { fontFamily: '"SFMono-Regular", Consolas, monospace', lineHeight: '1.7', overflow: 'auto', overscrollBehavior: 'contain' },
-  '.cm-content': { padding: '12px 0', caretColor: '#c3cac4' },
+  '&': { backgroundColor: '#19191b', color: '#c9c9cf', height: '100%', fontSize: '13px' },
+  '.cm-scroller': { fontFamily: '"Geist Mono Variable", "SFMono-Regular", Consolas, monospace', lineHeight: '1.7', overflow: 'auto', overscrollBehavior: 'contain' },
+  '.cm-content': { padding: '12px 0', caretColor: '#ececee' },
   '.cm-line': { padding: '0 12px' },
-  '.cm-gutters': { backgroundColor: '#0a0e14', color: '#596570', borderRight: '1px solid #202830' },
-  '.cm-activeLineGutter': { backgroundColor: '#171d25' },
-  '.cm-cursor': { borderLeftColor: '#c3cac4' },
+  '.cm-gutters': { backgroundColor: '#19191b', color: '#5a5a61', borderRight: '0' },
+  '.cm-activeLineGutter': { backgroundColor: '#232325', color: '#b6b6bd' },
+  '.cm-cursor': { borderLeftColor: '#ececee' },
   '&.cm-focused': { outline: 'none' },
   // Drawn by drawSelection(), so it shows in WebKitGTK where the native selection does not.
   '.cm-selectionBackground': { backgroundColor: '#2a3a55' },
   '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: '#33507d' },
   '.cm-selectionMatch': { backgroundColor: '#24324a' },
   '.cm-matchingBracket, &.cm-focused .cm-matchingBracket': { backgroundColor: '#2d3b2a', color: '#e0e6e3' },
-  '.cm-tooltip': { backgroundColor: '#171d25', color: '#c3cac4', border: '1px solid #2b333b' },
+  '.cm-tooltip': { backgroundColor: '#2b2b2e', color: '#ececee', border: '1px solid #46464c', borderRadius: '8px' },
   '.cm-diagnostic': { fontSize: '11px' },
+  '.cm-foldGutter .cm-gutterElement': { padding: '0 4px 0 2px', cursor: 'pointer' },
+  '.cm-fold-marker': { display: 'inline-flex', verticalAlign: 'middle', color: '#6a6a72', transition: 'transform .15s' },
+  '.cm-fold-marker:hover': { color: '#ececee' },
+  '.cm-fold-marker.open': { transform: 'rotate(90deg)' },
+  '.cm-foldPlaceholder': { backgroundColor: '#2b2b2e', border: '0', borderRadius: '6px', color: '#b6b6bd', padding: '0 6px' },
 }, { dark: true });
+
+// The default fold markers are tiny text glyphs; draw the app's chevron instead.
+function foldMarker(open: boolean) {
+  const marker = document.createElement('span');
+  marker.className = open ? 'cm-fold-marker open' : 'cm-fold-marker';
+  marker.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>';
+  return marker;
+}
 
 export function JsonEditor({ value, onChange, label, readOnly = false }: { value: string; onChange?: (value: string) => void; label: string; readOnly?: boolean }) {
   const host = useRef<HTMLDivElement>(null);
@@ -41,8 +54,8 @@ export function JsonEditor({ value, onChange, label, readOnly = false }: { value
   useEffect(() => {
     if (!host.current) return;
     const view = new EditorView({ parent: host.current, state: EditorState.create({ doc: value, extensions: [
-      json(), theme, syntaxHighlighting(colors), lineNumbers(), highlightActiveLineGutter(),
-      drawSelection(), bracketMatching(), foldGutter(), indentOnInput(), history(),
+      json(), theme, EditorView.lineWrapping, syntaxHighlighting(colors), lineNumbers(), highlightActiveLineGutter(),
+      drawSelection(), bracketMatching(), foldGutter({ markerDOM: foldMarker }), indentOnInput(), history(),
       linter(jsonParseLinter(), { delay: 200 }), lintGutter(),
       keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
       EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly),

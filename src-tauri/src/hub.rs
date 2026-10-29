@@ -752,7 +752,9 @@ async fn prepare_download(
     let filename = filename.to_owned();
     let app = state.app.clone();
     // hf keeps resume state under <local-dir>/.cache/huggingface/download/<filename>.*
-    let partial_base = directory.join(".cache/huggingface/download").join(&filename);
+    let partial_base = directory
+        .join(".cache/huggingface/download")
+        .join(&filename);
     // A retry resumes from these files, so they no longer belong to a cancelled download.
     state
         .app
@@ -807,7 +809,8 @@ async fn prepare_download(
             partials.retain(|(base, _)| *base != partial_base);
             partials.push((partial_base, files));
             download.cancelled = true;
-            download.message = "Download cancelled; partial files are kept until you quit Noullama.".into();
+            download.message =
+                "Download cancelled; partial files are kept until you quit Noullama.".into();
         } else if success {
             download.downloaded_bytes = size.unwrap_or(download.downloaded_bytes);
             download.total_bytes = size.or(download.total_bytes);

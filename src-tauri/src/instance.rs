@@ -303,7 +303,10 @@ mod linux {
                 Path::new("/usr/bin/noullama"),
                 Path::new("/home/me/noullama/target/dev/debug/noullama")
             ));
-            assert!(!same_app(Path::new("/usr/bin/ollama"), Path::new("/usr/bin/noullama")));
+            assert!(!same_app(
+                Path::new("/usr/bin/ollama"),
+                Path::new("/usr/bin/noullama")
+            ));
         }
         #[test]
         fn process_identity_parser_handles_spaces_and_parentheses_in_names() {

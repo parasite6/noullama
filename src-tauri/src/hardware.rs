@@ -33,12 +33,104 @@ pub fn cached() -> Option<&'static Hardware> {
     CACHE.get()
 }
 
-pub fn fit(path: &str, context_size: u32, gpu_layers: i32) -> Option<Fit> {
+/// `projector` is the multimodal projector loaded alongside, if any; it sits
+/// in the same memory as the weights, so it counts toward the estimate.
+pub fn fit(path: &str, projector: &str, context_size: u32, gpu_layers: i32) -> Option<Fit> {
     let file = std::fs::metadata(path).ok()?;
     if !file.is_file() || file.len() == 0 {
         return None;
     }
-    fit_model_bytes(file.len(), context_size, gpu_layers, cached()?)
+    let projector = std::fs::metadata(projector)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map_or(0, |file| file.len());
+    fit_model_bytes(file.len() + projector, context_size, gpu_layers, cached()?)
+}
+
+#[derive(Serialize, Default, Debug, PartialEq)]
+pub struct MemoryUse {
+    /// Graphics memory held by the runtime process (NVIDIA only).
+    pub process_bytes: Option<u64>,
+    pub used_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+}
+
+/// Live graphics memory, read on demand (it runs nvidia-smi, so never per snapshot).
+pub fn memory_use(pid: Option<u32>) -> MemoryUse {
+    if let Some(text) = command_output(
+        "nvidia-smi",
+        &[
+            "--query-gpu=memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+    ) {
+        let apps = pid.and_then(|_| {
+            command_output(
+                "nvidia-smi",
+                &[
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+            )
+        });
+        return parse_nvidia_memory(&text, apps.as_deref(), pid);
+    }
+    amd_memory()
+}
+
+fn mib(text: &str) -> Option<u64> {
+    text.trim().parse::<u64>().ok().map(|mib| mib * 1024 * 1024)
+}
+
+fn parse_nvidia_memory(gpus: &str, apps: Option<&str>, pid: Option<u32>) -> MemoryUse {
+    let (used_bytes, total_bytes) = gpus
+        .lines()
+        .next()
+        .and_then(|line| line.split_once(','))
+        .map_or((None, None), |(used, total)| (mib(used), mib(total)));
+    let process_bytes = pid.zip(apps).and_then(|(pid, apps)| {
+        apps.lines()
+            .filter_map(|line| line.split_once(','))
+            .filter(|(id, _)| id.trim().parse::<u32>().ok() == Some(pid))
+            .filter_map(|(_, used)| mib(used))
+            .reduce(|a, b| a + b)
+    });
+    MemoryUse {
+        process_bytes,
+        used_bytes,
+        total_bytes,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn amd_memory() -> MemoryUse {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return MemoryUse::default();
+    };
+    for entry in entries.flatten() {
+        let device = entry.path().join("device");
+        let read = |name: &str| {
+            std::fs::read_to_string(device.join(name))
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        };
+        if let (Some(used), Some(total)) = (read("mem_info_vram_used"), read("mem_info_vram_total"))
+        {
+            if total > 0 {
+                return MemoryUse {
+                    process_bytes: None,
+                    used_bytes: Some(used),
+                    total_bytes: Some(total),
+                };
+            }
+        }
+    }
+    MemoryUse::default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn amd_memory() -> MemoryUse {
+    MemoryUse::default()
 }
 
 pub fn fit_model_bytes(
@@ -289,6 +381,22 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nvidia_memory_reads_the_runtime_process_and_the_card() {
+        let usage = parse_nvidia_memory("3120, 8188\n", Some("911, 300\n4242, 2500\n"), Some(4242));
+        assert_eq!(usage.used_bytes, Some(3120 * 1024 * 1024));
+        assert_eq!(usage.total_bytes, Some(8188 * 1024 * 1024));
+        assert_eq!(usage.process_bytes, Some(2500 * 1024 * 1024));
+        assert_eq!(
+            parse_nvidia_memory("3120, 8188", Some("911, 300"), Some(4242)).process_bytes,
+            None
+        );
+        assert_eq!(
+            parse_nvidia_memory("garbage", None, None),
+            MemoryUse::default()
+        );
+    }
+
     fn machine(ram_gb: u64, vram_gb: Option<u64>) -> Hardware {
         Hardware {
             ram_bytes: ram_gb * 1_000_000_000,
@@ -341,7 +449,7 @@ mod tests {
 
     #[test]
     fn missing_or_empty_files_have_no_rating() {
-        assert!(fit("/definitely/not/a/model.gguf", 8192, 99).is_none());
+        assert!(fit("/definitely/not/a/model.gguf", "", 8192, 99).is_none());
     }
 
     #[test]
