@@ -27,6 +27,12 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match tauri.conf.json version $version" >&2
             exit 1
           fi
+          npm_version=$(node -p "require('./package.json').version")
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$npm_version" != "$version" ] || [ "$cargo_version" != "$version" ]; then
+            echo "Versions disagree: tauri.conf.json $version, package.json $npm_version, Cargo.toml $cargo_version" >&2
+            exit 1
+          fi
 
       - name: Install system libraries
         run: |
@@ -95,8 +101,8 @@ jobs:
             --arg rpm_url "$BASE/$(basename "$rpm")" --rawfile rpm_sig "$rpm.sig" \
             '{version: $version, pub_date: $date, notes: "",
               platforms: {
-                "linux-x86_64-deb": {url: $deb_url, signature: $deb_sig},
-                "linux-x86_64-rpm": {url: $rpm_url, signature: $rpm_sig}}}' \
+                "linux-x86_64-deb": {url: $deb_url, signature: ($deb_sig | rtrimstr("\n"))},
+                "linux-x86_64-rpm": {url: $rpm_url, signature: ($rpm_sig | rtrimstr("\n"))}}}' \
             > packages/latest.json
 
       - name: Publish release

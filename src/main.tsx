@@ -126,7 +126,9 @@ function App() {
   async function refresh() { if (desktop) { setSnapshot(await invoke<Snapshot>('snapshot')); setUpdates(await invoke<UpdateView>('update_state')); } }
   async function updateCommand(command: string, args?: Record<string, unknown>) {
     try { const next = await invoke<UpdateView | null>(command, args); if (next) setUpdates(next); }
-    catch { /* the dialog shows the failure from update_state */ }
+    // Check and install failures show in the dialog from update_state; a
+    // preference that could not be saved has nowhere else to appear.
+    catch (e) { if (command === 'set_update_prefs') setNotice({ text: errorText(e), error: true }); }
     await refresh().catch(() => {});
   }
   useEffect(() => {
@@ -425,7 +427,7 @@ function App() {
       {download.active && <div className="download-track" aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, download.progress ?? 0))}%` }}/></div>}</>}
     </aside>}
     <ContextMenu/>
-    {updates && <UpdatesDialog open={updatesOpen} view={updates} onClose={() => setUpdatesOpen(false)} onCheck={() => { void updateCommand('check_for_update'); }} onInstall={() => { void updateCommand('install_update'); }} onPrefs={(includePrereleases, checkOnLaunch) => { void updateCommand('set_update_prefs', { includePrereleases, checkOnLaunch }); }}/>}
+    {updates && <UpdatesDialog open={updatesOpen} view={updates} onClose={() => setUpdatesOpen(false)} onCheck={() => { void updateCommand('check_for_update'); }} onInstall={() => { void updateCommand('install_update'); }} onPrefs={(includePrereleases, checkOnLaunch) => { setUpdates(view => view && { ...view, include_prereleases: includePrereleases, check_on_launch: checkOnLaunch }); void updateCommand('set_update_prefs', { includePrereleases, checkOnLaunch }); }}/>}
     <QuitDialog open={snapshot?.quit_confirmation ?? false} pending={busy === 'quit' || busy === 'cancel-quit'} onCancel={() => { void action('cancel-quit', async () => { await invoke('cancel_quit'); }); }} onConfirm={() => { void action('quit', async () => { await invoke('quit_app'); }); }}/>
     {showLogs && <div className="log-drawer"><div className="panel-heading"><span><Terminal size={16}/> Runtime activity</span><button className="icon-button" aria-label="Close runtime logs" onClick={() => setShowLogs(false)}><X size={17}/></button></div><pre>{snapshot?.logs.join('\n') || 'No runtime activity yet.'}</pre></div>}
   </div>;

@@ -5,7 +5,7 @@ use tauri::{utils::config::BundleType, AppHandle, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
-const RELEASES_URL: &str = "https://api.github.com/repos/parasite6/noullama/releases?per_page=30";
+const RELEASES_URL: &str = "https://api.github.com/repos/parasite6/noullama/releases?per_page=100";
 const MANIFEST_NAME: &str = "latest.json";
 /// Points the check at one manifest instead of GitHub, for testing updates
 /// against a local server. The package signature is still verified.
@@ -13,6 +13,8 @@ const MANIFEST_OVERRIDE: &str = "NOULLAMA_UPDATE_URL";
 /// rpm rejects semver pre-release versions, so a pre-release keeps a plain app
 /// version and is marked by a tag suffix (`v0.3.0-pre`, `v0.3.0-nightly`).
 const PRERELEASE_SUFFIXES: [&str; 2] = ["-pre", "-nightly"];
+/// Generous for a ~10 MB package on a slow link; only a stalled download hits it.
+const DOWNLOAD_LIMIT: Duration = Duration::from_secs(20 * 60);
 /// Set by the release workflow when it builds a pre-release.
 const BUILT_AS_PRERELEASE: bool = option_env!("NOULLAMA_PRERELEASE").is_some();
 
@@ -110,9 +112,15 @@ struct Candidate {
 
 /// The newest published release above `current` that carries an update
 /// manifest. Pre-releases count only when `include_prereleases` is set.
+///
+/// Pre-releases share the plain version of the stable release they lead to
+/// (`v0.3.0-nightly` is app version 0.3.0), so on a pre-release build the
+/// stable release of the same version also counts as newer, and on a tie the
+/// stable release wins.
 fn pick_release(
     releases: Vec<GithubRelease>,
     current: &Version,
+    current_is_prerelease: bool,
     include_prereleases: bool,
 ) -> Option<Candidate> {
     releases
@@ -146,8 +154,17 @@ fn pick_release(
                 manifest,
             })
         })
-        .filter(|candidate| candidate.version > *current)
-        .max_by(|a, b| a.version.cmp(&b.version))
+        .filter(|candidate| {
+            candidate.version > *current
+                || (current_is_prerelease
+                    && !candidate.offer.prerelease
+                    && candidate.version == *current)
+        })
+        .max_by(|a, b| {
+            a.version
+                .cmp(&b.version)
+                .then_with(|| b.offer.prerelease.cmp(&a.offer.prerelease))
+        })
 }
 
 /// Only the packages the release ships can be replaced in place; a source
@@ -258,7 +275,7 @@ impl Updates {
                     .map_err(|error| {
                         format!("GitHub returned an unexpected release list: {error}")
                     })?;
-                match pick_release(releases, &current, include) {
+                match pick_release(releases, &current, BUILT_AS_PRERELEASE, include) {
                     Some(candidate) => (candidate.manifest, Some(candidate.offer)),
                     None => return Ok(None),
                 }
@@ -275,9 +292,20 @@ impl Updates {
         let url = manifest
             .parse()
             .map_err(|error| format!("Invalid update manifest address {manifest}: {error}"))?;
+        // A release picked from GitHub was already judged newer above, which
+        // includes stable 0.3.0 replacing the 0.3.0 pre-release build; the
+        // plugin's own `>` would refuse that same-version step.
+        let picked = offer.is_some();
         let update = app
             .updater_builder()
             .endpoints(vec![url])
+            .map(|builder| {
+                if picked {
+                    builder.version_comparator(|current, remote| remote.version >= current)
+                } else {
+                    builder
+                }
+            })
             .and_then(|builder| builder.timeout(Duration::from_secs(30)).build())
             .map_err(|error| error.to_string())?
             .check()
@@ -365,16 +393,26 @@ pub async fn set_update_prefs(
         check_on_launch,
     };
     let bytes = serde_json::to_vec_pretty(&prefs).map_err(|error| error.to_string())?;
-    let temp = updates.path.with_extension("json.tmp");
-    tokio::fs::write(&temp, bytes)
-        .await
-        .and(tokio::fs::rename(&temp, &updates.path).await)
-        .map_err(|error| format!("Could not save update preferences: {error}"))?;
+    // Rename only after a complete write, so a full disk never replaces the
+    // saved preferences with a truncated file.
+    let temp = updates.path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+    let saved = match tokio::fs::write(&temp, bytes).await {
+        Ok(()) => tokio::fs::rename(&temp, &updates.path).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = saved {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(format!("Could not save update preferences: {error}"));
+    }
     *updates.prefs.lock().await = prefs;
-    // A different channel may change which release is offered.
+    // A different channel may change which release is offered, so an offer
+    // found earlier (also one shown beside a later error) is dropped.
     {
         let mut inner = updates.inner.lock().await;
-        if matches!(inner.status, Status::Available | Status::UpToDate) {
+        if !matches!(
+            inner.status,
+            Status::Checking | Status::Downloading { .. } | Status::Installing
+        ) {
             *inner = Inner::default();
         }
     }
@@ -419,18 +457,26 @@ pub async fn install_update(
     tauri::async_runtime::spawn(async move {
         let progress = updates.inner.clone();
         let mut received = 0u64;
-        let result = update
-            .download(
-                |chunk, total| {
-                    received += chunk as u64;
-                    if let Ok(mut inner) = progress.try_lock() {
-                        inner.status = Status::Downloading { received, total };
-                    }
-                },
-                || {},
-            )
-            .await
-            .map_err(|error| format!("The update could not be downloaded or verified: {error}"));
+        // The plugin sets no download timeout, so a stalled connection would
+        // leave the updater in Downloading until restart.
+        let download = update.download(
+            |chunk, total| {
+                received += chunk as u64;
+                if let Ok(mut inner) = progress.try_lock() {
+                    inner.status = Status::Downloading { received, total };
+                }
+            },
+            || {},
+        );
+        let result = match tokio::time::timeout(DOWNLOAD_LIMIT, download).await {
+            Ok(result) => result.map_err(|error| {
+                format!("The update could not be downloaded or verified: {error}")
+            }),
+            Err(_) => Err(format!(
+                "The update download did not finish within {} minutes. Check your connection and try again.",
+                DOWNLOAD_LIMIT.as_secs() / 60
+            )),
+        };
         let result = match result {
             Ok(bytes) => {
                 updates.inner.lock().await.status = Status::Installing;
@@ -440,7 +486,7 @@ pub async fn install_update(
                     .map_err(|error| error.to_string())
                     .and_then(|installed| {
                         installed.map_err(|error| {
-                            format!("The update was not installed: {error}. The password prompt may have been cancelled.")
+                            format!("The update was not installed: {error}. If a password prompt appeared, it may have been cancelled.")
                         })
                     })
             }
@@ -492,7 +538,7 @@ mod tests {
             release("v0.3.0", false, true),
             release("v0.2.0", false, true),
         ];
-        let picked = pick_release(releases, &current, false).unwrap();
+        let picked = pick_release(releases, &current, false, false).unwrap();
         assert_eq!(picked.offer.version, "0.3.0");
         assert!(!picked.offer.prerelease);
     }
@@ -505,14 +551,14 @@ mod tests {
             release("v0.3.2-pre", true, true),
             release("v0.3.1", false, true),
         ];
-        let picked = pick_release(releases, &current, true).unwrap();
+        let picked = pick_release(releases, &current, false, true).unwrap();
         assert_eq!(picked.offer.version, "0.3.10");
         assert!(picked.offer.prerelease);
         let releases = vec![release("v0.3.0-pre", true, true)];
-        assert!(pick_release(releases, &current, true).is_none());
+        assert!(pick_release(releases, &current, false, true).is_none());
         let releases = vec![release("v0.3.1-nightly", true, true)];
         assert_eq!(
-            pick_release(releases, &current, true)
+            pick_release(releases, &current, false, true)
                 .unwrap()
                 .offer
                 .version,
@@ -531,13 +577,30 @@ mod tests {
             release("v0.2.0", false, true),
             release("nightly", false, true),
         ];
-        assert!(pick_release(releases, &current, true).is_none());
+        assert!(pick_release(releases, &current, false, true).is_none());
+    }
+
+    #[test]
+    fn stable_replaces_its_own_pre_release() {
+        let current = Version::parse("0.3.0").unwrap();
+        // GitHub lists newest first; the nightly was published before stable.
+        let both = || vec![release("v0.3.0", false, true), release("v0.3.0-nightly", true, true)];
+        // A 0.3.0 nightly build is offered stable 0.3.0, never its own nightly.
+        let picked = pick_release(both(), &current, true, true).unwrap();
+        assert!(!picked.offer.prerelease);
+        assert!(pick_release(vec![release("v0.3.0-nightly", true, true)], &current, true, true).is_none());
+        // A stable 0.3.0 build is not offered anything for 0.3.0.
+        assert!(pick_release(both(), &current, false, true).is_none());
+        // From 0.2.1 with pre-releases on, the tie goes to stable.
+        let older = Version::parse("0.2.1").unwrap();
+        let picked = pick_release(vec![release("v0.3.0-nightly", true, true), release("v0.3.0", false, true)], &older, false, true).unwrap();
+        assert!(!picked.offer.prerelease);
     }
 
     #[test]
     fn a_pre_tag_counts_as_prerelease_even_if_github_says_otherwise() {
         let current = Version::parse("0.2.0").unwrap();
         let releases = vec![release("v0.3.0-pre", false, true)];
-        assert!(pick_release(releases, &current, false).is_none());
+        assert!(pick_release(releases, &current, false, false).is_none());
     }
 }
