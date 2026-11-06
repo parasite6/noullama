@@ -2,7 +2,7 @@ import React from 'react';
 
 export type MemoryUse = { process_bytes: number | null; used_bytes: number | null; total_bytes: number | null };
 type Props = {
-  name: string; status: string; path: string; device: string | null; projector: string | null;
+  name: string; status: string; path: string; device: string | null; projector: string | null; mtp: string | null;
   contextSize: number; gpuLayers: number; runtime: string; endpoint: string | null;
   memory: MemoryUse | null; estimate: number | null; gpuName: string | null;
 };
@@ -24,6 +24,7 @@ export function ModelDetails(props: Props) {
     <dl>
       {props.device && <><dt>Device</dt><dd>{props.device}</dd></>}
       <dt>Vision</dt><dd title={props.projector ?? undefined}>{props.projector ?? 'Off'}</dd>
+      <dt>MTP</dt><dd title={props.mtp ?? undefined}>{props.mtp ?? 'Off'}</dd>
       <dt>Context</dt><dd>{props.contextSize.toLocaleString()} tokens</dd>
       <dt>GPU layers</dt><dd>{props.gpuLayers === 0 ? 'None (CPU)' : props.gpuLayers}</dd>
       <dt>llama.cpp</dt><dd>{props.runtime}</dd>

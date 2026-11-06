@@ -19,6 +19,13 @@ pub struct Settings {
     pub runtime_path: String,
     pub model_path: String,
     pub mmproj_path: String,
+    // Multi-token prediction: speculative decoding with the model's own MTP
+    // layers, or with a separate `mtp-*.gguf` head when `mtp_path` is set.
+    pub mtp: bool,
+    pub mtp_path: String,
+    // How decisions are read: "auto" (from the GGUF's metadata), "native"
+    // (llama.cpp's /v1/systemone) or "winnow" (Winnow's prompt layout).
+    pub decision_mode: String,
     pub context_size: u32,
     pub gpu_layers: i32,
     pub api_port: u16,
@@ -33,6 +40,9 @@ impl Default for Settings {
             runtime_path: String::new(),
             model_path: String::new(),
             mmproj_path: String::new(),
+            mtp: false,
+            mtp_path: String::new(),
+            decision_mode: "auto".into(),
             context_size: 8192,
             gpu_layers: 99,
             api_port: 11435,
@@ -79,6 +89,11 @@ pub struct RuntimeSession {
     cancel: tokio::sync::Notify,
     /// When the runtime last wrote any output; loading only times out on silence.
     last_output: std::sync::Mutex<std::time::Instant>,
+    /// Set when the model is read through a prompt layout instead of native
+    /// decision support (see `decision.rs`).
+    readout: std::sync::OnceLock<crate::decision::Readout>,
+    /// One readout request at a time on the single runtime slot.
+    readout_lock: Mutex<()>,
 }
 
 impl Drop for RuntimeSession {
@@ -118,6 +133,8 @@ impl RuntimeSession {
             port,
             cancel: tokio::sync::Notify::new(),
             last_output: std::sync::Mutex::new(std::time::Instant::now()),
+            readout: std::sync::OnceLock::new(),
+            readout_lock: Mutex::new(()),
         }))
     }
 }
@@ -129,6 +146,10 @@ pub struct LoadedModel {
     pub runtime_path: String,
     // Loaded with a multimodal projector, so requests may carry images.
     pub projector: bool,
+    // Loaded with multi-token prediction (speculative decoding) on.
+    pub mtp: bool,
+    // How decisions are read once ready: "native" or a layout such as "winnow-v1".
+    pub layout: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -244,6 +265,14 @@ impl AppState {
             .await
             .clone()
             .ok_or("The runtime has stopped.")?;
+        if let Some(readout) = session.readout.get() {
+            if has_images(&payload) {
+                return Err("Images are not supported for this model yet: it is read through Winnow's text prompt layout.".into());
+            }
+            let _one_at_a_time = session.readout_lock.lock().await;
+            let server = crate::decision::Server { client: &self.local_client, port: session.port, key: &session.key };
+            return server.decide(readout, &payload).await.map_err(|e| e.replace(&session.key, "[redacted]"));
+        }
         payload["model"] = json!(session.alias);
         let response = self
             .local_client
@@ -443,6 +472,9 @@ fn runtime_settings_changed(a: &Settings, b: &Settings) -> bool {
     a.runtime_path != b.runtime_path
         || a.model_path != b.model_path
         || a.mmproj_path != b.mmproj_path
+        || a.mtp != b.mtp
+        || a.mtp_path != b.mtp_path
+        || a.decision_mode != b.decision_mode
         || a.context_size != b.context_size
         || a.gpu_layers != b.gpu_layers
         || a.runtime_port != b.runtime_port
@@ -501,9 +533,10 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
         .as_ref()
         .map(|model| model.path.clone())
         .unwrap_or_else(|| settings.model_path.clone());
+    let mtp_head = if settings.mtp { settings.mtp_path.as_str() } else { "" };
     let fit = crate::hardware::fit(
         &fit_path,
-        &settings.mmproj_path,
+        &[settings.mmproj_path.as_str(), mtp_head],
         settings.context_size,
         settings.gpu_layers,
     );
@@ -511,7 +544,8 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
         json!({"settings": settings, "running": running, "ready": ready,
         "logs": logs, "download": download, "loaded_model":loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
-        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_error": load_error, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit}),
+        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_error": load_error, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit,
+        "model_missing": !settings.model_path.is_empty() && !Path::new(&settings.model_path).is_file()}),
     )
 }
 
@@ -635,6 +669,24 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
     if !settings.mmproj_path.is_empty() && !Path::new(&settings.mmproj_path).is_file() {
         return Err("The multimodal projector path does not exist.".into());
     }
+    if settings.mtp {
+        if !settings.mtp_path.is_empty() {
+            if !Path::new(&settings.mtp_path).is_file() {
+                return Err("The MTP head path does not exist.".into());
+            }
+            // The Hub and the file picker go by name; the metadata decides.
+            match crate::gguf::info(&settings.mtp_path) {
+                Some(head) if head.is_mtp_head() => {
+                    if !crate::gguf::info(&settings.model_path).is_some_and(|model| head.head_fits(&model)) {
+                        return Err("The MTP head does not fit this model: its width differs. Choose the head made for this model, or turn MTP off.".into());
+                    }
+                }
+                _ => return Err("The chosen MTP file is not an MTP head. Choose a head file made only of MTP layers, or turn MTP off.".into()),
+            }
+        } else if !crate::gguf::info(&settings.model_path).is_some_and(|i| i.has_built_in_mtp()) {
+            return Err("This model has no built-in MTP layers. Choose an mtp- head file in Runtime, or turn MTP off.".into());
+        }
+    }
     let session = RuntimeSession::new(&state.data_dir, settings.runtime_port)?;
     *state.load_error.lock().await = None;
     *state.session.lock().await = Some(session.clone());
@@ -747,6 +799,19 @@ fn runtime_args(settings: &Settings, session: &RuntimeSession) -> Vec<String> {
     if !settings.mmproj_path.is_empty() {
         args.extend(["--mmproj".into(), settings.mmproj_path.clone()]);
     }
+    if settings.mtp {
+        args.extend(["--spec-type".into(), "draft-mtp".into()]);
+        // A separate head is loaded as the draft model; built-in layers run on
+        // the main model's weights and need nothing more.
+        if !settings.mtp_path.is_empty() {
+            args.extend([
+                "--spec-draft-model".into(),
+                settings.mtp_path.clone(),
+                "--spec-draft-ngl".into(),
+                settings.gpu_layers.to_string(),
+            ]);
+        }
+    }
     args
 }
 
@@ -854,6 +919,8 @@ async fn prepare_and_poll(
             device: device.clone(),
             runtime_path: settings.runtime_path.clone(),
             projector: !settings.mmproj_path.is_empty(),
+            mtp: settings.mtp,
+            layout: None,
         });
         state
             .log(format!("Loading {} on {device}", settings.model_path))
@@ -896,7 +963,7 @@ async fn prepare_and_poll(
                         "Runtime identity did not match this launch; refusing to connect.".into(),
                     );
                 }
-                let decision = models["data"].as_array().is_some_and(|models| {
+                let native = models["data"].as_array().is_some_and(|models| {
                     models.iter().any(|model| {
                         model["id"] == session.alias
                             && model["architecture"]["output_modalities"]
@@ -904,8 +971,40 @@ async fn prepare_and_poll(
                                 .is_some_and(|a| a.iter().any(|x| x == "decisions"))
                     })
                 });
-                if !decision {
-                    return Err("Runtime did not advertise native decision support. Use a decision GGUF and a compatible llama.cpp build.".into());
+                let layout = match crate::decision::resolve(&settings.decision_mode, &settings.model_path) {
+                    // Winnow (forced, or detected from a file with no decision key) wins;
+                    // otherwise the runtime's native support does.
+                    Some(crate::decision::Layout::Winnow) => crate::decision::Layout::Winnow,
+                    _ if native => crate::decision::Layout::Native,
+                    Some(crate::decision::Layout::Native) => {
+                        return Err("Runtime did not advertise native decision support. Use a decision GGUF and a compatible llama.cpp build, or set Decision mode to Auto in Runtime.".into());
+                    }
+                    None => {
+                        return Err("This model has no native decision support, and Noullama has no prompt layout for it. Winnow GGUFs are read through Winnow's own layout; if this is a Winnow model under another name, set Decision mode to Winnow in Runtime.".into());
+                    }
+                };
+                if layout == crate::decision::Layout::Winnow && session.readout.get().is_none() {
+                    let server = crate::decision::Server { client: &state.local_client, port: session.port, key: &session.key };
+                    let profile = crate::decision::profile(&settings.model_path);
+                    let thought = match profile.thought {
+                        Some(thought) => thought,
+                        None => crate::decision::template_has_thought(
+                            server.props().await?["chat_template"].as_str().unwrap_or_default(),
+                        ),
+                    };
+                    let labels = server.labels().await?;
+                    state
+                        .log(format!(
+                            "Reading decisions through the {} layout ({}, temperature {}, {} labels).",
+                            crate::decision::LAYOUT, profile.model, profile.temperature, labels.len()
+                        ))
+                        .await;
+                    let _ = session.readout.set(crate::decision::Readout {
+                        profile,
+                        thought,
+                        labels,
+                        context: settings.context_size as usize,
+                    });
                 }
                 let _guard = state.lifecycle.lock().await;
                 if !is_current_session(state, session).await {
@@ -916,6 +1015,9 @@ async fn prepare_and_poll(
                     return Err("Runtime exited before becoming ready.".into());
                 }
                 *state.ready.lock().await = true;
+                if let Some(model) = state.loaded_model.lock().await.as_mut() {
+                    model.layout = Some(layout.name().into());
+                }
                 state
                     .log("Decision model is ready. Local API is accepting requests.".into())
                     .await;
@@ -1025,6 +1127,32 @@ mod tests {
         assert!(!key_path.exists());
         std::fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    fn mtp_adds_speculative_flags_only_when_on() {
+        let base = std::env::temp_dir().join(format!("noullama-mtp-args-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let session = RuntimeSession::new(&base, 18441).unwrap();
+        let flag = |args: &[String], name: &str| {
+            args.iter().position(|a| a == name).map(|i| args[i + 1].clone())
+        };
+        let off = runtime_args(&Settings { mtp_path: "/m/mtp-head.gguf".into(), ..Settings::default() }, &session);
+        assert!(flag(&off, "--spec-type").is_none());
+        assert!(flag(&off, "--spec-draft-model").is_none());
+
+        let built_in = runtime_args(&Settings { mtp: true, ..Settings::default() }, &session);
+        assert_eq!(flag(&built_in, "--spec-type").as_deref(), Some("draft-mtp"));
+        assert!(flag(&built_in, "--spec-draft-model").is_none());
+
+        let head = Settings { mtp: true, mtp_path: "/m/mtp-head.gguf".into(), gpu_layers: 0, ..Settings::default() };
+        let args = runtime_args(&head, &session);
+        assert_eq!(flag(&args, "--spec-type").as_deref(), Some("draft-mtp"));
+        assert_eq!(flag(&args, "--spec-draft-model").as_deref(), Some("/m/mtp-head.gguf"));
+        assert_eq!(flag(&args, "--spec-draft-ngl").as_deref(), Some("0"));
+        assert!(runtime_settings_changed(&Settings::default(), &Settings { mtp: true, ..Settings::default() }));
+        drop(session);
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[cfg(unix)]
     fn fake_runtime(base: &Path, name: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1152,6 +1280,56 @@ mod tests {
         state.shutdown().await;
         std::fs::remove_dir_all(base).unwrap();
     }
+    /// Loads a real Winnow GGUF through the normal load path and answers a
+    /// request in the Winnow layout. Run with
+    /// `NOULLAMA_RUNTIME=…/llama-server NOULLAMA_WINNOW=…/Winnow-E4B-Q8_0.gguf cargo test -- --ignored winnow`.
+    #[tokio::test]
+    #[ignore]
+    async fn winnow_loads_and_decides_on_a_real_runtime() {
+        let (Ok(runtime), Ok(model)) = (std::env::var("NOULLAMA_RUNTIME"), std::env::var("NOULLAMA_WINNOW")) else {
+            panic!("set NOULLAMA_RUNTIME and NOULLAMA_WINNOW");
+        };
+        let base = std::env::temp_dir().join(format!("noullama-winnow-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = runtime;
+            settings.model_path = model;
+            settings.runtime_port = port;
+            settings.mtp = std::env::var("NOULLAMA_MTP_HEAD").is_ok();
+            settings.mtp_path = std::env::var("NOULLAMA_MTP_HEAD").unwrap_or_default();
+        }
+        load_model(&state).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(300), async {
+            while !*state.ready.lock().await {
+                if let Some(error) = state.load_error.lock().await.clone() {
+                    panic!("load failed: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.loaded_model.lock().await.as_ref().unwrap().layout.as_deref(), Some("winnow-v1"));
+        let request = json!({"state": {"ticket": "My card was charged twice for order #4411 and I need the duplicate refunded today."},
+            "questions": {
+                "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+                "topic": {"type": "choice", "instructions": "What is the ticket about?", "criteria": {"billing": "Charges, refunds, invoices", "shipping": null, "login": null}},
+                "urgency": {"type": "score", "instructions": "How urgent is it?", "criteria": ["Can wait", "Today", "Immediately"]}}});
+        let started = std::time::Instant::now();
+        let result = state.infer(request.clone()).await.unwrap();
+        println!("Winnow readout ({:?}): {result}", started.elapsed());
+        assert!(result["answers"]["refund"]["noul"].as_f64().unwrap() > 0.9);
+        assert_eq!(result["answers"]["topic"]["choice"], "billing");
+        let score = result["answers"]["urgency"]["score"].as_f64().unwrap();
+        assert!((1.0..2.0).contains(&score), "{score}");
+        // The same request gives the same numbers.
+        assert_eq!(state.infer(request).await.unwrap()["answers"], result["answers"]);
+        state.shutdown().await;
+        std::fs::remove_dir_all(base).ok();
+    }
+
     #[test]
     fn malformed_settings_are_preserved_and_defaults_recover() {
         for contents in [r#"{"context_size":"8192"}"#, r#"{"model_path":"truncated"#] {

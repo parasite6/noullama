@@ -101,6 +101,7 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .chip, .pill { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; border-radius: var(--r-pill); padding: 5px 11px; font-size: 12px; color: var(--secondary); background: var(--surface-2); line-height: 1.2; }
 .chip code { font-size: 11px; color: var(--text); }
 .chip.success, .pill.success { color: var(--ok); background: rgba(111, 207, 151, .1); }
+.chip.warning { color: var(--warn); background: rgba(231, 182, 90, .1); }
 .code-badge { background: var(--accent-soft); color: var(--accent); padding: 2px 7px; font-size: 10.5px; font-weight: 600; border-radius: var(--r-pill); letter-spacing: .3px; }
 .fit-level-1 { --fit-text: #8fd3a6; --fit-bg: rgba(63, 154, 99, .14); --fit-mark: #4fb57a; }
 .fit-level-2 { --fit-text: #c2ec92; --fit-bg: rgba(140, 204, 99, .12); --fit-mark: #8ccc63; }

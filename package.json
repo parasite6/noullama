@@ -10,8 +10,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "tauri": "tauri",
-    "desktop": "tauri dev --runner blaze -- --target-dir target/dev",
-    "desktop:build": "tauri build --runner blaze",
+    "desktop": "tauri dev -- --target-dir target/dev",
+    "desktop:build": "tauri build",
     "test": "node --experimental-strip-types --test src/presets.test.ts"
   },
   "dependencies": {

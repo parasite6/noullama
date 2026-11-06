@@ -250,6 +250,15 @@ pub async fn local_models(state: tauri::State<'_, AppState>) -> Result<Value, St
     list_local_models(state.inner()).await
 }
 
+/// How the selected model can use MTP: its own layers, or a fitting head
+/// in its folder. Works for a model chosen from outside the scanned folders.
+#[tauri::command]
+pub async fn model_mtp(path: String) -> Result<crate::gguf::ModelMtp, String> {
+    tokio::task::spawn_blocking(move || crate::gguf::model_mtp(&path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 async fn list_local_models(state: &AppState) -> Result<Value, String> {
     let settings = state.settings.lock().await.clone();
     let base = model_directory(&settings, &state.data_dir);
@@ -336,7 +345,23 @@ fn scan_local_models(
                             .extension()
                             .is_some_and(|e| e.eq_ignore_ascii_case("gguf")) =>
                 {
-                    files.push(json!({"path": path, "name": entry.file_name().to_string_lossy(), "size": entry.metadata().ok().map(|m| m.len())}));
+                    // MTP support is read from each file's metadata (cached per
+                    // file version): a standalone head, or a model that can use
+                    // its own MTP layers or a fitting head in its folder.
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let text = path.to_string_lossy();
+                    let projector = name.to_lowercase().contains("mmproj");
+                    let mtp_head = !projector && crate::gguf::is_mtp_head(&text);
+                    let mtp = !projector && !mtp_head && {
+                        let found = crate::gguf::model_mtp(&text);
+                        found.built_in || found.head.is_some()
+                    };
+                    // How decisions would be read from it, before it is loaded.
+                    let decision = (!projector && !mtp_head)
+                        .then(|| crate::decision::resolve("auto", &text))
+                        .flatten()
+                        .map(crate::decision::Layout::name);
+                    files.push(json!({"path": path, "name": name, "size": entry.metadata().ok().map(|m| m.len()), "mtp": mtp, "mtp_head": mtp_head, "decision": decision}));
                 }
                 Err(error) => {
                     incomplete = true;
@@ -560,7 +585,9 @@ pub async fn search_models(
                     .flatten()
                     .filter(|file| {
                         file["rfilename"].as_str().is_some_and(|name| {
-                            name.ends_with(".gguf") && !name.to_lowercase().contains("mmproj")
+                            name.ends_with(".gguf")
+                                && !name.to_lowercase().contains("mmproj")
+                                && !crate::gguf::named_like_mtp_head(name)
                         })
                     })
                     .filter_map(|file| file["size"].as_u64())
@@ -584,11 +611,13 @@ fn inspection_files(
     model["siblings"].as_array().into_iter().flatten()
         .filter(|file| file["rfilename"].as_str().is_some_and(|name| name.ends_with(".gguf")))
         .map(|file| {
-            let projector = file["rfilename"].as_str().unwrap_or_default().to_lowercase().contains("mmproj");
-            let fit = if projector { None } else {
+            let name = file["rfilename"].as_str().unwrap_or_default();
+            let projector = name.to_lowercase().contains("mmproj");
+            let mtp_head = crate::gguf::named_like_mtp_head(name);
+            let fit = if projector || mtp_head { None } else {
                 file["size"].as_u64().and_then(|size| crate::hardware::fit_model_bytes(size, context_size, gpu_layers, hardware))
             };
-            json!({"name": file["rfilename"], "size": file["size"], "projector": projector, "fit": fit})
+            json!({"name": file["rfilename"], "size": file["size"], "projector": projector, "mtp_head": mtp_head, "fit": fit})
         }).collect()
 }
 
@@ -917,10 +946,14 @@ mod tests {
             {"rfilename": "model-Q8.gguf", "size": 28_600_000_000_u64},
             {"rfilename": "mmproj-F16.gguf", "size": 930_000_000},
             {"rfilename": "unknown.gguf"},
+            {"rfilename": "mtp-model-Q8.gguf", "size": 400_000_000},
             {"rfilename": "README.md", "size": 50}
         ]});
         let files = inspection_files(&model, 8192, 99, &hardware);
-        assert_eq!(files.len(), 4);
+        assert_eq!(files.len(), 5);
+        assert_eq!(files[4]["mtp_head"], true);
+        assert!(files[4]["fit"].is_null());
+        assert_eq!(files[0]["mtp_head"], false);
         assert_eq!(files[0]["fit"]["model_bytes"], 4_000_000_000_u64);
         assert_eq!(files[1]["fit"]["model_bytes"], 28_600_000_000_u64);
         assert_ne!(files[0]["fit"]["level"], files[1]["fit"]["level"]);

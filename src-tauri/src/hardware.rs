@@ -33,18 +33,22 @@ pub fn cached() -> Option<&'static Hardware> {
     CACHE.get()
 }
 
-/// `projector` is the multimodal projector loaded alongside, if any; it sits
-/// in the same memory as the weights, so it counts toward the estimate.
-pub fn fit(path: &str, projector: &str, context_size: u32, gpu_layers: i32) -> Option<Fit> {
+/// `extras` are files loaded alongside the model, such as a multimodal
+/// projector or an MTP head; they sit in the same memory as the weights, so
+/// they count toward the estimate. Empty paths are skipped.
+pub fn fit(path: &str, extras: &[&str], context_size: u32, gpu_layers: i32) -> Option<Fit> {
     let file = std::fs::metadata(path).ok()?;
     if !file.is_file() || file.len() == 0 {
         return None;
     }
-    let projector = std::fs::metadata(projector)
-        .ok()
+    let extras: u64 = extras
+        .iter()
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| std::fs::metadata(path).ok())
         .filter(std::fs::Metadata::is_file)
-        .map_or(0, |file| file.len());
-    fit_model_bytes(file.len() + projector, context_size, gpu_layers, cached()?)
+        .map(|file| file.len())
+        .sum();
+    fit_model_bytes(file.len() + extras, context_size, gpu_layers, cached()?)
 }
 
 #[derive(Serialize, Default, Debug, PartialEq)]
@@ -449,7 +453,7 @@ mod tests {
 
     #[test]
     fn missing_or_empty_files_have_no_rating() {
-        assert!(fit("/definitely/not/a/model.gguf", "", 8192, 99).is_none());
+        assert!(fit("/definitely/not/a/model.gguf", &[], 8192, 99).is_none());
     }
 
     #[test]

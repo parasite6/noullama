@@ -43,6 +43,10 @@ test('selecting a new model never mislabels the running model', () => {
   assert.equal(status.selected, '/models/new.gguf');
   assert.equal(status.switching, true);
   assert.equal(modelStatus('/models/new.gguf', null, false, false).label, 'Selected · not loaded');
+  const gone = modelStatus('/models/gone.gguf', null, false, false, true);
+  assert.equal(gone.label, 'File not found');
+  assert.equal(gone.missing, true);
+  assert.equal(modelStatus('', null, false, false, true).missing, false);
   assert.equal(modelStatus('/models/new.gguf', { path:'/models/new.gguf', device:'CPU' }, true, false).label, 'Loading');
 });
 

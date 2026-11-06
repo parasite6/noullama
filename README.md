@@ -10,7 +10,7 @@
 
 <p align="center">A local workbench and API for native decision models using llama.cpp</p>
 
-[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Features](#features) · [Requirements](#requirements) · [Getting started](#getting-started) · [Runtime](#runtime) · [Models and presets](#models-and-presets) · [Images](#images) · [Local API](#local-api) · [Data and verification](#data-and-verification)
+[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Features](#features) · [Requirements](#requirements) · [Getting started](#getting-started) · [Runtime](#runtime) · [Models and presets](#models-and-presets) · [Images](#images) · [Multi-token prediction](#multi-token-prediction) · [Winnow models](#winnow-models) · [Local API](#local-api) · [Data and verification](#data-and-verification)
 
 ## Quick start
 
@@ -31,6 +31,7 @@ In the app: **Hub** → download a GGUF (or **Models** → browse for a local fi
 | Use an existing model | Open **Models**, choose **Browse local model**, then click **Load model**. |
 | Run a decision | In **Playground**, pick a preset under **Run settings**, edit the questions and state, then click **Run decision**. |
 | Ask about images | Turn on **Vision** in the model bar, load the model, then add images in the **State** box. |
+| Speed up generation with MTP | Turn on **MTP** in the model bar for a model with MTP layers or a matching MTP head in its folder, then load it. |
 | Save a preset | Enter a name under the questions editor and click **Save preset**. |
 | See why a load failed | Read the red panel under the model bar, or open **Runtime logs**. |
 | Use CPU inference | Set **GPU layers** to `0` in **Runtime**. |
@@ -47,6 +48,8 @@ Question types:
 - Discover and download decision-model GGUFs from Hugging Face using an existing login or a session token.
 - Load a local model with a compatible llama.cpp runtime and configure GPU offloading. A **Vision** switch loads the model's multimodal projector.
 - Run typed questions against text or JSON state, and against images when a projector is loaded, using editable presets, JSON linting, and syntax highlighting.
+- Turn on multi-token prediction (MTP) for models that ship MTP layers or a separate MTP head, using llama.cpp's speculative decoding.
+- Load Winnow GGUFs, which have no native decision support, through Winnow's own prompt layout on a stock llama.cpp.
 - See why a model failed to load, with llama.cpp's own error lines, without opening the logs.
 - Hover the runtime card in the sidebar for the loaded model's settings and live graphics-memory use.
 - Save, update, and delete named custom presets.
@@ -56,7 +59,7 @@ Question types:
 
 Needed to build from source. The `.deb` and `.rpm` packages install the system libraries themselves, but still need `hf` and a `llama-server`.
 
-- Node.js 24+, Rust, and Blaze for the provided build commands.
+- Node.js 24+ and Rust (with cargo).
 - The Hugging Face CLI (`hf`) for downloads. Public models do not require a login; gated models require access and authentication.
 - A compatible `llama-server`. Liquid d1-2B requires a build containing [llama.cpp PR #31275](https://github.com/ggml-org/llama.cpp/pull/31275), such as b11954 or a compatible newer build.
 - On Linux, the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux), including GTK 3 and WebKitGTK 4.1 development packages.
@@ -172,6 +175,35 @@ Image input needs a model that supports it and its multimodal projector.
 
 Images are sent as base64 data URLs in the request's `images` field. PNG, JPEG, GIF, and BMP are sent unchanged; other formats the app can display, such as WebP, are converted to PNG first. Each image can be up to 20 MB and all images together up to 60 MB.
 
+## Multi-token prediction
+
+Some models can predict several tokens per step with multi-token prediction (MTP) layers. llama.cpp uses them for speculative decoding, which can speed up generation without changing the result.
+
+An MTP model comes in one of two forms:
+
+- **Built-in layers.** The MTP layers are inside the model GGUF. Noullama reads the file's metadata to find them.
+- **A separate head.** A small GGUF made only of MTP layers (for example `winnow-mtp.gguf`) sits in the same folder as the model. Noullama recognizes it from its metadata, whatever its name, and only pairs it with a model whose width it matches. Heads are not listed as models. Before download, the Hub can only go by the name, so it labels files with `mtp` in the name as **MTP head**.
+
+When either is found, the model bar shows an **MTP** switch, and **Models** marks the model **MTP available**. Turn it on, or use the switch in **Runtime → Model**, then load the model. Selecting a model from another folder turns MTP off.
+
+With MTP on, Noullama starts llama-server with `--spec-type draft-mtp`. A separate head is also passed with `--spec-draft-model`, using the same GPU-layer setting as the model. This needs a llama.cpp build with MTP support; an older build fails to load and the error panel shows why.
+
+Decision results are short, so MTP mostly helps models and requests that generate more than a few tokens.
+
+## Winnow models
+
+A native decision model records its decision type in its GGUF metadata, and llama.cpp then answers `/v1/systemone` itself. Winnow GGUFs (EldanRing's Winnow-E2B, -E4B and -12B) have no such entry. They are Gemma 4 models trained to answer with an option's letter, so Noullama reads them another way:
+
+1. It builds Winnow's own prompt for each question: the state, the question, and the options labelled `A`, `B`, `C`, ….
+2. It asks llama-server for the probability of each option's label as the next token.
+3. It turns those into the usual answers: `noul` is the probability of true; `choice` and `score` get per-option probabilities and a confidence.
+
+This follows the `winnow-v1` layout as specified by [Ollaya](https://github.com/ollaya-dev/ollaya), including Winnow-E4B's fitted temperature (1.2574). A request can override it with `"winnow": {"temperature": …}`. Each question is evaluated from scratch, so the same request always gives the same numbers. Responses have the same shape as native ones, so the Playground and both API routes work unchanged.
+
+**Models** marks these files **Winnow layout**, and files Noullama cannot read as decision models **Not a decision model**. Detection uses the file's metadata: a Gemma 4 model whose name or file name contains "winnow". For a Winnow model under another name, set **Runtime → Model → Decision mode** to **Winnow**. **Native** requires native support, and **Auto** (the default) picks for you.
+
+Images are not supported in the Winnow layout yet.
+
 ## Local API
 
 ### Ports and access
@@ -232,13 +264,13 @@ Settings, saved presets, and downloads use the platform app-data directory (`~/.
 ```sh
 npm run build
 npm test
-blaze test --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 An optional real-model integration test can be run with `NOULLAMA_TEST_MODEL` and `NOULLAMA_TEST_RUNTIME` set to absolute paths. Set `NOULLAMA_TEST_GPU_LAYERS=99` to test GPU offloading:
 
 ```sh
-blaze test --manifest-path src-tauri/Cargo.toml \
+cargo test --manifest-path src-tauri/Cargo.toml \
   real_runtime_native_and_openai_requests -- --ignored --nocapture
 ```
 
@@ -248,6 +280,7 @@ Noullama is in early beta. Known limits:
 
 - One loaded model, one model download, and one runtime installation at a time.
 - No bundled runtime; use **Runtime → llama.cpp** to download one or point to your own `llama-server`.
+- Models without native decision support load only if they are Winnow GGUFs, and then without image input.
 - No automatic playground history. Only named custom presets are saved.
 - Linux packages only (64-bit `.deb` and `.rpm`). There are no macOS or Windows builds yet.
 
