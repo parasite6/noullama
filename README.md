@@ -184,7 +184,7 @@ An MTP model comes in one of two forms:
 - **Built-in layers.** The MTP layers are inside the model GGUF. Noullama reads the file's metadata to find them.
 - **A separate head.** A small GGUF made only of MTP layers (for example `winnow-mtp.gguf`) sits in the same folder as the model. Noullama recognizes it from its metadata, whatever its name, and only pairs it with a model whose width it matches. Heads are not listed as models. Before download, the Hub can only go by the name, so it labels files with `mtp` in the name as **MTP head**.
 
-When either is found, the model bar shows an **MTP** switch, and **Models** marks the model **MTP available**. Turn it on, or use the switch in **Runtime → Model**, then load the model. Selecting a model from another folder turns MTP off.
+When either is found, the model bar shows an **MTP** switch, and **Models** marks the model **MTP available**. Turn it on, or use the switch in **Runtime → Model**, then load the model. Selecting a different model turns MTP off, because a head only fits the model it was made for.
 
 With MTP on, Noullama starts llama-server with `--spec-type draft-mtp`. A separate head is also passed with `--spec-draft-model`, using the same GPU-layer setting as the model. This needs a llama.cpp build with MTP support; an older build fails to load and the error panel shows why.
 
