@@ -13,12 +13,14 @@
 
 Install the Linux x86-64 package for your distribution from the [v0.4.0 release](https://github.com/parasite6/noullama/releases/tag/v0.4.0):
 
+
+## Debian / Ubuntu
 ```sh
-# Debian / Ubuntu
 curl -fLO https://github.com/parasite6/noullama/releases/download/v0.4.0/noullama_0.4.0_amd64.deb
 sudo apt install ./noullama_0.4.0_amd64.deb
-
-# Fedora / RPM-based distributions
+```
+## Fedora / RPM-based distributions
+```sh
 curl -fLO https://github.com/parasite6/noullama/releases/download/v0.4.0/noullama-0.4.0-1.x86_64.rpm
 sudo dnf install ./noullama-0.4.0-1.x86_64.rpm
 ```
