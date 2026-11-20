@@ -281,9 +281,19 @@ async fn list_local_models(state: &AppState) -> Result<Value, String> {
     if base != original {
         roots.push((original, false));
     }
-    tokio::task::spawn_blocking(move || scan_local_models(roots, 20_000, Duration::from_secs(2)))
+    let scan = tokio::task::spawn_blocking(move || scan_local_models(roots, 20_000, Duration::from_secs(2)))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Every model found gets an entry in models.yml; projectors and MTP heads do not.
+    let models: Vec<String> = scan["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["mtp_head"] != true && !m["name"].as_str().unwrap_or_default().to_lowercase().contains("mmproj"))
+        .filter_map(|m| m["path"].as_str().map(str::to_owned))
+        .collect();
+    crate::library::ensure(state, &models).await;
+    Ok(scan)
 }
 
 fn scan_local_models(
@@ -894,6 +904,7 @@ async fn prepare_download(
             partials.retain(|(base, _)| *base != partial_base);
             partials.push((partial_base, files));
         }
+        let model_path = destination.clone();
         let mut downloads = state.downloads.lock().await;
         if let Some(download) = entry(&mut downloads, &key) {
             download.active = false;
@@ -921,6 +932,9 @@ async fn prepare_download(
             }
         }
         drop(downloads);
+        if success && !cancelled && !filename.to_lowercase().contains("mmproj") && !crate::gguf::is_mtp_head(&model_path) {
+            crate::library::ensure(&state, &[model_path.clone()]).await;
+        }
         state
             .log(if success {
                 format!("Download complete: {filename}")

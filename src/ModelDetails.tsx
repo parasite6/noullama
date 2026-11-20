@@ -1,10 +1,13 @@
 import React from 'react';
 
-export type MemoryUse = { process_bytes: number | null; used_bytes: number | null; total_bytes: number | null };
+// process_bytes covers every loaded model; models holds each one's share by id.
+export type MemoryUse = { process_bytes: number | null; used_bytes: number | null; total_bytes: number | null; models?: Record<string, number | null> };
 type Props = {
   name: string; status: string; path: string; device: string | null; projector: string | null; mtp: string | null;
   contextSize: number; gpuLayers: number; runtime: string; endpoint: string | null;
   memory: MemoryUse | null; estimate: number | null; gpuName: string | null;
+  // The loaded model shown, to pick its share of graphics memory, and how many are loaded.
+  modelId: string | null; loadedCount: number;
 };
 const gb = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 
@@ -33,7 +36,8 @@ export function ModelDetails(props: Props) {
     <div className="model-details-memory">
       <div className="model-details-title">Graphics memory{props.gpuName ? <span> / {props.gpuName}</span> : null}</div>
       {total ? <>
-        {memory?.process_bytes != null && <Meter label="This model" value={memory.process_bytes} total={total} strong/>}
+        {props.modelId && memory?.models?.[props.modelId] != null && <Meter label="This model" value={memory.models[props.modelId]!} total={total} strong/>}
+        {props.loadedCount > 1 && memory?.process_bytes != null && <Meter label={`All ${props.loadedCount} loaded models`} value={memory.process_bytes} total={total}/>}
         {memory?.used_bytes != null && <Meter label="In use on the GPU" value={memory.used_bytes} total={total}/>}
       </> : <p>{!memory ? 'Reading usage…' : props.gpuName ? 'Live usage is not available for this GPU.' : 'No graphics card found. The model runs from system memory.'}</p>}
       {props.estimate != null && <p>Estimated need for this model: about {gb(props.estimate)}.</p>}

@@ -4,13 +4,15 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Toggle } from './Toggle';
 import { ModelDetails, type MemoryUse } from './ModelDetails';
 import { ImageAttachments, MAX_TOTAL_BYTES, readImages, type Attachment } from './ImageAttachments';
-import { Activity, AlertCircle, ArrowDownToLine, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, ChevronUp, CircleCheck, Code2, Copy, Cpu, Download, ExternalLink, FileJson, FlaskConical, FolderOpen, Gauge, Layers3, Mail, MemoryStick, Microchip, Network, Play, Plus, RefreshCw, Route, Search, Settings2, Shield, ShieldCheck, Square, Terminal, Trash2, Save, Power, X, CircleArrowUp } from 'lucide-react';
+import { Activity, AlertCircle, ArrowDownToLine, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, ChevronUp, CircleCheck, Code2, Copy, Cpu, Download, ExternalLink, FileJson, FlaskConical, FolderOpen, Gauge, Layers3, Mail, MemoryStick, Microchip, Network, Play, Plus, RefreshCw, Route, Search, Settings2, Shield, ShieldCheck, Square, Tags, Terminal, Trash2, Save, Power, Unplug, X, CircleArrowUp, Library as LibraryIcon } from 'lucide-react';
 import { buildRequest, convertState, presets } from './presets';
 import { QuitDialog } from './QuitDialog';
 import { DeletePresetDialog } from './DeletePresetDialog';
 import { CopyButton } from './CopyButton';
 import { KeepContext } from './KeepContext';
-import { ModelNames } from './ModelNames';
+import { ModelAliases, ModelRouting, type Route as ApiRoute } from './ModelNames';
+import { Select } from './Select';
+import { Library, SHA_CHECKS, type LibraryEntry, type LibraryState } from './Library';
 import { UpdatesDialog, type UpdateView } from './UpdatesDialog';
 import { ContextMenu } from './ContextMenu';
 import { NumberField } from './NumberField';
@@ -29,9 +31,12 @@ import './styles.css';
 
 const logoUrl = new URL('../logo.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; model_aliases: string[]; keep_context: boolean };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string };
 
-type Snapshot = { settings: Settings; running: boolean; ready: boolean; api_port: number; api_error: string | null; api_notice: string | null; load_error: string | null; runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; downloads: DownloadState[]; context: { entries: number; last_flushed: number }; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; fit: Fit | null; model_missing: boolean };
+// One loaded model, with the settings it was loaded with.
+type Instance = { id: string; name: string; label: string; path: string; device: string; runtime_path: string; projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null; ready: boolean; context_size: number; gpu_layers: number; required_bytes: number | null; context: { entries: number; last_flushed: number }; settings: Settings };
+type LoadError = { path: string; name: string; message: string };
+type Snapshot = { settings: Settings; running: boolean; ready: boolean; instances: Instance[]; default_model: string | null; routes: ApiRoute[]; library: LibraryState; api_port: number; api_error: string | null; api_notice: string | null; load_errors: LoadError[]; runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; downloads: DownloadState[]; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; fit: Fit | null; model_missing: boolean };
 type Hardware = { ram_bytes: number; vram_bytes: number | null; gpu: string | null; cpu_cores: number };
 type Fit = { level: number; label: string; detail: string; model_bytes: number; required_bytes: number };
 type SavedPreset = { id: string; name: string; questions: unknown; state: string; state_mode: 'text' | 'json' };
@@ -40,14 +45,16 @@ type ModelFile = { name: string; size?: number; projector: boolean; mtp_head: bo
 type Inspection = { repo: string; files: ModelFile[]; sha: string };
 type Session = { authenticated: boolean; account: string | null; cli_available: boolean; token_present: boolean };
 type Result = { answers?: Record<string, { type?: string; choice?: string; score?: number; noul?: number; confidence?: number; probabilities?: Record<string, number> }>; usage?: { input_tokens: number; output_tokens: number }; [key: string]: unknown };
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', model_aliases: [], keep_context: false };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once' };
 const icons = [Route, ShieldCheck, Shield, Mail, Network, Plus];
 const pages: Record<string, [string, string]> = {
   playground: ['Playground', 'Ask typed questions about a piece of content.'],
   models: ['Models', 'GGUF files on this machine.'],
   hub: ['Hub', 'Find and download decision models from Hugging Face.'],
   runtime: ['Runtime', 'llama.cpp builds, model settings and ports.'],
-  api: ['Local API', 'Call the loaded model from your own code.'],
+  api: ['Local API', 'Call loaded models from your own code.'],
+  library: ['Library', 'models.yml: the name, aliases, file, account and sha256 of every model.'],
+  settings: ['Settings', 'How Noullama checks model files.'],
 };
 const pretty = (v: unknown) => JSON.stringify(v, null, 2);
 const errorText = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -75,7 +82,10 @@ function App() {
   const [keepOverride, setKeepOverride] = useState<boolean | null>(null);
   const [dismissedApi, setDismissedApi] = useState<string | null>(null);
   const [dismissedApiNotice, setDismissedApiNotice] = useState(false);
-  const [dismissedLoadError, setDismissedLoadError] = useState<string | null>(null);
+  // The loaded model the Playground runs on; the default model when unset or ejected.
+  const [playModel, setPlayModel] = useState<string | null>(null);
+  // Model files whose alias editor is open on the Models page.
+  const [aliasEditors, setAliasEditors] = useState<string[]>([]);
   const [dismissedStartup, setDismissedStartup] = useState(false);
   const [previewDismissed, setPreviewDismissed] = useState(false);
   // Downloads whose request is still being checked, by repo/file id.
@@ -195,7 +205,7 @@ function App() {
     await action('decide', async () => {
       const payload = { ...buildRequest(questions, content, stateMode), ...(visionLoaded && images.length ? { images: images.map(image => image.url) } : {}) };
       const start = performance.now();
-      const response = await invoke<Result>('decide', { payload });
+      const response = await invoke<Result>('decide', { payload, model: activeInstance?.id ?? null });
       setElapsed(performance.now() - start); setResult(response);
     });
   }
@@ -234,11 +244,23 @@ function App() {
     catch (e) { setNotice({ text: errorText(e), error: true }); }
     finally { setKeepOverride(null); }
   }
-  async function clearContext() { await action('clear-context', async () => { await invoke('clear_context'); }); }
-  async function saveAliases(aliases: string[]) {
+  async function clearContext(model: string | null) { await action('clear-context', async () => { await invoke('clear_context', { model }); }); }
+  async function saveAliases(path: string, aliases: string[]) {
     if (!desktop) throw new Error('Launch the desktop app with npm run desktop to use the local backend.');
-    await invoke('set_model_aliases', { aliases }); await refresh();
+    await invoke('set_model_aliases', { path, aliases }); await refresh();
   }
+  async function saveLibrary(entries: LibraryEntry[], revision: number) {
+    if (!desktop) throw new Error('Launch the desktop app with npm run desktop to use the local backend.');
+    await invoke('save_library', { entries, revision }); await refresh();
+    setNotice({ text: 'models.yml saved. The previous version was backed up.', error: false });
+  }
+  async function libraryCommand(command: string, args?: Record<string, unknown>) {
+    if (!desktop) throw new Error('Launch the desktop app with npm run desktop to use the local backend.');
+    await invoke(command, args); await refresh();
+  }
+  async function setShaCheck(mode: string) { await action('sha-check', async () => { await invoke('set_sha256_check', { mode }); }); }
+  async function eject(id: string) { await action(`eject:${id}`, async () => { await invoke('unload_model', { id }); }); }
+  async function dismissLoadError(path: string) { if (desktop) { await invoke('dismiss_load_error', { path }).catch(() => {}); await refresh().catch(() => {}); } }
   async function browseFile(field: 'model_path' | 'mmproj_path' | 'mtp_path') {
     await action('browse', async () => {
       const path = await invoke<string | null>('pick_model_file');
@@ -282,12 +304,14 @@ function App() {
       setContent(converted); setStateMode(next);
     } catch (e) { setNotice({ text: errorText(e), error: true }); }
   }
+  // Loads the selected model beside any already loaded. Reloading one that is
+  // loaded ejects only that model first.
   async function loadSelected() {
-    setDismissedLoadError(null);
     await action('start', async () => {
-      if (snapshot?.running) { await invoke('stop_runtime'); await refresh(); }
       await save();
-      await invoke('start_runtime');
+      if (selectedInstance) await invoke('unload_model', { id: selectedInstance.id });
+      const id = await invoke<string>('start_runtime');
+      setPlayModel(current => current && instances.some(i => i.id === current && i.path !== settings.model_path) ? current : id);
     });
   }
   async function saveDownloadDirectory() {
@@ -303,34 +327,53 @@ function App() {
     catch (e) { setNotice({ text: `Could not copy: ${errorText(e)}`, error: true }); }
   }
   const banner = visibleBanner(notice ?? (!dismissedApiNotice && snapshot?.api_notice ? { text: snapshot.api_notice, error: false } : null) ?? (!dismissedStartup && snapshot?.startup_warning ? { text: snapshot.startup_warning, error: true } : null), snapshot?.api_error, dismissedApi, desktop, previewDismissed);
-  const ready = snapshot?.ready ?? false;
-  const running = snapshot?.running ?? false;
+  const instances = snapshot?.instances ?? [];
+  const running = instances.length > 0;
+  const readyCount = instances.filter(i => i.ready).length;
   const modelMissing = !dirty && !!snapshot?.model_missing;
-  const model = modelStatus(settings.model_path, snapshot?.loaded_model ?? null, running, ready, modelMissing);
-  const runtimeDirty = snapshot ? (['runtime_path', 'model_path', 'mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size', 'gpu_layers', 'runtime_port', 'library_path'] as const).some(key => settings[key] !== snapshot.settings[key]) : false;
+  // The selected file's loaded model, if it is loaded.
+  const selectedInstance = instances.find(i => i.path === settings.model_path) ?? null;
+  const model = modelStatus(settings.model_path, selectedInstance, modelMissing);
+  // Settings that differ from what the selected model was loaded with.
+  const runtimeDirty = selectedInstance ? (['runtime_path', 'mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size', 'gpu_layers', 'library_path'] as const).some(key => settings[key] !== selectedInstance.settings[key]) : false;
+  const otherLoaded = instances.filter(i => i.path !== settings.model_path).length;
   const fit = snapshot?.fit ?? null;
-  const visionLoaded = ready && !!snapshot?.loaded_model?.projector;
+  const fitDetail = fit ? `${fit.detail}${otherLoaded ? ` Counts the memory the ${otherLoaded === 1 ? 'other loaded model holds' : `${otherLoaded} other loaded models hold`}.` : ''}` : '';
+  const defaultInstance = instances.find(i => i.id === snapshot?.default_model) ?? null;
+  const activeInstance = instances.find(i => i.id === playModel) ?? defaultInstance ?? instances[0] ?? null;
+  const ready = !!activeInstance?.ready;
+  const visionLoaded = ready && !!activeInstance?.projector;
   const projector = settings.mmproj_path || localModels.find(file => isProjector(file.path) && folder(file.path) === folder(settings.model_path))?.path || '';
   const mtpHead = settings.mtp_path || selectedMtp.head || '';
   const builtInMtp = selectedMtp.built_in;
   const mtpAvailable = builtInMtp || !!mtpHead;
   const mtpTitle = settings.mtp ? settings.mtp_path ? `Uses ${basename(settings.mtp_path)}` : "Uses the model's built-in MTP layers" : builtInMtp ? "Use the model's built-in MTP layers" : `Load ${basename(mtpHead)} with this model`;
   const modelFiles = localModels.filter(file => !isProjector(file.path) && !file.mtp_head);
-  const loadError = !running && snapshot?.load_error && snapshot.load_error !== dismissedLoadError ? snapshot.load_error : null;
+  const loadErrors = snapshot?.load_errors ?? [];
   const hardware = snapshot?.hardware ?? null;
-  const chosenRuntime = runtimeStatus(settings.runtime_path, running ? snapshot?.loaded_model?.runtime_path ?? snapshot?.settings.runtime_path ?? null : null, running, snapshot?.data_dir ?? '');
+  const chosenRuntime = runtimeStatus(settings.runtime_path, selectedInstance?.runtime_path ?? null, !!selectedInstance, snapshot?.data_dir ?? '');
   const keepContext = keepOverride ?? snapshot?.settings.keep_context ?? false;
-  const contextInfo = snapshot?.context ?? { entries: 0, last_flushed: 0 };
-  const keepContextControl = <KeepContext on={keepContext} entries={contextInfo.entries} lastFlushed={contextInfo.last_flushed} disabled={!desktop} onToggle={on => void toggleKeepContext(on)} onClear={() => void clearContext()}/>;
-  const loadedFileName = snapshot?.loaded_model ? basename(snapshot.loaded_model.path).replace(/\.gguf$/i, '') : null;
+  const toggleKeep = (on: boolean) => void toggleKeepContext(on);
+  const playContext = activeInstance?.context ?? { entries: 0, last_flushed: 0 };
+  const allEntries = instances.reduce((sum, i) => sum + i.context.entries, 0);
+  const libraryEntries = snapshot?.library?.entries ?? [];
+  const aliasesFor = (path: string) => libraryEntries.find(e => e.path === path)?.aliases ?? [];
+  // The avatar account: models.yml first, then the download folder's name.
+  const accountFor = (path: string) => libraryEntries.find(e => e.path === path)?.account || authorFromPath(path);
+  const nameFor = (path: string) => libraryEntries.find(e => e.path === path)?.name;
+  const routes = snapshot?.routes ?? [];
+  // Shown in the sidebar card: the Playground's model, else the selection.
+  const shown = activeInstance;
   const apiOrigin = `http://127.0.0.1:${snapshot?.api_port ?? 11435}`;
   const apiBase = `${apiOrigin}/v1`;
-  const pythonExample = `import json\nfrom openai import OpenAI\n\nclient = OpenAI(base_url="${apiBase}", api_key="local")\n\nrequest = {\n    "state": "I was charged twice. Please refund the duplicate.",\n    "questions": {\n        "refund": {\n            "type": "noul",\n            "instructions": "Is the customer requesting a refund?"\n        }\n    }\n}\n\nresponse = client.chat.completions.create(\n    model="noullama",\n    messages=[{"role": "user", "content": json.dumps(request)}],\n    stream=False,\n)\ndecision = json.loads(response.choices[0].message.content)\nprint(decision["answers"])`;
+  // Every request names its model exactly; examples use a real name when one is loaded.
+  const exampleModel = (activeInstance && (aliasesFor(activeInstance.path)[0] ?? activeInstance.name)) || 'your-model-name';
+  const pythonExample = `import json\nfrom openai import OpenAI\n\nclient = OpenAI(base_url="${apiBase}", api_key="local")\n\nrequest = {\n    "state": "I was charged twice. Please refund the duplicate.",\n    "questions": {\n        "refund": {\n            "type": "noul",\n            "instructions": "Is the customer requesting a refund?"\n        }\n    }\n}\n\nresponse = client.chat.completions.create(\n    model="${exampleModel}",\n    messages=[{"role": "user", "content": json.dumps(request)}],\n    stream=False,\n)\ndecision = json.loads(response.choices[0].message.content)\nprint(decision["answers"])`;
   let questionError = '';
   try { buildRequest(questions, '', 'text'); } catch (e) { questionError = errorText(e); }
   let jsonError = '';
   try { buildRequest(questions, content, stateMode); } catch (e) { jsonError = errorText(e); }
-  const requestJson = (() => { try { return pretty(buildRequest(questions, content, stateMode)); } catch { return '{}'; } })();
+  const requestJson = (() => { try { return pretty({ model: exampleModel, ...buildRequest(questions, content, stateMode) }); } catch { return '{}'; } })();
 
   const [pageTitle, pageSubtitle] = pages[tab];
   const repoLike = /^[\w.-]+\/[\w.-]+$/.test(query.trim()) && !models.some(m => m.id === query.trim());
@@ -355,27 +398,29 @@ function App() {
     <aside className="sidebar">
       <div className="brand"><img className="brand-logo" src={logoUrl} width={28} height={28} alt=""/><span>noullama</span><span className="brand-tag">Beta</span></div>
       <nav>{[
-        ['playground', FlaskConical, 'Playground'], ['models', Layers3, 'Models'], ['hub', Network, 'Hub'], ['runtime', Cpu, 'Runtime'], ['api', Code2, 'Local API'],
+        ['playground', FlaskConical, 'Playground'], ['models', Layers3, 'Models'], ['hub', Network, 'Hub'], ['runtime', Cpu, 'Runtime'], ['api', Code2, 'Local API'], ['library', LibraryIcon, 'Library'], ['settings', Settings2, 'Settings'],
       ].map(([id, Icon, title]) => { const I = Icon as typeof Cpu; return <button key={String(id)} className={`nav-item ${tab === id ? 'active' : ''}`} aria-current={tab === id ? 'page' : undefined} title={String(title)} onClick={() => setTab(String(id))}><I size={18}/><span>{String(title)}</span></button>; })}</nav>
       <div className="sidebar-bottom">
         {desktop && <button className={`nav-item ${updates?.offer ? 'has-update' : ''}`} title={updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'} aria-haspopup="dialog" onClick={() => setUpdatesOpen(true)}><CircleArrowUp size={18}/><span>{updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'}</span></button>}
         <button className="nav-item" title="Runtime logs" aria-label="Runtime logs" aria-pressed={showLogs} onClick={() => setShowLogs(v => !v)}><Terminal size={18}/><span>Runtime logs</span></button>
         <button className="nav-item" title="Quit Noullama" aria-label="Quit Noullama" disabled={!desktop || busy === 'quit'} onClick={() => action('quit-prompt', async () => { await invoke('request_quit'); })}><Power size={18}/><span>Quit Noullama</span></button>
         <div className="runtime-card-wrap" onMouseEnter={() => setDetailsOpen(true)} onMouseLeave={() => setDetailsOpen(false)} onFocus={() => setDetailsOpen(true)} onBlur={() => setDetailsOpen(false)}>
-          <button className="runtime-card" onClick={() => setTab('runtime')} aria-label={`Selected llama.cpp: ${chosenRuntime.source} ${chosenRuntime.name}${chosenRuntime.inUse ? ', in use' : ', not running'}`}><span className={`runtime-card-icon ${ready ? 'ready' : running ? 'loading' : ''}`}><Cpu size={16}/></span><span><strong>{ready ? 'Model ready' : running ? 'Loading model' : 'Runtime offline'}</strong><small>llama.cpp {chosenRuntime.source} · {chosenRuntime.name}</small>{chosenRuntime.pending && <small className="runtime-pending">Next selection not applied</small>}</span></button>
+          <button className="runtime-card" onClick={() => setTab('runtime')} aria-label={`Selected llama.cpp: ${chosenRuntime.source} ${chosenRuntime.name}${chosenRuntime.inUse ? ', in use' : ', not running'}`}><span className={`runtime-card-icon ${readyCount ? 'ready' : running ? 'loading' : ''}`}><Cpu size={16}/></span><span><strong>{readyCount > 1 ? `${readyCount} models ready` : readyCount ? 'Model ready' : running ? 'Loading model' : 'Runtime offline'}</strong><small>llama.cpp {chosenRuntime.source} · {chosenRuntime.name}</small>{chosenRuntime.pending && <small className="runtime-pending">Next selection not applied</small>}</span></button>
           {detailsOpen && <ModelDetails
-            name={basename(snapshot?.loaded_model?.path || settings.model_path || '') }
-            status={ready ? 'Ready' : running ? 'Loading' : model.selected ? 'Not loaded' : 'No model selected'}
-            path={snapshot?.loaded_model?.path || settings.model_path}
-            device={running ? snapshot?.loaded_model?.device ?? null : null}
-            projector={running ? (snapshot?.loaded_model?.projector ? basename(snapshot.settings.mmproj_path) : null) : (settings.mmproj_path ? basename(settings.mmproj_path) : null)}
-            mtp={mtpDetail(running ? snapshot?.loaded_model?.mtp ? snapshot.settings : null : settings.mtp ? settings : null)}
-            contextSize={(running ? snapshot?.settings.context_size : settings.context_size) ?? settings.context_size}
-            gpuLayers={(running ? snapshot?.settings.gpu_layers : settings.gpu_layers) ?? settings.gpu_layers}
-            runtime={`${chosenRuntime.source} / ${chosenRuntime.name}${chosenRuntime.pending ? ' (next selection not applied)' : ''}`}
-            endpoint={ready ? apiBase : null}
+            name={basename(shown?.path || settings.model_path || '') }
+            status={shown ? `${shown.ready ? 'Ready' : 'Loading'}${instances.length > 1 ? ` · 1 of ${instances.length} loaded` : ''}` : model.selected ? 'Not loaded' : 'No model selected'}
+            path={shown?.path || settings.model_path}
+            device={shown?.device || null}
+            projector={shown ? shown.projector ? basename(shown.mmproj_path) : null : settings.mmproj_path ? basename(settings.mmproj_path) : null}
+            mtp={mtpDetail(shown ? shown.mtp ? shown : null : settings.mtp ? settings : null)}
+            contextSize={shown?.context_size ?? settings.context_size}
+            gpuLayers={shown?.gpu_layers ?? settings.gpu_layers}
+            runtime={(() => { const r = runtimeStatus(shown?.runtime_path ?? settings.runtime_path, null, false, snapshot?.data_dir ?? ''); return `${r.source} / ${r.name}`; })()}
+            endpoint={shown?.ready ? apiBase : null}
             memory={desktop ? memory : null}
-            estimate={fit?.required_bytes ?? null}
+            estimate={shown ? shown.required_bytes : fit?.required_bytes ?? null}
+            modelId={shown?.id ?? null}
+            loadedCount={instances.length}
             gpuName={hardware?.gpu ?? null}/>}
         </div>
       </div>
@@ -388,17 +433,17 @@ function App() {
         </header>
         {banner && <div className={`notice ${banner.error ? 'error' : ''}`} role={banner.error ? 'alert' : 'status'}><span className="notice-text">{banner.error && <AlertCircle size={16}/>}<span>{banner.text}</span></span><button aria-label="Dismiss notification" onClick={() => { setNotice(null); setDismissedStartup(true); setDismissedApiNotice(true); setDismissedApi(snapshot?.api_error ?? null); setPreviewDismissed(true); }}><X size={16}/></button></div>}
         <section className="model-strip" aria-label="Model status">
-          <div className="model-strip-icon">{authorFromPath(model.loaded || model.selected || '') ? <AuthorLogo author={authorFromPath(model.loaded || model.selected || '')} size={40}/> : <Cpu size={20}/>}</div>
-          <div className="model-identity"><small>{running ? ready ? 'Loaded model' : 'Loading model' : 'Selected model'}</small><span className="identity-line"><strong title={model.loaded || model.selected}>{model.loaded ? basename(model.loaded) : model.selected ? basename(model.selected) : 'No model selected'}</strong>{(model.loaded || model.selected) && <CopyButton value={basename(model.loaded || model.selected || '')} label="Copy model file name" size={13} onError={copyError}/>}</span>{model.device && <small>{model.device}</small>}{model.switching && <small className="pending-model" title={model.selected}>Next: {basename(model.selected)}</small>}</div>
-          <span className={`chip ${ready ? 'success' : ''}`}><span className={`status-dot ${ready ? 'green' : running ? 'amber' : ''}`}/>{busy === 'start' ? 'Starting…' : model.label}</span>
+          <div className="model-strip-icon">{accountFor(model.loaded || model.selected || '') ? <AuthorLogo author={accountFor(model.loaded || model.selected || '')} size={40}/> : <Cpu size={20}/>}</div>
+          <div className="model-identity"><small>{selectedInstance ? selectedInstance.ready ? 'Loaded model' : 'Loading model' : 'Selected model'}{otherLoaded > 0 && <> · <button type="button" className="text-button inline" onClick={() => setTab('models')}>{otherLoaded} other loaded</button></>}</small><span className="identity-line"><strong title={model.loaded || model.selected}>{model.loaded || model.selected ? nameFor(model.loaded || model.selected) ?? basename(model.loaded || model.selected) : 'No model selected'}</strong>{(model.loaded || model.selected) && <CopyButton value={basename(model.loaded || model.selected || '')} label="Copy model file name" size={13} onError={copyError}/>}</span>{model.device && <small>{model.device}</small>}</div>
+          <span className={`chip ${model.ready ? 'success' : ''}`}><span className={`status-dot ${model.ready ? 'green' : model.loaded ? 'amber' : ''}`}/>{busy === 'start' ? 'Starting…' : model.label}</span>
           {projector && <Toggle label="Vision" title={settings.mmproj_path ? `Loads ${basename(settings.mmproj_path)}` : `Load ${basename(projector)} with this model`} checked={!!settings.mmproj_path} onChange={on => edit('mmproj_path', on ? projector : '')}/>}
           {mtpAvailable && <Toggle label="MTP" title={mtpTitle} checked={settings.mtp} onChange={setMtp}/>}
-          {fit && <span className={`fit-badge fit-level-${fit.level}`} title={fit.detail}><span className="fit-bars" aria-hidden="true">{[1, 2, 3, 4].map(n => <i key={n} className={n <= fit.level ? 'on' : ''}/>)}</span>{fit.label}</span>}
+          {fit && <span className={`fit-badge fit-level-${fit.level}`} title={fitDetail}><span className="fit-bars" aria-hidden="true">{[1, 2, 3, 4].map(n => <i key={n} className={n <= fit.level ? 'on' : ''}/>)}</span>{fit.label}</span>}
           <div className="model-controls"><button className="text-button" disabled={!!busy} onClick={() => tab === 'models' ? browseFile('model_path') : setTab('models')}>{tab === 'models' ? 'Browse file' : 'Select model'}</button>
-          {running && <button className="secondary" disabled={!!busy} onClick={() => action('stop', async () => { await invoke('stop_runtime'); })}><Square size={13}/>{ready ? 'Unload' : 'Cancel loading'}</button>}
-          {(!running || model.switching || runtimeDirty) && <button className="primary" disabled={!!busy || !model.selected || model.missing || (running && !ready)} onClick={loadSelected}>{busy === 'start' ? <RefreshCw className="spin" size={14}/> : <Play size={14}/>} {busy === 'start' ? 'Starting…' : running ? model.switching ? 'Switch model' : 'Reload model' : 'Load model'}</button>}</div>
+          {selectedInstance && <button className="secondary" disabled={!!busy} title={selectedInstance.ready ? `Unload ${selectedInstance.name}; other loaded models keep running` : undefined} onClick={() => void eject(selectedInstance.id)}>{selectedInstance.ready ? <Unplug size={13}/> : <Square size={13}/>}{selectedInstance.ready ? 'Eject' : 'Cancel loading'}</button>}
+          {(!selectedInstance || runtimeDirty) && <button className="primary" disabled={!!busy || !model.selected || model.missing || (!!selectedInstance && !selectedInstance.ready)} title={!selectedInstance && running ? 'Loads beside the models already loaded' : undefined} onClick={loadSelected}>{busy === 'start' ? <RefreshCw className="spin" size={14}/> : <Play size={14}/>} {busy === 'start' ? 'Starting…' : selectedInstance ? 'Reload model' : running ? 'Load beside' : 'Load model'}</button>}</div>
         </section>
-        {loadError && <div className="load-error" role="alert"><AlertCircle size={18}/><div><strong>{loadError.split('\n')[0]}</strong>{loadError.includes('\n') && <pre>{loadError.split('\n').slice(1).join('\n')}</pre>}</div><div className="load-error-actions"><button className="text-button" onClick={() => setShowLogs(true)}>View logs</button><button className="icon-button" aria-label="Dismiss error" onClick={() => setDismissedLoadError(snapshot?.load_error ?? null)}><X size={15}/></button></div></div>}
+        {loadErrors.map(error => <div className="load-error" role="alert" key={error.path}><AlertCircle size={18}/><div><strong>{error.name}: {error.message.split('\n')[0]}</strong>{error.message.includes('\n') && <pre>{error.message.split('\n').slice(1).join('\n')}</pre>}</div><div className="load-error-actions"><button className="text-button" onClick={() => setShowLogs(true)}>View logs</button><button className="icon-button" aria-label={`Dismiss error for ${error.name}`} onClick={() => void dismissLoadError(error.path)}><X size={15}/></button></div></div>)}
 
         {tab === 'playground' && <div className="playground">
           <div className="playground-main">
@@ -408,14 +453,19 @@ function App() {
           </div>
           <aside className="run-settings" aria-label="Run settings">
             <h2>Run settings</h2>
+            <div className="rail-section"><div className="rail-label">Model</div>{instances.length ? <Select label="Playground model" value={activeInstance?.id ?? ''} options={instances.map(i => ({ value: i.id, label: `${i.name}${i.ready ? '' : ' (loading)'}` }))} onChange={setPlayModel}/> : <p className="rail-note">No model loaded. Select one and click Load model.</p>}{activeInstance && <p className="rail-note">In the local API, send <code>"model": "{aliasesFor(activeInstance.path)[0] ?? activeInstance.name}"</code>.</p>}</div>
             <div className="rail-section"><div className="rail-label">Preset</div><div className="preset-chips">{presets.map((p, i) => { const Icon = icons[i]; return <button key={p.id} className={`preset-chip ${p.id === preset ? 'selected' : ''}`} aria-pressed={p.id === preset} title={p.subtitle} onClick={() => selectPreset(p.id)}><Icon size={14}/>{p.title}</button>; })}{savedPresets.map(p => <span className={`preset-chip saved ${p.id === preset ? 'selected' : ''}`} key={p.id}><button aria-pressed={p.id === preset} onClick={() => selectPreset(p.id)}><FileJson size={14}/>{p.name}</button><button className="chip-remove" aria-label={`Delete preset ${p.name}`} title={`Delete ${p.name}`} disabled={!!busy} onClick={() => setPresetToDelete(p)}><X size={13}/></button></span>)}</div><p className="rail-note">{presets.find(p => p.id === preset)?.subtitle ?? (preset.startsWith('saved-') ? 'Custom preset' : 'Custom questions')}</p></div>
-            <div className="rail-section">{keepContextControl}</div>
+            <div className="rail-section"><KeepContext on={keepContext} entries={playContext.entries} lastFlushed={playContext.last_flushed} scope={instances.length > 1 && activeInstance ? `for ${activeInstance.name}` : undefined} disabled={!desktop} onToggle={toggleKeep} onClear={() => void clearContext(activeInstance?.id ?? null)}/></div>
             <section className="question-panel"><div className="rail-heading"><span className="rail-label">Questions <span className="code-badge">JSON</span></span><div className="heading-actions"><button className="text-button" onClick={() => { try { setQuestions(pretty(JSON.parse(questions))); } catch (e) { setNotice({ text: errorText(e), error: true }); } }}>Format</button><button className="icon-button" aria-label="Copy questions" onClick={() => copy(questions, 'questions')}>{copied === 'questions' ? <Check size={14}/> : <Copy size={14}/>}</button></div></div><JsonEditor label="Questions JSON" value={questions} onChange={value => { setQuestions(value); setResult(null); }}/><div className="editor-footer"><span className={questionError ? 'invalid' : 'valid'}><span className={`status-dot ${questionError ? 'red' : 'green'}`}/>{questionError ? 'Check JSON' : `${Object.keys(JSON.parse(questions)).length} questions`}</span><span>choice, noul or score</span></div></section>
             <form className="preset-save" onSubmit={e => { e.preventDefault(); saveCustom(); }}><input aria-label="Custom preset name" placeholder="Preset name" maxLength={80} value={presetName} onChange={e => setPresetName(e.target.value)}/><button className="secondary compact" disabled={!!busy || !!jsonError || !presetName.trim()}><Save size={13}/>{preset.startsWith('saved-') ? 'Save changes' : 'Save preset'}</button></form>
           </aside>
         </div>}
         {tab === 'models' && <>
-          {modelFiles.length > 0 && <><div className="section-heading"><h2>On your machine</h2><span>{modelFiles.length} {modelFiles.length === 1 ? 'model' : 'models'}</span></div><div className="model-list">{modelFiles.map(model => { const hasProjector = localModels.some(file => isProjector(file.path) && folder(file.path) === folder(model.path)); return <div key={model.path} className="local-model-entry"><button className="model-row" onClick={() => { selectModel(model.path); setTab('runtime'); }}><AuthorLogo author={authorFromPath(model.path)}/><span><strong>{model.name}</strong><small>{(model.size / 1e9).toFixed(2)} GB / {model.path}</small></span>{hasProjector && <span className="chip" title="A multimodal projector is in the same folder. Turn it on from the model bar or Runtime.">Vision available</span>}{model.mtp && <span className="chip" title="This model has MTP layers, or a matching MTP head is in the same folder. Turn it on from the model bar or Runtime.">MTP available</span>}{model.decision === 'winnow-v1' && <span className="chip" title="No native decision support, so Noullama reads its answers through Winnow's own prompt layout.">Winnow layout</span>}{model.decision == null && settings.decision_mode === 'auto' && <span className="chip warning" title="No native decision support and no prompt layout Noullama knows. Loading it will fail unless you set Decision mode in Runtime.">Not a decision model</span>}<span className="pill">{model.path === snapshot?.loaded_model?.path ? 'Loaded' : model.path === settings.model_path ? 'Selected' : 'Select'}</span></button><CopyButton className="reveal-file" value={model.path} label={`Copy path of ${model.name}`} size={15} onError={copyError}/><button className="icon-button reveal-file" aria-label={`Show ${model.name} in folder`} title="Show in folder" disabled={!!busy} onClick={() => revealFile(model.path)}><FolderOpen size={16}/></button></div>; })}</div></>}
+          {instances.length > 0 && <><div className="section-heading"><h2>Loaded</h2><span>{instances.length} {instances.length === 1 ? 'model' : 'models'} · API requests name one by file name or alias</span></div><div className="loaded-list">{instances.map(instance => <section className="panel loaded-model" key={instance.id}>
+            <div className="loaded-head"><AuthorLogo author={accountFor(instance.path)} size={34}/><span className="loaded-name"><span className="identity-line"><strong title={instance.path}>{instance.name}</strong><CopyButton value={instance.name} label={`Copy model name ${instance.name}`} size={12} onError={copyError}/></span><small>{instance.ready ? instance.device : 'Loading…'} · {instance.context_size.toLocaleString()} context · {instance.gpu_layers === 0 ? 'no GPU layers' : `${instance.gpu_layers} GPU layers`}{instance.layout === 'winnow-v1' ? ' · Winnow layout' : ''}{instance.projector ? ' · Vision' : ''}{instance.mtp ? ' · MTP' : ''}</small></span><span className={`chip ${instance.ready ? 'success' : ''}`}><span className={`status-dot ${instance.ready ? 'green' : 'amber'}`}/>{instance.ready ? 'Ready' : 'Loading'}</span><button className="secondary compact" disabled={busy === `eject:${instance.id}`} onClick={() => void eject(instance.id)}>{instance.ready ? <><Unplug size={13}/>Eject</> : <><Square size={13}/>Cancel</>}</button></div>
+            <ModelAliases path={instance.path} aliases={aliasesFor(instance.path)} routes={routes} disabled={!desktop} onSave={saveAliases} onError={copyError}/>
+          </section>)}</div></>}
+          {modelFiles.length > 0 && <><div className="section-heading"><h2>On your machine</h2><span>{modelFiles.length} {modelFiles.length === 1 ? 'model' : 'models'}</span></div><div className="model-list">{modelFiles.map(model => { const hasProjector = localModels.some(file => isProjector(file.path) && folder(file.path) === folder(model.path)); return <div key={model.path} className="local-model-entry"><button className="model-row" onClick={() => { selectModel(model.path); setTab('runtime'); }}><AuthorLogo author={accountFor(model.path)}/><span><strong>{nameFor(model.path) ?? model.name}</strong><small>{nameFor(model.path) && nameFor(model.path) !== model.name.replace(/\.gguf$/i, '') ? `${model.name} / ` : ''}{(model.size / 1e9).toFixed(2)} GB / {model.path}</small></span>{hasProjector && <span className="chip" title="A multimodal projector is in the same folder. Turn it on from the model bar or Runtime.">Vision available</span>}{model.mtp && <span className="chip" title="This model has MTP layers, or a matching MTP head is in the same folder. Turn it on from the model bar or Runtime.">MTP available</span>}{model.decision === 'winnow-v1' && <span className="chip" title="No native decision support, so Noullama reads its answers through Winnow's own prompt layout.">Winnow layout</span>}{model.decision == null && settings.decision_mode === 'auto' && <span className="chip warning" title="No native decision support and no prompt layout Noullama knows. Loading it will fail unless you set Decision mode in Runtime.">Not a decision model</span>}{aliasesFor(model.path).length > 0 && <span className="chip" title={`API aliases: ${aliasesFor(model.path).join(', ')}`}>{aliasesFor(model.path).length === 1 ? aliasesFor(model.path)[0] : `${aliasesFor(model.path).length} aliases`}</span>}<span className="pill">{instances.some(i => i.path === model.path) ? 'Loaded' : model.path === settings.model_path ? 'Selected' : 'Select'}</span></button><button className="icon-button reveal-file" aria-label={`API names for ${model.name}`} title="API names" aria-expanded={aliasEditors.includes(model.path)} onClick={() => setAliasEditors(open => open.includes(model.path) ? open.filter(p => p !== model.path) : [...open, model.path])}><Tags size={16}/></button><CopyButton className="reveal-file" value={model.path} label={`Copy path of ${model.name}`} size={15} onError={copyError}/><button className="icon-button reveal-file" aria-label={`Show ${model.name} in folder`} title="Show in folder" disabled={!!busy} onClick={() => revealFile(model.path)}><FolderOpen size={16}/></button>{aliasEditors.includes(model.path) && <div className="row-aliases"><ModelAliases path={model.path} aliases={aliasesFor(model.path)} routes={routes} disabled={!desktop} onSave={saveAliases} onError={copyError}/></div>}</div>; })}</div></>}
           {modelFiles.length === 0 && <div className="local-empty"><FolderOpen size={18}/><p>No models on this machine yet. Download one from the <button className="text-button" onClick={() => setTab('hub')}>Hub</button> or point Noullama at a GGUF file.</p></div>}
           {scanWarnings.length > 0 && <div className="hint" role="status">{scanWarnings.map(warning => <p key={warning}>{warning}</p>)}</div>}
           <div className="import-note"><FolderOpen size={18}/><div><strong>Local GGUF</strong><p>Already have a GGUF file? Pick it here instead of downloading.</p></div><button className="text-button" onClick={() => browseFile('model_path')}>Browse local model<ArrowRight size={14}/></button></div>
@@ -453,7 +503,7 @@ function App() {
             <label>Shared-library folders (optional)<input placeholder="Found automatically, or /usr/local/cuda/lib64" value={settings.library_path} onChange={e => edit('library_path', e.target.value)}/><small>For CUDA or other libraries the runtime cannot find. Separate folders with a colon. Only the runtime process sees them.</small></label>
           </RuntimeManager>
           <section className="panel settings-panel"><div className="panel-heading"><span><Layers3 size={16}/> Model</span>{fit && <span className={`fit-badge fit-level-${fit.level}`}><span className="fit-bars" aria-hidden="true">{[1, 2, 3, 4].map(n => <i key={n} className={n <= fit.level ? 'on' : ''}/>)}</span>{fit.label}</span>}</div><div className="settings-body">
-            <p className="hint fit-note">{fit ? fit.detail : model.selected ? 'The selected model file could not be read.' : 'Select a model to see how it would run on this machine.'}</p>
+            <p className="hint fit-note">{fit ? fitDetail : model.selected ? 'The selected model file could not be read.' : 'Select a model to see how it would run on this machine.'}</p>
             <label>Model file (GGUF)<div className="file-input-row"><input placeholder="/path/to/model.gguf" value={settings.model_path} onChange={e => edit('model_path', e.target.value)}/><button className="secondary" type="button" disabled={!!busy} onClick={() => browseFile('model_path')}><FolderOpen size={14}/>Browse</button></div></label>
             <div className="field"><div className="field-row"><span>Multimodal projector</span><Toggle label={settings.mmproj_path ? 'On' : 'Off'} ariaLabel="Multimodal projector" checked={!!settings.mmproj_path} disabled={!settings.mmproj_path && !projector} onChange={on => edit('mmproj_path', on ? projector : '')}/></div>{settings.mmproj_path ? <div className="file-input-row"><input aria-label="Multimodal projector path" placeholder="/path/to/mmproj.gguf" value={settings.mmproj_path} onChange={e => edit('mmproj_path', e.target.value)}/><button className="secondary" type="button" disabled={!!busy} onClick={() => browseFile('mmproj_path')}><FolderOpen size={14}/>Browse</button></div> : <small>{projector ? `Found ${basename(projector)} next to the selected model.` : <>No projector next to the selected model. <button type="button" className="text-button inline" disabled={!!busy} onClick={() => browseFile('mmproj_path')}>Choose a file</button></>}</small>}<small>Lets image-capable models read images in the Playground.</small></div>
             <div className="field"><div className="field-row"><span>Multi-token prediction (MTP)</span><Toggle label={settings.mtp ? 'On' : 'Off'} ariaLabel="Multi-token prediction" checked={settings.mtp} disabled={!settings.mtp && !mtpAvailable} onChange={setMtp}/></div>{settings.mtp_path ? <div className="file-input-row"><input aria-label="MTP head path" placeholder="/path/to/mtp-model.gguf" value={settings.mtp_path} onChange={e => edit('mtp_path', e.target.value)}/><button className="secondary" type="button" disabled={!!busy} onClick={() => browseFile('mtp_path')}><FolderOpen size={14}/>Browse</button></div> : <small>{builtInMtp ? 'The selected model has built-in MTP layers.' : mtpHead ? `Found ${basename(mtpHead)} next to the selected model.` : <>No MTP layers in the selected model and no matching MTP head next to it. <button type="button" className="text-button inline" disabled={!!busy} onClick={() => browseFile('mtp_path')}>Choose a file</button></>}</small>}<small>Drafts several tokens per step with the model's MTP layers, which can speed up generation. Needs a llama.cpp build with MTP support.</small></div>
@@ -461,16 +511,30 @@ function App() {
             <div className="form-grid"><label>Context size<NumberField min={512} max={131072} step={1024} value={settings.context_size} onChange={value => edit('context_size', value)}/><small>Maximum tokens per request. The default is 8192.</small></label><label>GPU layers<NumberField min={-1} value={settings.gpu_layers} onChange={value => edit('gpu_layers', value)}/><small>0 runs on the CPU. 99 puts every layer that fits on the GPU.</small></label></div>
           </div></section>
           <section className="panel settings-panel"><div className="panel-heading"><span><Settings2 size={16}/> Connection</span></div><div className="settings-body">
-            <div className="form-grid"><label>Local API port<NumberField min={1} max={65535} value={settings.api_port} onChange={value => edit('api_port', value)}/><small>Used after a restart. If it is taken, Noullama picks a free nearby port and shows it in Local API.</small></label><label>Private llama-server port<NumberField min={1} max={65535} value={settings.runtime_port} onChange={value => edit('runtime_port', value)}/><small>Internal only. Both ports listen on 127.0.0.1.</small></label></div>
+            <div className="form-grid"><label>Local API port<NumberField min={1} max={65535} value={settings.api_port} onChange={value => edit('api_port', value)}/><small>Used after a restart. If it is taken, Noullama picks a free nearby port and shows it in Local API.</small></label><label>Private llama-server port<NumberField min={1} max={65535} value={settings.runtime_port} onChange={value => edit('runtime_port', value)}/><small>Internal only, on 127.0.0.1. Each loaded model takes the next free port from here.</small></label></div>
             <label>Hugging Face CLI<input value={settings.hf_path} onChange={e => edit('hf_path', e.target.value)} placeholder="hf"/><small>Use the full path if hf is not on the desktop app's PATH.</small></label>
           </div></section>
-          <div className={`save-bar ${dirty ? 'dirty' : ''}`}><span className="hint">{running ? 'Unload the model to save changes. Reload model applies model changes right away.' : dirty ? 'You have unsaved changes.' : 'All changes saved.'}</span><button className={dirty && !running ? 'primary' : 'secondary'} disabled={!dirty || !!busy || running} onClick={() => action('save', async () => { await save(); setNotice({ text: 'Settings saved.', error: false }); })}>Save settings</button></div>
+          <div className={`save-bar ${dirty ? 'dirty' : ''}`}><span className="hint">{dirty ? running ? 'Unsaved changes apply to the next model you load. Reload model applies them to the selected one.' : 'You have unsaved changes.' : running ? 'All changes saved. Loaded models keep the settings they started with.' : 'All changes saved.'}</span><button className={dirty ? 'primary' : 'secondary'} disabled={!dirty || !!busy} onClick={() => action('save', async () => { await save(); setNotice({ text: 'Settings saved.', error: false }); })}>Save settings</button></div>
+        </>}
+        {tab === 'library' && <Library library={snapshot?.library ?? null} loadedPaths={instances.map(i => i.path)} desktop={desktop}
+          onSave={saveLibrary} onReload={() => libraryCommand('reload_library')} onOpenFile={() => libraryCommand('open_models_file')} onOpenBackups={() => libraryCommand('open_backups_folder')}
+          onRecordSha={path => libraryCommand('record_sha256', { path })} onBrowse={() => invoke<string | null>('pick_model_file')} onError={copyError}/>}
+        {tab === 'settings' && <>
+          <section className="panel settings-panel"><div className="panel-heading"><span><ShieldCheck size={16}/> Model file checks</span></div><div className="settings-body">
+            <div className="field"><div className="field-row"><span>sha256 before loading</span><div className="segmented" role="group" aria-label="sha256 check">{SHA_CHECKS.map(option => <button key={option.value} type="button" className={(snapshot?.settings.sha256_check ?? 'once') === option.value ? 'on' : ''} aria-pressed={(snapshot?.settings.sha256_check ?? 'once') === option.value} disabled={!desktop || busy === 'sha-check'} onClick={() => void setShaCheck(option.value)}>{option.label}</button>)}</div></div>
+              <small>{SHA_CHECKS.find(option => option.value === (snapshot?.settings.sha256_check ?? 'once'))?.detail}</small>
+              <small>Each model's sha256 is kept in models.yml. It guards against loading a file that was replaced, truncated or swapped by mistake; it is not a security boundary.</small></div>
+          </div></section>
+          <section className="panel settings-panel"><div className="panel-heading"><span><FileJson size={16}/> Models file</span></div><div className="settings-body">
+            <div className="field"><div className="field-row"><span className="identity-line"><code>{snapshot?.library?.file ?? 'models.yml'}</code>{snapshot?.library?.file && <CopyButton value={snapshot.library.file} label="Copy models.yml path" size={12} onError={copyError}/>}</span><span className="save-actions"><button className="secondary compact" disabled={!desktop} onClick={() => action('open-yml', () => libraryCommand('open_models_file'))}>Edit models.yml</button><button className="secondary compact" disabled={!desktop} onClick={() => action('open-backups', () => libraryCommand('open_backups_folder'))}>Backups</button><button className="text-button" onClick={() => setTab('library')}>Open Library</button></span></div>
+              <small>Noullama rereads models.yml whenever it changes, and before loading, ejecting, routing a request or changing Keep context. It backs the file up before every change it makes, other than recording a sha256, and keeps the newest 20 copies.</small></div>
+          </div></section>
         </>}
         {tab === 'api' && <>
           <section className="endpoint-card"><div><span className={`status-dot ${!snapshot?.api_error && desktop ? 'green' : ''}`}/><strong>{apiBase}</strong><button className="icon-button" aria-label="Copy API URL" onClick={() => copy(apiBase, 'api')}>{copied === 'api' ? <Check size={16}/> : <Copy size={16}/>}</button></div><p>{snapshot?.api_error ?? 'Localhost only. No API key needed. Available while Noullama is open.'}</p></section>
-          <section className="panel keep-context-card">{keepContextControl}</section>
-          <div className="endpoint-list">{([['GET', '/v1/models', 'List the names the loaded model answers to'], ['POST', '/v1/systemone', 'Native state + typed questions'], ['POST', '/v1/chat/completions', 'OpenAI chat response envelope'], ['GET', '/health', 'Gateway health and model readiness (outside /v1)']] as const).map(([method, path, text]) => <div key={path}><span className={`method ${method === 'GET' ? 'get' : ''}`}>{method}</span><code>{path}</code><span>{text}</span><CopyButton value={`${apiOrigin}${path}`} label={`Copy ${apiOrigin}${path}`} size={13} onError={copyError}/></div>)}</div>
-          <ModelNames fileName={loadedFileName} aliases={snapshot?.settings.model_aliases ?? []} disabled={!desktop} onSave={saveAliases} onError={copyError}/>
+          <section className="panel keep-context-card"><KeepContext on={keepContext} entries={allEntries} lastFlushed={instances.length === 1 ? instances[0].context.last_flushed : 0} scope={instances.length > 1 ? `across ${instances.length} models` : undefined} disabled={!desktop} onToggle={toggleKeep} onClear={() => void clearContext(null)}/></section>
+          <div className="endpoint-list">{([['GET', '/v1/models', 'List the names that reach a loaded model'], ['POST', '/v1/systemone', 'Native state + typed questions'], ['POST', '/v1/chat/completions', 'OpenAI chat response envelope'], ['GET', '/health', 'Gateway health and model readiness (outside /v1)']] as const).map(([method, path, text]) => <div key={path}><span className={`method ${method === 'GET' ? 'get' : ''}`}>{method}</span><code>{path}</code><span>{text}</span><CopyButton value={`${apiOrigin}${path}`} label={`Copy ${apiOrigin}${path}`} size={13} onError={copyError}/></div>)}</div>
+          <ModelRouting instances={instances} routes={routes} aliasesFor={aliasesFor} disabled={!desktop} onSave={saveAliases} onError={copyError}/>
           <section className="panel code-panel"><div className="panel-heading"><span>Native decision request</span><button className="icon-button" aria-label="Copy native API example" onClick={() => copy(`curl ${apiBase}/systemone -H 'Content-Type: application/json' -d '${requestJson.replace(/'/g, "'\\''")}'`, 'curl')}>{copied === 'curl' ? <Check size={14}/> : <Copy size={14}/>}</button></div><pre>{`curl ${apiBase}/systemone \\\n  -H 'Content-Type: application/json' \\\n  -d '${requestJson.replace(/'/g, "'\\''")}'`}</pre></section>
           <section className="panel code-panel"><div className="panel-heading"><span>Python · OpenAI SDK</span><div className="heading-actions"><span className="chip">Non-streaming</span><CopyButton value={pythonExample} label="Copy Python example" onError={copyError}/></div></div><pre>{pythonExample}</pre></section>
           <div className="api-note"><BookOpen size={18}/><div><strong>Request format</strong><p>Send one user message containing a JSON request with state and questions. The assistant content contains the native result as JSON. Chat history, tools, and streaming are unsupported. Questions use choice, noul, or score; this runtime does not support extraction or multi-select.</p><a href="https://github.com/ggml-org/llama.cpp/blob/b11938/tools/server/README.md#post-v1systemone-typesafe-compatible-system-one-api" target="_blank" rel="noreferrer">llama.cpp decision API reference<ExternalLink size={12}/></a></div></div>

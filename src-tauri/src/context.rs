@@ -1,9 +1,11 @@
 //! Keep context: earlier decisions ride along in each new request's state, so
-//! the model sees what it decided before. The history is shared by the
-//! Playground and every local API caller. When a request no longer fits the
-//! context window, the oldest decisions are flushed until it does.
+//! the model sees what it decided before. Each loaded model keeps its own
+//! history, shared by the Playground and every local API caller that reaches
+//! it. When a request no longer fits the context window, the oldest decisions
+//! are flushed until it does.
 
-use crate::runtime::AppState;
+use crate::runtime::{AppState, Instance};
+use std::sync::Arc;
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 
@@ -23,8 +25,6 @@ pub struct Entry {
 pub struct History {
     entries: VecDeque<Entry>,
     next_seq: u64,
-    /// The model the entries were decided by; a different model starts fresh.
-    model: String,
     /// Decisions flushed to make the most recent request fit.
     pub last_flushed: usize,
 }
@@ -113,21 +113,13 @@ pub enum Failure {
 }
 
 /// Runs one decision, adding earlier decisions when Keep context is on.
-pub async fn infer(state: &AppState, payload: Value) -> Result<Value, String> {
+pub async fn infer(state: &AppState, instance: &Arc<Instance>, payload: Value) -> Result<Value, String> {
     if !state.settings.lock().await.keep_context {
-        return state.infer_once(payload, false).await.map_err(|failure| match failure {
+        return state.infer_once(instance, payload, false).await.map_err(|failure| match failure {
             Failure::ContextFull(message) | Failure::Other(message) => message,
         });
     }
-    let model = state.loaded_model.lock().await.as_ref().map(|m| m.path.clone()).unwrap_or_default();
-    let earlier: Vec<Entry> = {
-        let mut history = state.context.lock().await;
-        if history.model != model {
-            history.clear();
-            history.model = model.clone();
-        }
-        history.entries.iter().cloned().collect()
-    };
+    let earlier: Vec<Entry> = instance.context.lock().await.entries.iter().cloned().collect();
     // Leave out the oldest decision each time the request does not fit. The
     // history only loses them once a request succeeds, so a state too long to
     // fit even alone fails without wiping the kept decisions.
@@ -136,16 +128,14 @@ pub async fn infer(state: &AppState, payload: Value) -> Result<Value, String> {
         let carried = &earlier[skipped..];
         let mut request = payload.clone();
         request["state"] = with_history(&payload["state"], carried);
-        match state.infer_once(request, !carried.is_empty()).await {
+        match state.infer_once(instance, request, !carried.is_empty()).await {
             Ok(result) => {
-                let mut history = state.context.lock().await;
-                if history.model == model {
-                    history.last_flushed = match skipped.checked_sub(1).map(|last| earlier[last].seq) {
-                        Some(seq) => history.flush_through(seq),
-                        None => 0,
-                    };
-                    history.push(payload["state"].clone(), summarize(&result));
-                }
+                let mut history = instance.context.lock().await;
+                history.last_flushed = match skipped.checked_sub(1).map(|last| earlier[last].seq) {
+                    Some(seq) => history.flush_through(seq),
+                    None => 0,
+                };
+                history.push(payload["state"].clone(), summarize(&result));
                 return Ok(result);
             }
             Err(Failure::ContextFull(message)) if carried.is_empty() => return Err(message),
@@ -157,18 +147,34 @@ pub async fn infer(state: &AppState, payload: Value) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn set_keep_context(on: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crate::library::refresh(state.inner()).await;
     let mut settings = state.settings.lock().await.clone();
     settings.keep_context = on;
     crate::runtime::persist_settings(state.inner(), settings).await?;
     if !on {
-        state.context.lock().await.clear();
+        clear_all(state.inner()).await;
     }
     Ok(())
 }
 
+async fn clear_all(state: &AppState) {
+    let instances = state.instances.lock().await.clone();
+    for instance in instances {
+        instance.context.lock().await.clear();
+    }
+}
+
+/// Empties one loaded model's history, or every model's when `model` is None.
 #[tauri::command]
-pub async fn clear_context(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.context.lock().await.clear();
+pub async fn clear_context(model: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    match model {
+        Some(id) => {
+            if let Some(instance) = state.instance(&id).await {
+                instance.context.lock().await.clear();
+            }
+        }
+        None => clear_all(state.inner()).await,
+    }
     Ok(())
 }
 
@@ -242,26 +248,20 @@ mod tests {
             settings.runtime_port = 18438;
             settings.keep_context = true;
         }
-        crate::runtime::load_model(&state).await.unwrap();
-        for _ in 0..240 {
-            if *state.ready.lock().await || state.session.lock().await.is_none() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-        assert!(*state.ready.lock().await, "{:#?}", state.logs.lock().await);
+        let id = crate::runtime::load_model(&state).await.unwrap();
+        let model = crate::runtime::wait_until_ready(&state, &id, 120).await;
         let questions = json!({"route":{"type":"choice","instructions":"Which team should handle this?","criteria":{"billing":"Payments and refunds","technical":"Bugs and errors"}}});
         let mut results = Vec::new();
         let mut most_flushed = 0;
         for n in 0..12 {
             let state_text = format!("Ticket {n}: I was charged twice for my subscription this month and the duplicate payment put my account into overdraft. Please refund the second charge as soon as possible, it is urgent.");
-            results.push(state.infer(json!({"state": state_text, "questions": questions})).await);
-            most_flushed = most_flushed.max(state.context.lock().await.last_flushed);
+            results.push(state.infer_on(&model, json!({"state": state_text, "questions": questions})).await);
+            most_flushed = most_flushed.max(model.context.lock().await.last_flushed);
         }
-        let kept = state.context.lock().await.len();
+        let kept = model.context.lock().await.len();
         // A state too long to fit even alone fails and keeps the history intact.
-        let oversized = state.infer(json!({"state": "charged twice. ".repeat(400), "questions": questions})).await;
-        let kept_after_failure = state.context.lock().await.len();
+        let oversized = state.infer_on(&model, json!({"state": "charged twice. ".repeat(400), "questions": questions})).await;
+        let kept_after_failure = model.context.lock().await.len();
         let tokens: Vec<_> = results.iter().map(|r| r.as_ref().map(|v| v["usage"]["input_tokens"].clone()).unwrap_or_default()).collect();
         println!("kept {kept}, flushed up to {most_flushed}, input tokens {tokens:?}");
         state.shutdown().await;

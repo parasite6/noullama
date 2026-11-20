@@ -37,30 +37,61 @@ pub fn cached() -> Option<&'static Hardware> {
 /// projector or an MTP head; they sit in the same memory as the weights, so
 /// they count toward the estimate. Empty paths are skipped.
 pub fn fit(path: &str, extras: &[&str], context_size: u32, gpu_layers: i32) -> Option<Fit> {
+    fit_beside(path, extras, context_size, gpu_layers, &[])
+}
+
+fn file_bytes<S: AsRef<str>>(path: &str, extras: &[S]) -> Option<u64> {
     let file = std::fs::metadata(path).ok()?;
     if !file.is_file() || file.len() == 0 {
         return None;
     }
     let extras: u64 = extras
         .iter()
+        .map(AsRef::as_ref)
         .filter(|path| !path.is_empty())
         .filter_map(|path| std::fs::metadata(path).ok())
         .filter(std::fs::Metadata::is_file)
         .map(|file| file.len())
         .sum();
-    fit_model_bytes(file.len() + extras, context_size, gpu_layers, cached()?)
+    Some(file.len() + extras)
+}
+
+/// The memory a model is estimated to need once loaded.
+pub fn estimate_bytes<S: AsRef<str>>(path: &str, extras: &[S], context_size: u32) -> Option<u64> {
+    file_bytes(path, extras).map(|bytes| required_bytes(bytes, context_size))
+}
+
+fn required_bytes(model_bytes: u64, context_size: u32) -> u64 {
+    // Weight overhead plus a KV-cache allowance for the configured context.
+    model_bytes + (model_bytes as f64 * 0.12) as u64 + context_size as u64 * 24 * 1024
+}
+
+/// As `fit`, with the memory other loaded models are estimated to hold set
+/// aside: each `(bytes, on_gpu)` comes out of graphics or system memory.
+pub fn fit_beside(path: &str, extras: &[&str], context_size: u32, gpu_layers: i32, taken: &[(u64, bool)]) -> Option<Fit> {
+    let bytes = file_bytes(path, extras)?;
+    let mut hardware = cached()?.clone();
+    for (used, on_gpu) in taken {
+        match (on_gpu, hardware.vram_bytes.as_mut()) {
+            (true, Some(vram)) => *vram = vram.saturating_sub(*used).max(1),
+            _ => hardware.ram_bytes = hardware.ram_bytes.saturating_sub(*used).max(1),
+        }
+    }
+    fit_model_bytes(bytes, context_size, gpu_layers, &hardware)
 }
 
 #[derive(Serialize, Default, Debug, PartialEq)]
 pub struct MemoryUse {
-    /// Graphics memory held by the runtime process (NVIDIA only).
+    /// Graphics memory held by all the runtime processes (NVIDIA only).
     pub process_bytes: Option<u64>,
+    /// Graphics memory of each process asked about, in the same order.
+    pub processes: Vec<Option<u64>>,
     pub used_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
 }
 
 /// Live graphics memory, read on demand (it runs nvidia-smi, so never per snapshot).
-pub fn memory_use(pid: Option<u32>) -> MemoryUse {
+pub fn memory_use(pids: &[u32]) -> MemoryUse {
     if let Some(text) = command_output(
         "nvidia-smi",
         &[
@@ -68,7 +99,7 @@ pub fn memory_use(pid: Option<u32>) -> MemoryUse {
             "--format=csv,noheader,nounits",
         ],
     ) {
-        let apps = pid.and_then(|_| {
+        let apps = (!pids.is_empty()).then(|| {
             command_output(
                 "nvidia-smi",
                 &[
@@ -76,8 +107,8 @@ pub fn memory_use(pid: Option<u32>) -> MemoryUse {
                     "--format=csv,noheader,nounits",
                 ],
             )
-        });
-        return parse_nvidia_memory(&text, apps.as_deref(), pid);
+        }).flatten();
+        return parse_nvidia_memory(&text, apps.as_deref(), pids);
     }
     amd_memory()
 }
@@ -86,21 +117,28 @@ fn mib(text: &str) -> Option<u64> {
     text.trim().parse::<u64>().ok().map(|mib| mib * 1024 * 1024)
 }
 
-fn parse_nvidia_memory(gpus: &str, apps: Option<&str>, pid: Option<u32>) -> MemoryUse {
+fn parse_nvidia_memory(gpus: &str, apps: Option<&str>, pids: &[u32]) -> MemoryUse {
     let (used_bytes, total_bytes) = gpus
         .lines()
         .next()
         .and_then(|line| line.split_once(','))
         .map_or((None, None), |(used, total)| (mib(used), mib(total)));
-    let process_bytes = pid.zip(apps).and_then(|(pid, apps)| {
-        apps.lines()
-            .filter_map(|line| line.split_once(','))
-            .filter(|(id, _)| id.trim().parse::<u32>().ok() == Some(pid))
-            .filter_map(|(_, used)| mib(used))
-            .reduce(|a, b| a + b)
-    });
+    let processes: Vec<Option<u64>> = pids
+        .iter()
+        .map(|pid| {
+            apps.and_then(|apps| {
+                apps.lines()
+                    .filter_map(|line| line.split_once(','))
+                    .filter(|(id, _)| id.trim().parse::<u32>().ok() == Some(*pid))
+                    .filter_map(|(_, used)| mib(used))
+                    .reduce(|a, b| a + b)
+            })
+        })
+        .collect();
+    let process_bytes = processes.iter().flatten().copied().reduce(|a, b| a + b);
     MemoryUse {
         process_bytes,
+        processes,
         used_bytes,
         total_bytes,
     }
@@ -123,6 +161,7 @@ fn amd_memory() -> MemoryUse {
             if total > 0 {
                 return MemoryUse {
                     process_bytes: None,
+                    processes: Vec::new(),
                     used_bytes: Some(used),
                     total_bytes: Some(total),
                 };
@@ -146,9 +185,7 @@ pub fn fit_model_bytes(
     if model_bytes == 0 || hardware.ram_bytes == 0 {
         return None;
     }
-    // Weight overhead plus a KV-cache allowance for the configured context.
-    let required_bytes =
-        model_bytes + (model_bytes as f64 * 0.12) as u64 + context_size as u64 * 24 * 1024;
+    let required_bytes = required_bytes(model_bytes, context_size);
     let (level, label, detail) = evaluate(required_bytes, hardware, gpu_layers != 0);
     Some(Fit {
         level,
@@ -387,16 +424,17 @@ mod tests {
 
     #[test]
     fn nvidia_memory_reads_the_runtime_process_and_the_card() {
-        let usage = parse_nvidia_memory("3120, 8188\n", Some("911, 300\n4242, 2500\n"), Some(4242));
+        let usage = parse_nvidia_memory("3120, 8188\n", Some("911, 300\n4242, 2500\n77, 100\n"), &[4242, 77, 5]);
         assert_eq!(usage.used_bytes, Some(3120 * 1024 * 1024));
         assert_eq!(usage.total_bytes, Some(8188 * 1024 * 1024));
-        assert_eq!(usage.process_bytes, Some(2500 * 1024 * 1024));
+        assert_eq!(usage.process_bytes, Some(2600 * 1024 * 1024));
+        assert_eq!(usage.processes, [Some(2500 * 1024 * 1024), Some(100 * 1024 * 1024), None]);
         assert_eq!(
-            parse_nvidia_memory("3120, 8188", Some("911, 300"), Some(4242)).process_bytes,
+            parse_nvidia_memory("3120, 8188", Some("911, 300"), &[4242]).process_bytes,
             None
         );
         assert_eq!(
-            parse_nvidia_memory("garbage", None, None),
+            parse_nvidia_memory("garbage", None, &[]),
             MemoryUse::default()
         );
     }

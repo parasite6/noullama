@@ -37,7 +37,10 @@ In the app: **Hub** → download a GGUF (or **Models** → browse for a local fi
 | See why a load failed | Read the red panel under the model bar, or open **Runtime logs**. |
 | Use CPU inference | Set **GPU layers** to `0` in **Runtime**. |
 | Connect an application | Use `http://127.0.0.1:11435/v1`; native decisions are at `/systemone`. |
-| Call the model by another name | Add an alias under **Local API → Model names**. |
+| Run several models at once | Select another model and click **Load beside**; each loaded model has its own **Eject** under **Models → Loaded**. |
+| Route API requests to a model | Send its name from **Library** as `model`, or give it an alias there, under **Models** or under **Local API → Model routing**. |
+| Rename a model or edit models.yml | Open **Library**, or **Edit models.yml** to open the file in your default editor. |
+| Choose how model files are checked | **Settings → sha256 before loading**. |
 
 Question types:
 
@@ -97,8 +100,8 @@ Only copies installed from the `.deb` or `.rpm` package can update themselves. A
 
 1. Open **Hub**, search for a decision model or type a repository such as `LiquidAI/d1-2B-GGUF`, pick it, and download a GGUF. Already have a file? Open **Models** and browse for it instead.
 2. In **Runtime → llama.cpp**, choose an installed build, download one, or enter a custom `llama-server` path and click **Check** to list its devices. Under **Model**, set GPU layers (`0` for CPU inference) and, for image-capable models, turn on the multimodal projector.
-3. Click **Load model** in the model bar. The bar shows the loaded model and device and has controls to switch or unload it. If loading fails, a red panel under it gives the reason.
-4. In **Playground**, choose a preset under **Run settings**, edit the questions and state, and run a decision.
+3. Click **Load model** in the model bar. The bar shows the selected model's state and device, with **Eject** to unload it. Select another model and click **Load beside** to run it next to the first. If loading fails, a red panel names the model and gives the reason.
+4. In **Playground**, pick the loaded model under **Run settings → Model**, choose a preset, edit the questions and state, and run a decision.
 
 ## Runtime
 
@@ -161,6 +164,39 @@ The download panel shows one progress bar filled from both ends: network bytes r
 
 The **Models** list rescans the download directories every few seconds, so files added or removed outside the app show up without a refresh.
 
+### Library and models.yml
+
+`models.yml` in the app-data directory lists every model Noullama knows: one entry per GGUF file, holding the model's **name**, its **aliases**, its **path**, the Hugging Face **account** its avatar comes from (such as `LiquidAI`), and its **sha256**. Every model found on this machine or downloaded gets an entry automatically, named after its file; projector (`mmproj`) files and MTP heads do not get one.
+
+```yaml
+version: 1
+models:
+- name: d1-3B-Q8_0
+  aliases:
+  - triage
+  path: /home/u/models/LiquidAI--d1-3B-GGUF/d1-3B-Q8_0.gguf
+  account: LiquidAI
+  sha256: 3b5f…
+```
+
+- **Library** edits each entry with text fields, alias chips, a file browser and an account picker. **Add model** adds a file from anywhere on disk. Changes are kept as a draft until **Save models.yml**.
+- **Edit models.yml** opens the file in your default editor. Noullama rereads it whenever it changes: on every snapshot and API request, and before loading, ejecting, finishing a download, scanning for models and changing Keep context.
+- Renaming a model changes only its API name; the file stays where it is. Renaming or moving the *file* does not update models.yml: the entry is marked **File missing** until you fix its path or remove it.
+- Noullama backs up models.yml to `backups/models` before every change it makes (other than recording a sha256), and backs up the previous version when it notices an outside edit. The newest 20 copies are kept; **Backups** opens the folder.
+- A file with an error (bad YAML, a duplicate name, a relative path) is never overwritten. Noullama shows the error in **Library** and keeps using the last valid version until the file is fixed or saved from **Library**.
+- If models.yml changes on disk while you have unsaved edits in **Library**, saving is refused so you do not overwrite the newer file; discard and edit again.
+
+**Settings → sha256 before loading** chooses how the recorded sha256 is used:
+
+| Mode | What happens |
+|---|---|
+| **Hash once** (default) | Each file is hashed once in the background. Before a load, the sha256 is read again only if the file's size or modified time changed. A mismatch stops the load. |
+| **Every load** | The whole file is hashed before every load; slower for large models. |
+| **Warn only** | As **Hash once**, but a mismatch only adds a warning to the log. |
+| **Off** | No hashing; recorded values are kept but not checked. |
+
+After a mismatch, **Library** marks the entry **sha256 changed**; **Accept new sha256** records the new value if you replaced the file on purpose. The check catches a wrong, truncated or replaced file; it is not a security boundary. Computed hashes are cached in `sha256-cache.json` by size and modified time.
+
 ### Questions and presets
 
 Questions use the `choice`, `noul`, and `score` types. The JSON editors provide syntax highlighting and inline lint diagnostics. The state editor accepts text or JSON; switching modes converts the representation while preserving the content.
@@ -216,15 +252,23 @@ The managed llama-server uses port `11436`. Both bind to localhost; changing the
 
 Local SDK and curl clients use the gateway without an API key. The gateway accepts requests addressed to `127.0.0.1` or `localhost` on its active port and rejects foreign browser origins. The private llama-server uses a temporary key generated for each model load; connect integrations to the gateway rather than the private port.
 
-### Model names
+### Several models and routing
 
-The loaded model answers to `noullama`, to its file name without `.gguf` (for example `d1-3B-Q8_0`), and to any aliases added under **Local API → Model names**. Names are not case-sensitive. `/v1/models` lists every name while a model is loaded, and responses echo the name the request used. An unknown name returns 404 with the accepted names. Aliases use letters, digits and `. _ : / -`, up to 64 characters.
+Any number of models can be loaded at once, each in its own `llama-server` on its own private port: the first free port at or above **Private llama-server port**. **Models → Loaded** lists them with their device, context and an **Eject** button that unloads only that model. A file can be loaded once; **Reload model** in the model bar ejects it and loads it again with the current settings. Runtime settings can be changed and saved while models are loaded; they apply to the next load, and loaded models keep the settings they started with. The fit badge counts the memory the other loaded models are estimated to hold.
+
+Every local API request must name its model in the `model` field, exactly as written; names are case-sensitive:
+
+- A model's **name** in models.yml (by default its file name without `.gguf`, for example `d1-3B-Q8_0`). Rename it in **Library**.
+- Any of its **aliases**. Add them in **Library**, with the tag button on a row in **Models** or in the **Loaded** list, or under **Local API → Model routing**.
+- A loaded file with no models.yml entry answers to its file name without `.gguf`.
+
+A request with no `model` returns 400 listing the accepted names. An unknown name returns 404; if it differs from a known name only by case, the message suggests the right one. A name or alias whose model is not loaded, or is still loading, returns 503. Names and aliases are unique across models.yml, ignoring case, so a request reaches exactly one model; a name shared by two loaded files without entries returns 409. `/v1/models` lists every name that reaches a ready model, and responses echo the name the request used. Names and aliases use letters, digits and `. _ : / -`, up to 64 characters, with up to 16 aliases per model; no two may differ only by case. The Playground picks its model from **Run settings → Model** and needs no name.
 
 ### Keep context
 
-With **Keep context** on, each decision's state is sent with the earlier decisions before it: their states and short answers (`billing`, `yes (0.82)`, `0.73`). A text state gets a text block above it; a JSON state becomes `{"earlier_decisions": [...], "current_state": ...}`. The switch is shared by the Playground and the Local API page, and it applies to every local API request as well as the Playground.
+With **Keep context** on, each decision's state is sent with the earlier decisions before it: their states and short answers (`billing`, `yes (0.82)`, `0.73`). A text state gets a text block above it; a JSON state becomes `{"earlier_decisions": [...], "current_state": ...}`. The switch is shared by the Playground and the Local API page. Each loaded model keeps its own history, which the Playground and every local API request that reaches that model read and add to.
 
-When a request no longer fits the context window, the oldest decisions are flushed, one at a time, until it does. The panel shows how many decisions are kept and how many the last run flushed. Turning it off, **Clear**, unloading or reloading the model empties the history. At most 64 decisions are kept; images are not carried forward.
+When a request no longer fits the context window, the oldest decisions are flushed, one at a time, until it does. The panel shows how many decisions are kept and how many the last run flushed. Turning it off empties every history; **Clear** in the Playground empties the chosen model's, and in **Local API** every model's. Ejecting or reloading a model empties its own. At most 64 decisions are kept; images are not carried forward.
 
 ### Native System One request
 
@@ -232,6 +276,7 @@ When a request no longer fits the context window, the oldest decisions are flush
 curl http://127.0.0.1:11435/v1/systemone \
   -H 'Content-Type: application/json' \
   -d '{
+    "model": "d1-3B-Q8_0",
     "state": "I was charged twice. Please refund the duplicate payment.",
     "questions": {
       "team": {
@@ -260,7 +305,7 @@ request = {
     },
 }
 response = client.chat.completions.create(
-    model="noullama",
+    model="d1-3B-Q8_0",  # a loaded model's name or alias from Library, exact case
     messages=[{"role": "user", "content": json.dumps(request)}],
     stream=False,
 )
@@ -271,7 +316,7 @@ The adapter does not support chat history, tools, streaming, or arbitrary chat p
 
 ## Data and verification
 
-Settings, saved presets, and downloads use the platform app-data directory (`~/.local/share/dev.noullama.desktop` on a typical Linux desktop). Existing GGUFs are used in place.
+Settings, `models.yml` and its backups, saved presets, and downloads use the platform app-data directory (`~/.local/share/dev.noullama.desktop` on a typical Linux desktop). Existing GGUFs are used in place.
 
 ```sh
 npm run build
@@ -286,16 +331,16 @@ cargo test --manifest-path src-tauri/Cargo.toml \
   real_runtime_native_and_openai_requests -- --ignored --nocapture
 ```
 
-`real_runtime_flushes_oldest_decisions_at_the_context_limit` runs Keep context on the CPU at a 512-token context with the same variables.
+`real_runtime_flushes_oldest_decisions_at_the_context_limit` runs Keep context on the CPU at a 512-token context with the same variables. `real_runtime_two_models_route_by_alias_and_eject_one` also needs `NOULLAMA_TEST_MODEL_2`, a different GGUF (`NOULLAMA_TEST_GPU_LAYERS_2` sets its GPU layers): it loads both at once, routes a request to each by alias, ejects the first and checks the second still answers.
 
 ## Current limits
 
 Noullama is in early beta. Known limits:
 
-- One loaded model and one runtime installation at a time.
+- One runtime installation at a time. Each loaded model runs one request at a time.
 - No bundled runtime; use **Runtime → llama.cpp** to download one or point to your own `llama-server`.
 - Models without native decision support load only if they are Winnow GGUFs, and then without image input.
-- No automatic playground history. Only named custom presets are saved, and Keep context lasts until the model is unloaded.
+- No automatic playground history. Only named custom presets are saved, and Keep context lasts until its model is ejected.
 - Linux packages only (64-bit `.deb` and `.rpm`). There are no macOS or Windows builds yet.
 
 Found a bug or missing something? [Open an issue](https://github.com/parasite6/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/parasite6/noullama/issues/new?template=feature_request.md).

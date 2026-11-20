@@ -1,5 +1,6 @@
 mod api;
 mod context;
+mod library;
 mod desktop;
 mod files;
 mod decision;
@@ -70,6 +71,14 @@ fn main() {
             runtime::decide,
             runtime::model_memory,
             runtime::set_model_aliases,
+            runtime::unload_model,
+            library::save_library,
+            library::reload_library,
+            library::open_models_file,
+            library::open_backups_folder,
+            library::record_sha256,
+            library::set_sha256_check,
+            runtime::dismiss_load_error,
             context::set_keep_context,
             context::clear_context,
             hub::hf_session,

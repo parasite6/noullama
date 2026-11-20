@@ -37,17 +37,17 @@ test('persistent API banners can be dismissed and new errors are still shown', (
   assert.equal(visibleBanner(null, null, null, false, true), null);
 });
 
-test('selecting a new model never mislabels the running model', () => {
-  const status = modelStatus('/models/new.gguf', { path:'/models/old.gguf', device:'CUDA0' }, true, true);
-  assert.equal(status.loaded, '/models/old.gguf');
-  assert.equal(status.selected, '/models/new.gguf');
-  assert.equal(status.switching, true);
-  assert.equal(modelStatus('/models/new.gguf', null, false, false).label, 'Selected · not loaded');
-  const gone = modelStatus('/models/gone.gguf', null, false, false, true);
+test('the selected model reports only its own load state', () => {
+  // Another model loaded beside it does not make the selection look loaded.
+  assert.equal(modelStatus('/models/new.gguf', null).label, 'Selected · not loaded');
+  const loaded = modelStatus('/models/new.gguf', { path:'/models/new.gguf', device:'CUDA0', ready:true });
+  assert.equal(loaded.label, 'Loaded');
+  assert.equal(loaded.device, 'CUDA0');
+  const gone = modelStatus('/models/gone.gguf', null, true);
   assert.equal(gone.label, 'File not found');
   assert.equal(gone.missing, true);
-  assert.equal(modelStatus('', null, false, false, true).missing, false);
-  assert.equal(modelStatus('/models/new.gguf', { path:'/models/new.gguf', device:'CPU' }, true, false).label, 'Loading');
+  assert.equal(modelStatus('', null, true).missing, false);
+  assert.equal(modelStatus('/models/new.gguf', { path:'/models/new.gguf', device:'CPU', ready:false }).label, 'Loading');
 });
 
 test('every preset produces native decision questions', () => {

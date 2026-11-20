@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -33,9 +36,13 @@ pub struct Settings {
     pub hf_path: String,
     pub download_dir: String,
     pub library_path: String,
-    // Extra names the local API accepts for the loaded model, besides
-    // "noullama" and the model's file name. Changed only by set_model_aliases.
-    pub model_aliases: Vec<String>,
+    // Aliases saved by an earlier version, keyed by model path. They moved to
+    // models.yml (see library.rs) and are only read once to create it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_routes: BTreeMap<String, Vec<String>>,
+    // sha256 checks before a load: "off", "once", "every_load" or "warn".
+    // Changed only by set_sha256_check.
+    pub sha256_check: String,
     // Carry earlier decisions into each request's state (see context.rs).
     // Changed only by set_keep_context.
     pub keep_context: bool,
@@ -56,7 +63,8 @@ impl Default for Settings {
             hf_path: "hf".into(),
             download_dir: String::new(),
             library_path: String::new(),
-            model_aliases: Vec::new(),
+            model_routes: BTreeMap::new(),
+            sha256_check: "once".into(),
             keep_context: false,
         }
     }
@@ -67,23 +75,27 @@ pub struct AppState {
     pub app: Arc<crate::lifecycle::AppControl>,
     pub runtimes: Arc<crate::runtimes::RuntimeManager>,
     pub settings: Arc<Mutex<Settings>>,
-    pub child: Arc<Mutex<Option<Child>>>,
     pub lifecycle: Arc<Mutex<()>>,
-    pub session: Arc<Mutex<Option<Arc<RuntimeSession>>>>,
+    // Loaded models, oldest first. The Playground uses the first ready one
+    // until another is picked; API requests always name theirs.
+    pub instances: Arc<Mutex<Vec<Arc<Instance>>>>,
     pub startup_warning: Option<String>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
     pub token: Arc<Mutex<Option<String>>>,
     // Model downloads, oldest first; several can run at once, one per file.
     pub downloads: Arc<Mutex<Vec<DownloadState>>>,
-    pub ready: Arc<Mutex<bool>>,
     pub api_error: Arc<Mutex<Option<String>>>,
     pub api_notice: Arc<Mutex<Option<String>>>,
-    pub loaded_model: Arc<Mutex<Option<LoadedModel>>>,
-    // Why the last load failed or the runtime stopped on its own, shown in the UI.
-    pub load_error: Arc<Mutex<Option<String>>>,
+    // Why recent loads failed or models stopped on their own, newest last.
+    pub load_errors: Arc<Mutex<Vec<LoadError>>>,
     pub presets_lock: Arc<Mutex<()>>,
-    // Earlier decisions for Keep context, shared by the Playground and the API.
-    pub context: Arc<Mutex<crate::context::History>>,
+    // models.yml, and the sha256 work around it.
+    pub library: Arc<Mutex<crate::library::Library>>,
+    pub hashing: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    // Model paths whose file no longer matches its recorded sha256, with the new sum.
+    pub mismatches: Arc<Mutex<BTreeMap<String, String>>>,
+    pub hash_worker: Arc<AtomicBool>,
+    pub hash_cache_lock: Arc<Mutex<()>>,
     pub local_client: reqwest::Client,
     pub data_dir: PathBuf,
     pub api_port: u16,
@@ -163,6 +175,96 @@ pub struct LoadedModel {
     pub layout: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+pub struct LoadError {
+    pub path: String,
+    pub name: String,
+    pub message: String,
+}
+
+/// A model file's name without `.gguf`, which the local API also accepts.
+pub fn file_stem(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name.len().checked_sub(5) {
+        Some(end) if name[end..].eq_ignore_ascii_case(".gguf") => name[..end].to_owned(),
+        _ => name,
+    }
+}
+
+/// One loaded model: its own llama-server on its own private port.
+pub struct Instance {
+    pub id: String,
+    /// Unique among loaded models; prefixes this model's log lines.
+    pub label: String,
+    /// The settings it was loaded with. Later edits only apply to new loads.
+    pub settings: Settings,
+    session: Arc<RuntimeSession>,
+    child: Mutex<Option<Child>>,
+    ready: AtomicBool,
+    model: std::sync::Mutex<LoadedModel>,
+    /// Earlier decisions for Keep context, kept per model.
+    pub context: Mutex<crate::context::History>,
+}
+
+impl Instance {
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+    pub fn path(&self) -> &str {
+        &self.settings.model_path
+    }
+    pub fn stem(&self) -> String {
+        file_stem(&self.settings.model_path)
+    }
+    pub fn model(&self) -> LoadedModel {
+        self.model.lock().map(|m| m.clone()).unwrap_or_else(|e| e.into_inner().clone())
+    }
+    fn prefix(&self) -> String {
+        format!("[{}] ", self.label)
+    }
+    fn load_marker(&self) -> String {
+        format!("{}{LOAD_MARKER}", self.prefix())
+    }
+    /// Stops the runtime and forgets this model's kept context.
+    async fn stop(&self) {
+        self.session.cancel.notify_one();
+        self.ready.store(false, Ordering::SeqCst);
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        self.context.lock().await.clear();
+    }
+}
+
+/// Why a model name could not be routed to a loaded model.
+pub enum RouteError {
+    /// The request named no model.
+    Missing(String),
+    /// The named model is not loaded or still loading.
+    Unavailable(String),
+    Unknown(String),
+    /// A file name shared by more than one loaded model.
+    Ambiguous(String),
+}
+
+/// One name the local API knows, and where it goes.
+#[derive(Clone, Serialize)]
+pub struct Route {
+    pub name: String,
+    /// "name" (its name in models.yml) or "alias".
+    pub kind: &'static str,
+    pub path: String,
+    /// The loaded model it reaches, if any.
+    pub instance: Option<String>,
+    pub ready: bool,
+    /// Shared with another loaded model or shadowed by an alias, so unusable.
+    pub conflict: bool,
+}
+
 #[derive(Clone, Default, Serialize)]
 pub struct DownloadState {
     /// `repo/file`; one entry per file.
@@ -214,20 +316,21 @@ impl AppState {
             runtimes: Default::default(),
             api_port: settings.api_port,
             settings: Arc::new(Mutex::new(settings)),
-            child: Default::default(),
             lifecycle: Default::default(),
-            session: Default::default(),
+            instances: Default::default(),
             startup_warning,
             logs: Default::default(),
             token: Default::default(),
             downloads: Default::default(),
-            ready: Default::default(),
             api_error: Default::default(),
             api_notice: Default::default(),
-            load_error: Default::default(),
-            loaded_model: Default::default(),
+            load_errors: Default::default(),
             presets_lock: Default::default(),
-            context: Default::default(),
+            library: Default::default(),
+            hashing: Default::default(),
+            mismatches: Default::default(),
+            hash_worker: Default::default(),
+            hash_cache_lock: Default::default(),
             local_client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(120))
@@ -261,57 +364,144 @@ impl AppState {
         self.shutdown_locked().await;
     }
     async fn shutdown_locked(&self) {
-        if let Some(session) = self.session.lock().await.take() {
-            session.cancel.notify_one();
+        let all = std::mem::take(&mut *self.instances.lock().await);
+        for instance in all {
+            instance.stop().await;
         }
-        *self.ready.lock().await = false;
-        if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-        *self.loaded_model.lock().await = None;
-        // Unloading or reloading starts Keep context afresh.
-        self.context.lock().await.clear();
     }
-    /// Names the local API accepts for the loaded model: "noullama" first,
-    /// then the model's file name without its extension, then custom aliases.
-    /// Empty while no model is ready.
-    pub async fn model_names(&self) -> Vec<String> {
-        if !*self.ready.lock().await {
-            return Vec::new();
+    /// Removes one loaded model and stops its runtime. Hold the lifecycle lock.
+    async fn unload_locked(&self, id: &str) -> Option<Arc<Instance>> {
+        let removed = {
+            let mut list = self.instances.lock().await;
+            let index = list.iter().position(|i| i.id == id)?;
+            list.remove(index)
+        };
+        removed.stop().await;
+        Some(removed)
+    }
+    async fn record_load_error(&self, instance: &Instance, message: String) {
+        let mut errors = self.load_errors.lock().await;
+        errors.retain(|e| e.path != instance.path());
+        errors.push(LoadError { path: instance.path().to_owned(), name: instance.stem(), message });
+        let extra = errors.len().saturating_sub(8);
+        errors.drain(..extra);
+    }
+    pub async fn instance(&self, id: &str) -> Option<Arc<Instance>> {
+        self.instances.lock().await.iter().find(|i| i.id == id).cloned()
+    }
+    pub async fn any_ready(&self) -> bool {
+        self.instances.lock().await.iter().any(|i| i.is_ready())
+    }
+
+    /// A model's name and aliases from models.yml; a file with no entry
+    /// answers to its file name.
+    pub async fn api_names(&self, path: &str) -> (String, Vec<String>) {
+        match self.library.lock().await.entry(path) {
+            Some(entry) => (entry.name.clone(), entry.aliases.clone()),
+            None => (file_stem(path), Vec::new()),
         }
-        let file = self.loaded_model.lock().await.as_ref().map(|m| {
-            let name = Path::new(&m.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            name.strip_suffix(".gguf").map(str::to_owned).unwrap_or(name)
-        });
-        let aliases = self.settings.lock().await.model_aliases.clone();
-        let mut names = vec!["noullama".to_owned()];
-        for name in file.into_iter().chain(aliases) {
-            if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
-                names.push(name);
+    }
+
+    /// Every name the local API knows: each loaded model's name and aliases,
+    /// then those of models in models.yml that are not loaded.
+    pub async fn routes(&self) -> Vec<Route> {
+        crate::library::refresh(self).await;
+        let instances = self.instances.lock().await.clone();
+        let library = self.library.lock().await;
+        let names = |path: &str| match library.entry(path) {
+            Some(entry) => (entry.name.clone(), entry.aliases.clone()),
+            None => (file_stem(path), Vec::new()),
+        };
+        let mut routes = Vec::new();
+        let loaded: Vec<(String, Vec<String>)> = instances.iter().map(|i| names(i.path())).collect();
+        for (instance, (name, aliases)) in instances.iter().zip(&loaded) {
+            // Entries keep names unique; a file with no entry can still clash.
+            let shared = loaded.iter().filter(|(other, _)| other == name).count() > 1;
+            let shadowed = library.named(name).is_some_and(|entry| entry.path != instance.path());
+            routes.push(Route { name: name.clone(), kind: "name", path: instance.path().to_owned(), instance: Some(instance.id.clone()), ready: instance.is_ready(), conflict: shared || shadowed });
+            for alias in aliases {
+                routes.push(Route { name: alias.clone(), kind: "alias", path: instance.path().to_owned(), instance: Some(instance.id.clone()), ready: instance.is_ready(), conflict: false });
+            }
+        }
+        for entry in &library.entries {
+            if instances.iter().any(|i| i.path() == entry.path) {
+                continue;
+            }
+            routes.push(Route { name: entry.name.clone(), kind: "name", path: entry.path.clone(), instance: None, ready: false, conflict: false });
+            for alias in &entry.aliases {
+                routes.push(Route { name: alias.clone(), kind: "alias", path: entry.path.clone(), instance: None, ready: false, conflict: false });
+            }
+        }
+        routes
+    }
+    /// Names that reach a ready model right now, as `/v1/models` lists them.
+    pub async fn model_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for route in self.routes().await {
+            if route.ready && !route.conflict && !names.contains(&route.name) {
+                names.push(route.name);
             }
         }
         names
     }
-    /// Runs a decision, with earlier decisions added when Keep context is on.
-    pub async fn infer(&self, payload: Value) -> Result<Value, String> {
-        crate::context::infer(self, payload).await
+    /// The loaded model a request's `model` field names: its name or an alias
+    /// in models.yml (a loaded file with no entry answers to its file name).
+    /// Every request must name one, exactly as written.
+    pub async fn route(&self, requested: Option<&str>) -> Result<Arc<Instance>, RouteError> {
+        use RouteError::*;
+        let Some(name) = requested.filter(|n| !n.is_empty()) else {
+            let names = self.model_names().await;
+            return Err(Missing(if names.is_empty() {
+                "Set \"model\" to a loaded model's name or alias. No model is loaded yet; load one in noullama.".into()
+            } else {
+                format!("Set \"model\" to a loaded model's name or alias: {}.", names.join(", "))
+            }));
+        };
+        let routes = self.routes().await;
+        let instances = self.instances.lock().await.clone();
+        let matches: Vec<&Route> = routes.iter().filter(|r| r.name == name).collect();
+        let still_loading = |path: &str| Unavailable(format!("{} is still loading.", file_stem(path)));
+        match matches.as_slice() {
+            [] => {
+                let hint = routes
+                    .iter()
+                    .find(|r| r.name.eq_ignore_ascii_case(name))
+                    .map(|r| format!(" Names are case-sensitive; did you mean '{}'?", r.name))
+                    .unwrap_or_default();
+                let names = self.model_names().await;
+                Err(Unknown(if names.is_empty() {
+                    format!("Unknown model '{name}'.{hint} No model is ready; load one in noullama.")
+                } else {
+                    format!("Unknown model '{name}'.{hint} Loaded models answer to: {}.", names.join(", "))
+                }))
+            }
+            [one] => match one.instance.as_deref().and_then(|id| instances.iter().find(|i| i.id == id)) {
+                Some(instance) if instance.is_ready() => Ok(instance.clone()),
+                Some(instance) => Err(still_loading(instance.path())),
+                None => Err(Unavailable(format!("'{name}' is {}, which is not loaded. Load it in noullama.", file_stem(&one.path)))),
+            },
+            many => Err(Ambiguous(format!(
+                "'{name}' is the name of {} loaded models ({}). Give them different names in Library.",
+                many.len(),
+                many.iter().map(|r| r.path.as_str()).collect::<Vec<_>>().join(", ")
+            ))),
+        }
+    }
+    /// Runs a decision on one loaded model, with earlier decisions added when
+    /// Keep context is on.
+    pub async fn infer_on(&self, instance: &Arc<Instance>, payload: Value) -> Result<Value, String> {
+        crate::context::infer(self, instance, payload).await
     }
 
     /// One request to the runtime. `with_history` marks a state that carries
     /// earlier decisions, which must fit whole rather than be cut short.
-    pub async fn infer_once(&self, mut payload: Value, with_history: bool) -> Result<Value, crate::context::Failure> {
+    pub async fn infer_once(&self, instance: &Instance, mut payload: Value, with_history: bool) -> Result<Value, crate::context::Failure> {
         use crate::context::Failure::{ContextFull, Other};
         validate_request(&payload).map_err(Other)?;
-        if !*self.ready.lock().await {
-            return Err(Other("Load a decision model before running inference.".into()));
+        if !instance.is_ready() {
+            return Err(Other(format!("{} has stopped. Load it again.", instance.stem())));
         }
-        let session = self
-            .session
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| Other("The runtime has stopped.".into()))?;
+        let session = instance.session.clone();
         if let Some(readout) = session.readout.get() {
             if has_images(&payload) {
                 return Err(Other("Images are not supported for this model yet: it is read through Winnow's text prompt layout.".into()));
@@ -371,7 +561,7 @@ impl AppState {
             return Err(if value["error"]["type"] == "exceed_context_size_error" { ContextFull(message) } else { Other(message) });
         }
         if let Some(model) = value.get_mut("model") {
-            *model = json!("noullama");
+            *model = json!(instance.stem());
         }
         Ok(value)
     }
@@ -531,89 +721,98 @@ fn runtime_command(settings: &Settings) -> Command {
     command
 }
 
-fn runtime_settings_changed(a: &Settings, b: &Settings) -> bool {
-    a.runtime_path != b.runtime_path
-        || a.model_path != b.model_path
-        || a.mmproj_path != b.mmproj_path
-        || a.mtp != b.mtp
-        || a.mtp_path != b.mtp_path
-        || a.decision_mode != b.decision_mode
-        || a.context_size != b.context_size
-        || a.gpu_layers != b.gpu_layers
-        || a.runtime_port != b.runtime_port
-        || a.library_path != b.library_path
-}
-
 #[tauri::command]
 pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     state_snapshot(state.inner()).await
 }
 
 pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
-    let running = {
+    {
+        // The load task reports its own failures; this catches a runtime
+        // that stopped after it was ready.
         let _guard = state.lifecycle.lock().await;
-        let mut child = state.child.lock().await;
-        let running = if let Some(c) = child.as_mut() {
-            let status = c.try_wait().map_err(|e| e.to_string())?;
-            if let Some(status) = status {
-                // The load task reports its own failures; this catches a
-                // runtime that stopped after it was ready.
-                if *state.ready.lock().await {
+        let list = state.instances.lock().await.clone();
+        for instance in list {
+            let exited = match instance.child.lock().await.as_mut() {
+                Some(child) => child.try_wait().map_err(|e| e.to_string())?,
+                None => None,
+            };
+            if let (Some(status), true) = (exited, instance.is_ready()) {
+                let message = {
                     let logs = state.logs.lock().await;
-                    *state.load_error.lock().await = Some(with_runtime_detail(
-                        format!("The runtime stopped unexpectedly ({status})."),
-                        &logs,
-                    ));
-                }
-            }
-            status.is_none()
-        } else {
-            state.session.lock().await.is_some()
-        };
-        if !running {
-            *child = None;
-            *state.ready.lock().await = false;
-            *state.loaded_model.lock().await = None;
-            if let Some(session) = state.session.lock().await.take() {
-                session.cancel.notify_one();
+                    with_runtime_detail(format!("{} stopped unexpectedly ({status}).", instance.stem()), &logs, &instance.label)
+                };
+                state.record_load_error(&instance, message).await;
+                state.unload_locked(&instance.id).await;
             }
         }
-        running
-    };
+    }
     let settings = state.settings.lock().await.clone();
     let logs = state.logs.lock().await.clone();
     let downloads = state.downloads.lock().await.clone();
-    let context = {
-        let history = state.context.lock().await;
-        json!({"entries": history.len(), "last_flushed": history.last_flushed})
-    };
-    let loaded_model = state.loaded_model.lock().await.clone();
-    let ready = *state.ready.lock().await;
+    let instances = state.instances.lock().await.clone();
+    let routes = state.routes().await;
+    let library = crate::library::snapshot(state).await;
+    let mut loaded = Vec::new();
+    let mut taken = Vec::new();
+    for instance in &instances {
+        let model = instance.model();
+        let history = instance.context.lock().await;
+        let extras = instance_extras(&instance.settings);
+        let required = crate::hardware::estimate_bytes(instance.path(), &extras, instance.settings.context_size);
+        if instance.path() != settings.model_path {
+            if let Some(bytes) = required {
+                taken.push((bytes, instance.settings.gpu_layers != 0));
+            }
+        }
+        let (name, _) = state.api_names(instance.path()).await;
+        loaded.push(json!({
+            "id": instance.id, "name": name, "label": instance.label,
+            "path": model.path, "device": model.device, "runtime_path": model.runtime_path,
+            "projector": model.projector, "mmproj_path": instance.settings.mmproj_path,
+            "mtp": model.mtp, "mtp_path": instance.settings.mtp_path, "layout": model.layout,
+            "ready": instance.is_ready(), "context_size": instance.settings.context_size,
+            "gpu_layers": instance.settings.gpu_layers, "required_bytes": required,
+            "context": {"entries": history.len(), "last_flushed": history.last_flushed},
+            "settings": instance.settings,
+        }));
+    }
+    let default = instances.iter().find(|i| i.is_ready()).or(instances.first());
+    let running = !instances.is_empty();
+    let ready = instances.iter().any(|i| i.is_ready());
+    let loaded_model = default.map(|i| i.model());
     let api_error = state.api_error.lock().await.clone();
     let api_notice = state.api_notice.lock().await.clone();
-    let load_error = state.load_error.lock().await.clone();
+    let load_errors = state.load_errors.lock().await.clone();
     let runtime_download = state.runtimes.progress.lock().await.clone();
     // The probe runs in the background from startup; until it finishes the
     // snapshot reports no hardware rather than waiting on nvidia-smi.
     let hardware = crate::hardware::cached();
-    let fit_path = loaded_model
-        .as_ref()
-        .map(|model| model.path.clone())
-        .unwrap_or_else(|| settings.model_path.clone());
-    let mtp_head = if settings.mtp { settings.mtp_path.as_str() } else { "" };
-    let fit = crate::hardware::fit(
-        &fit_path,
-        &[settings.mmproj_path.as_str(), mtp_head],
+    // The selected model's fit, beside the memory other loaded models hold.
+    let fit = crate::hardware::fit_beside(
+        &settings.model_path,
+        &instance_extras(&settings).iter().map(String::as_str).collect::<Vec<_>>(),
         settings.context_size,
         settings.gpu_layers,
+        &taken,
     );
     Ok(
         json!({"settings": settings, "running": running, "ready": ready,
-        "logs": logs, "downloads": downloads, "context": context, "loaded_model":loaded_model,
+        "instances": loaded, "default_model": default.map(|i| i.id.clone()), "routes": routes, "library": library,
+        "logs": logs, "downloads": downloads, "loaded_model": loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
-        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_error": load_error, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit,
+        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_errors": load_errors, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit,
         "model_missing": !settings.model_path.is_empty() && !Path::new(&settings.model_path).is_file()}),
     )
+}
+
+/// Files loaded beside the model (projector, MTP head), for memory estimates.
+fn instance_extras(settings: &Settings) -> Vec<String> {
+    let mut extras = vec![settings.mmproj_path.clone()];
+    if settings.mtp {
+        extras.push(settings.mtp_path.clone());
+    }
+    extras
 }
 
 #[tauri::command]
@@ -630,13 +829,14 @@ pub async fn save_settings(
 pub async fn save_from_editor(state: &AppState, mut settings: Settings) -> Result<(), String> {
     {
         let current = state.settings.lock().await;
-        settings.model_aliases = current.model_aliases.clone();
+        settings.model_routes = current.model_routes.clone();
         settings.keep_context = current.keep_context;
+        settings.sha256_check = current.sha256_check.clone();
     }
     persist_settings(state, settings).await
 }
 
-/// Trims, checks and de-duplicates model aliases for the local API.
+/// Trims, checks and de-duplicates one model's aliases for the local API.
 pub fn normalize_aliases(aliases: &[String]) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     for alias in aliases.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
@@ -647,35 +847,33 @@ pub fn normalize_aliases(aliases: &[String]) -> Result<Vec<String>, String> {
         {
             return Err(format!("Model name \"{alias}\" can use letters, digits and . _ : / - only, up to 64 characters."));
         }
-        if alias.eq_ignore_ascii_case("noullama") {
-            continue;
-        }
         if !names.iter().any(|n| n.eq_ignore_ascii_case(alias)) {
             names.push(alias.to_owned());
         }
     }
     if names.len() > 16 {
-        return Err("Use at most 16 model names.".into());
+        return Err("Use at most 16 aliases for one model.".into());
     }
     Ok(names)
 }
 
 #[tauri::command]
-pub async fn set_model_aliases(aliases: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    let aliases = normalize_aliases(&aliases)?;
-    let mut settings = state.settings.lock().await.clone();
-    settings.model_aliases = aliases.clone();
-    persist_settings(state.inner(), settings).await?;
-    Ok(aliases)
+pub async fn set_model_aliases(path: String, aliases: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    set_aliases(state.inner(), path, aliases).await
+}
+
+/// Sets the aliases of the model file at `path` in models.yml.
+pub async fn set_aliases(state: &AppState, path: String, aliases: Vec<String>) -> Result<Vec<String>, String> {
+    if path.trim().is_empty() {
+        return Err("Choose a model file first.".into());
+    }
+    crate::library::set_aliases(state, &path, aliases).await
 }
 
 pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<(), String> {
+    // Loaded models keep the settings they started with, so these can change
+    // at any time; they apply to the next load.
     let _guard = state.lifecycle.lock().await;
-    if state.session.lock().await.is_some()
-        && runtime_settings_changed(&*state.settings.lock().await, &settings)
-    {
-        return Err("Stop the runtime before changing its configuration.".into());
-    }
     if settings.api_port == 0
         || settings.runtime_port == 0
         || settings.api_port == settings.runtime_port
@@ -759,18 +957,20 @@ pub async fn probe_runtime(path: String, library_path: String) -> Result<String,
     ))
 }
 
+/// Loads the selected model beside any already loaded; returns its id.
 #[tauri::command]
-pub async fn start_runtime(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn start_runtime(state: tauri::State<'_, AppState>) -> Result<String, String> {
     load_model(state.inner()).await
 }
 
-pub async fn load_model(state: &AppState) -> Result<(), String> {
+pub async fn load_model(state: &AppState) -> Result<String, String> {
+    let selected = state.settings.lock().await.model_path.clone();
+    if Path::new(&selected).is_file() {
+        crate::library::ensure(state, &[selected]).await;
+    }
     let _guard = state.lifecycle.lock().await;
     if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("Noullama is shutting down.".into());
-    }
-    if state.session.lock().await.is_some() || state.child.lock().await.is_some() {
-        return Err("Runtime is already started. Stop it before loading another model.".into());
     }
     let settings = state.settings.lock().await.clone();
     if !Path::new(&settings.model_path).is_file()
@@ -799,16 +999,43 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
             return Err("This model has no built-in MTP layers. Choose an mtp- head file in Runtime, or turn MTP off.".into());
         }
     }
-    let session = RuntimeSession::new(&state.data_dir, settings.runtime_port)?;
-    *state.load_error.lock().await = None;
-    *state.session.lock().await = Some(session.clone());
-    *state.ready.lock().await = false;
-    state.log(LOAD_MARKER.into()).await;
+    let loaded = state.instances.lock().await.clone();
+    if loaded.iter().any(|i| i.path() == settings.model_path) {
+        return Err(format!("{} is already loaded. Eject it first to load it again with other settings.", file_stem(&settings.model_path)));
+    }
+    let port = free_runtime_port(state, &settings, &loaded)?;
+    let stem = file_stem(&settings.model_path);
+    let label = (1..)
+        .map(|n| if n == 1 { stem.clone() } else { format!("{stem}#{n}") })
+        .find(|label| !loaded.iter().any(|i| i.label == *label))
+        .unwrap_or(stem);
+    let session = RuntimeSession::new(&state.data_dir, port)?;
+    let instance = Arc::new(Instance {
+        id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
+        label,
+        model: std::sync::Mutex::new(LoadedModel {
+            path: settings.model_path.clone(),
+            device: String::new(),
+            runtime_path: settings.runtime_path.clone(),
+            projector: !settings.mmproj_path.is_empty(),
+            mtp: settings.mtp,
+            layout: None,
+        }),
+        settings,
+        session,
+        child: Default::default(),
+        ready: AtomicBool::new(false),
+        context: Default::default(),
+    });
+    state.load_errors.lock().await.retain(|e| e.path != instance.path());
+    state.instances.lock().await.push(instance.clone());
+    state.log(instance.load_marker()).await;
+    let id = instance.id.clone();
     let state = state.clone();
     tokio::spawn(async move {
         let result = tokio::select! {
-            result = tokio::time::timeout(LOAD_LIMIT, prepare_and_poll(&state, &settings, &session)) => result,
-            _ = session.cancel.notified() => return,
+            result = tokio::time::timeout(LOAD_LIMIT, prepare_and_poll(&state, &instance)) => result,
+            _ = instance.session.cancel.notified() => return,
         };
         let error = match result {
             Ok(Ok(())) => return,
@@ -816,18 +1043,30 @@ pub async fn load_model(state: &AppState) -> Result<(), String> {
             Err(_) => "Model loading did not finish within 15 minutes.".into(),
         };
         let _guard = state.lifecycle.lock().await;
-        if is_current_session(&state, &session).await {
-            let error = error.replace(&session.key, "[redacted]");
-            state.log(error.clone()).await;
+        if is_registered(&state, &instance).await {
+            let error = error.replace(&instance.session.key, "[redacted]");
+            state.log(format!("{}{error}", instance.prefix())).await;
             let detail = {
                 let logs = state.logs.lock().await;
-                with_runtime_detail(error, &logs)
+                with_runtime_detail(error, &logs, &instance.label)
             };
-            *state.load_error.lock().await = Some(detail);
-            state.shutdown_locked().await;
+            state.record_load_error(&instance, detail).await;
+            state.unload_locked(&instance.id).await;
         }
     });
-    Ok(())
+    Ok(id)
+}
+
+/// The first private port at or above the configured one that no loaded
+/// model or the local API holds and that is free right now. Call with the
+/// lifecycle lock held, so two loads cannot pick the same port.
+fn free_runtime_port(state: &AppState, settings: &Settings, loaded: &[Arc<Instance>]) -> Result<u16, String> {
+    let api = state.listening_port();
+    (0..64u16)
+        .filter_map(|offset| settings.runtime_port.checked_add(offset))
+        .filter(|port| *port != api && !loaded.iter().any(|i| i.session.port == *port))
+        .find(|port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port)).is_ok())
+        .ok_or_else(|| format!("No free private runtime port at or above {}. Choose another runtime port in Runtime.", settings.runtime_port))
 }
 
 const LOAD_MARKER: &str = "Loading model; checking the runtime and waiting for readiness…";
@@ -835,14 +1074,20 @@ const LOAD_MARKER: &str = "Loading model; checking the runtime and waiting for r
 // llama-server explains most failures (bad file, out of memory, unsupported
 // architecture) in its own output, so attach its last error lines from this
 // load to the summary instead of only pointing at the log.
-fn with_runtime_detail(summary: String, logs: &VecDeque<String>) -> String {
+//
+// Every model's lines carry its label, so a load running beside another only
+// picks up its own errors.
+fn with_runtime_detail(summary: String, logs: &VecDeque<String>, label: &str) -> String {
+    let prefix = format!("[{label}] ");
+    let marker = format!("{prefix}{LOAD_MARKER}");
     let start = logs
         .iter()
-        .rposition(|line| line == LOAD_MARKER)
+        .rposition(|line| *line == marker)
         .map_or(0, |i| i + 1);
     let mut lines: Vec<&str> = logs
         .iter()
         .skip(start)
+        .filter_map(|line| line.strip_prefix(&prefix))
         .map(|line| line.trim())
         .filter(|line| *line != summary.as_str())
         .filter(|line| {
@@ -876,13 +1121,9 @@ fn with_runtime_detail(summary: String, logs: &VecDeque<String>) -> String {
 const LOAD_LIMIT: Duration = Duration::from_secs(15 * 60);
 const LOAD_SILENCE: Duration = Duration::from_secs(5 * 60);
 
-async fn is_current_session(state: &AppState, session: &RuntimeSession) -> bool {
-    state
-        .session
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|current| current.alias == session.alias)
+/// Whether this load is still wanted: it has not been ejected or replaced.
+async fn is_registered(state: &AppState, instance: &Arc<Instance>) -> bool {
+    state.instances.lock().await.iter().any(|i| Arc::ptr_eq(i, instance))
 }
 
 fn runtime_args(settings: &Settings, session: &RuntimeSession) -> Vec<String> {
@@ -927,11 +1168,11 @@ fn runtime_args(settings: &Settings, session: &RuntimeSession) -> Vec<String> {
     args
 }
 
-async fn prepare_and_poll(
-    state: &AppState,
-    settings: &Settings,
-    session: &Arc<RuntimeSession>,
-) -> Result<(), String> {
+async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<(), String> {
+    let settings = &instance.settings;
+    let session = &instance.session;
+    let prefix = instance.prefix();
+    crate::library::verify(state, &settings.model_path, crate::library::Check::parse(&settings.sha256_check), &prefix).await?;
     // Keep the port reserved during preflight, then verify the launch's random
     // alias over an authenticated endpoint before ever accepting inference.
     let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))
@@ -981,7 +1222,7 @@ async fn prepare_and_poll(
     };
     {
         let _guard = state.lifecycle.lock().await;
-        if !is_current_session(state, session).await {
+        if !is_registered(state, instance).await {
             return Ok(());
         }
         drop(reservation);
@@ -1012,39 +1253,35 @@ async fn prepare_and_poll(
         {
             let state = state.clone();
             let session = session.clone();
+            let prefix = prefix.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(pipe).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Ok(mut last) = session.last_output.lock() {
                         *last = std::time::Instant::now();
                     }
-                    state.log(line.replace(&session.key, "[redacted]")).await;
+                    state.log(format!("{prefix}{}", line.replace(&session.key, "[redacted]"))).await;
                 }
             });
         }
-        *state.child.lock().await = Some(child);
+        *instance.child.lock().await = Some(child);
         if let Ok(mut last) = session.last_output.lock() {
             *last = std::time::Instant::now();
         }
-        *state.loaded_model.lock().await = Some(LoadedModel {
-            path: settings.model_path.clone(),
-            device: device.clone(),
-            runtime_path: settings.runtime_path.clone(),
-            projector: !settings.mmproj_path.is_empty(),
-            mtp: settings.mtp,
-            layout: None,
-        });
+        if let Ok(mut model) = instance.model.lock() {
+            model.device = device.clone();
+        }
         state
-            .log(format!("Loading {} on {device}", settings.model_path))
+            .log(format!("{prefix}Loading {} on {device} (private port {})", settings.model_path, session.port))
             .await;
     }
     loop {
         {
             let _guard = state.lifecycle.lock().await;
-            if !is_current_session(state, session).await {
+            if !is_registered(state, instance).await {
                 return Ok(());
             }
-            let mut child = state.child.lock().await;
+            let mut child = instance.child.lock().await;
             if !matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(None))) {
                 return Err(
                     "Runtime exited during startup. Check the log for model/runtime compatibility."
@@ -1107,7 +1344,7 @@ async fn prepare_and_poll(
                     let labels = server.labels().await?;
                     state
                         .log(format!(
-                            "Reading decisions through the {} layout ({}, temperature {}, {} labels).",
+                            "{prefix}Reading decisions through the {} layout ({}, temperature {}, {} labels).",
                             crate::decision::LAYOUT, profile.model, profile.temperature, labels.len()
                         ))
                         .await;
@@ -1119,19 +1356,19 @@ async fn prepare_and_poll(
                     });
                 }
                 let _guard = state.lifecycle.lock().await;
-                if !is_current_session(state, session).await {
+                if !is_registered(state, instance).await {
                     return Ok(());
                 }
-                let mut child = state.child.lock().await;
+                let mut child = instance.child.lock().await;
                 if !matches!(child.as_mut().map(|c| c.try_wait()), Some(Ok(None))) {
                     return Err("Runtime exited before becoming ready.".into());
                 }
-                *state.ready.lock().await = true;
-                if let Some(model) = state.loaded_model.lock().await.as_mut() {
+                if let Ok(mut model) = instance.model.lock() {
                     model.layout = Some(layout.name().into());
                 }
+                instance.ready.store(true, Ordering::SeqCst);
                 state
-                    .log("Decision model is ready. Local API is accepting requests.".into())
+                    .log(format!("{prefix}Decision model is ready. Local API is accepting requests."))
                     .await;
                 return Ok(());
             }
@@ -1150,25 +1387,112 @@ async fn prepare_and_poll(
     }
 }
 
+/// Unloads every model.
 #[tauri::command]
 pub async fn stop_runtime(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let any = !state.instances.lock().await.is_empty();
     state.shutdown().await;
-    state.log("Runtime stopped; model unloaded.".into()).await;
+    if any {
+        state.log("Runtime stopped; every model unloaded.".into()).await;
+    }
+    Ok(())
+}
+
+/// Ejects one loaded model; the others keep running.
+#[tauri::command]
+pub async fn unload_model(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    unload(state.inner(), &id).await
+}
+
+pub async fn unload(state: &AppState, id: &str) -> Result<(), String> {
+    crate::library::refresh(state).await;
+    let _guard = state.lifecycle.lock().await;
+    let instance = state.unload_locked(id).await.ok_or("That model is no longer loaded.")?;
+    state.log(format!("{}Unloaded.", instance.prefix())).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn model_memory(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    let pid = state.child.lock().await.as_ref().and_then(Child::id);
-    let usage = tokio::task::spawn_blocking(move || crate::hardware::memory_use(pid))
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(json!(usage))
+pub async fn dismiss_load_error(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.load_errors.lock().await.retain(|e| e.path != path);
+    Ok(())
 }
 
+/// Graphics memory in use, overall and per loaded model.
 #[tauri::command]
-pub async fn decide(payload: Value, state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    state.infer(payload).await
+pub async fn model_memory(state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let instances = state.instances.lock().await.clone();
+    let mut pids = Vec::new();
+    for instance in &instances {
+        if let Some(pid) = instance.child.lock().await.as_ref().and_then(Child::id) {
+            pids.push((instance.id.clone(), pid));
+        }
+    }
+    let ids: Vec<u32> = pids.iter().map(|(_, pid)| *pid).collect();
+    let usage = tokio::task::spawn_blocking(move || crate::hardware::memory_use(&ids))
+        .await
+        .map_err(|e| e.to_string())?;
+    let models: serde_json::Map<String, Value> = pids
+        .iter()
+        .zip(&usage.processes)
+        .map(|((id, _), bytes)| (id.clone(), json!(bytes)))
+        .collect();
+    let mut value = json!(usage);
+    value["models"] = Value::Object(models);
+    Ok(value)
+}
+
+/// Runs a Playground decision on the loaded model `model` (an id), or on the
+/// oldest ready model when none is given.
+#[tauri::command]
+pub async fn decide(payload: Value, model: Option<String>, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    let instance = match model {
+        Some(id) => state.instance(&id).await.ok_or("That model was ejected. Choose a loaded model.")?,
+        None => state
+            .instances
+            .lock()
+            .await
+            .iter()
+            .find(|i| i.is_ready())
+            .cloned()
+            .ok_or("Load a decision model before running inference.")?,
+    };
+    state.infer_on(&instance, payload).await
+}
+
+/// Registers a loaded model with no runtime behind it, for routing tests.
+#[cfg(test)]
+pub async fn insert_test_instance(state: &AppState, path: &str, ready: bool) -> Arc<Instance> {
+    let settings = Settings { model_path: path.into(), ..state.settings.lock().await.clone() };
+    let port = 1 + state.instances.lock().await.len() as u16;
+    let instance = Arc::new(Instance {
+        id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
+        label: file_stem(path),
+        model: std::sync::Mutex::new(LoadedModel { path: path.into(), device: "CPU".into(), runtime_path: String::new(), projector: false, mtp: false, layout: Some("native".into()) }),
+        session: RuntimeSession::new(&state.data_dir, port).unwrap(),
+        settings,
+        child: Default::default(),
+        ready: AtomicBool::new(ready),
+        context: Default::default(),
+    });
+    state.instances.lock().await.push(instance.clone());
+    instance
+}
+
+/// Waits for a load to finish; panics with the log if it fails.
+#[cfg(test)]
+pub async fn wait_until_ready(state: &AppState, id: &str, seconds: u64) -> Arc<Instance> {
+    for _ in 0..seconds * 10 {
+        match state.instance(id).await {
+            Some(instance) if instance.is_ready() => return instance,
+            Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            None => break,
+        }
+    }
+    let logs = state.logs.lock().await.clone();
+    let errors: Vec<String> = state.load_errors.lock().await.iter().map(|e| e.message.clone()).collect();
+    state.shutdown().await;
+    panic!("Model {id} did not become ready: {errors:#?}\n{logs:#?}");
 }
 
 #[cfg(test)]
@@ -1195,21 +1519,24 @@ mod tests {
 
     #[test]
     fn load_errors_carry_the_runtime_explanation_from_this_load() {
+        let marker = format!("[foo] {LOAD_MARKER}");
         let logs: VecDeque<String> = [
-            "error: stale failure from an earlier load",
-            LOAD_MARKER,
-            "llama_model_load: loading model",
-            "llama_model_load: error loading model: unknown model architecture: 'foo'",
-            "main: exiting due to model loading error",
+            "[foo] error: stale failure from an earlier load",
+            &marker,
+            "[foo] llama_model_load: loading model",
+            "[other] error: a failure from the model loading beside it",
+            "[foo] llama_model_load: error loading model: unknown model architecture: 'foo'",
+            "[foo] main: exiting due to model loading error",
         ]
         .map(String::from)
         .into();
-        let message = with_runtime_detail("Runtime exited during startup.".into(), &logs);
+        let message = with_runtime_detail("Runtime exited during startup.".into(), &logs, "foo");
         assert!(message.starts_with("Runtime exited during startup.\n"));
         assert!(message.contains("unknown model architecture"));
         assert!(!message.contains("stale failure"));
+        assert!(!message.contains("beside it"));
         assert_eq!(
-            with_runtime_detail("Plain.".into(), &VecDeque::new()),
+            with_runtime_detail("Plain.".into(), &VecDeque::new(), "foo"),
             "Plain."
         );
     }
@@ -1229,14 +1556,30 @@ mod tests {
             std::fs::read_to_string(&key_path).unwrap().trim(),
             session.key
         );
-        *state.session.lock().await = Some(session.clone());
-        let snapshot = state_snapshot(&state).await.unwrap().to_string();
+        let instance = insert_test_instance(&state, "/m/a.gguf", true).await;
+        let value = state_snapshot(&state).await.unwrap();
+        // Every field the frontend's Instance and Route types read.
+        for key in ["id", "name", "label", "path", "device", "runtime_path", "projector", "mmproj_path", "mtp", "mtp_path", "layout", "ready", "context_size", "gpu_layers", "required_bytes", "context", "settings"] {
+            assert!(value["instances"][0].get(key).is_some(), "instances[0] lacks {key}");
+        }
+        assert!(value["instances"][0]["settings"]["gpu_layers"].is_number());
+        for key in ["name", "kind", "path", "instance", "ready", "conflict"] {
+            assert!(value["routes"][0].get(key).is_some(), "routes[0] lacks {key}");
+        }
+        for key in ["instances", "default_model", "routes", "load_errors"] {
+            assert!(value.get(key).is_some(), "snapshot lacks {key}");
+        }
+        let snapshot = value.to_string();
         assert!(!snapshot.contains(&session.key));
+        assert!(!snapshot.contains(&instance.session.key));
         let args = runtime_args(&Settings::default(), &session);
         assert!(!args.iter().any(|arg| arg.contains(&session.key)));
+        let instance_key = instance.session.key_path.clone();
         state.shutdown().await;
         drop(session);
+        drop(instance);
         assert!(!key_path.exists());
+        assert!(!instance_key.exists());
         std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
@@ -1260,7 +1603,6 @@ mod tests {
         assert_eq!(flag(&args, "--spec-type").as_deref(), Some("draft-mtp"));
         assert_eq!(flag(&args, "--spec-draft-model").as_deref(), Some("/m/mtp-head.gguf"));
         assert_eq!(flag(&args, "--spec-draft-ngl").as_deref(), Some("0"));
-        assert!(runtime_settings_changed(&Settings::default(), &Settings { mtp: true, ..Settings::default() }));
         drop(session);
         std::fs::remove_dir_all(base).ok();
     }
@@ -1295,14 +1637,14 @@ mod tests {
             settings.runtime_port = port;
             settings.gpu_layers = 0;
         }
-        load_model(&state).await.unwrap();
+        let old = load_model(&state).await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         let snapshot = tokio::time::timeout(Duration::from_millis(500), state_snapshot(&state))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(snapshot["running"], true);
-        let old = state.session.lock().await.clone().unwrap();
+        let old = state.instance(&old).await.unwrap();
         let mut settings = state.settings.lock().await.clone();
         settings.download_dir = base.join("downloads").to_string_lossy().into_owned();
         tokio::time::timeout(
@@ -1315,13 +1657,13 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(500), state.shutdown())
             .await
             .unwrap();
-        assert!(!is_current_session(&state, &old).await);
+        assert!(!is_registered(&state, &old).await);
         drop(old);
-        load_model(&state).await.unwrap();
-        let replacement = state.session.lock().await.clone().unwrap();
+        let replacement = load_model(&state).await.unwrap();
+        let replacement = state.instance(&replacement).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(is_current_session(&state, &replacement).await);
-        assert!(state.child.lock().await.is_none());
+        assert!(is_registered(&state, &replacement).await);
+        assert!(replacement.child.lock().await.is_none());
         state.shutdown().await;
         drop(replacement);
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -1357,9 +1699,10 @@ mod tests {
             settings.runtime_port = port;
             settings.gpu_layers = 0;
         }
-        load_model(&state).await.unwrap();
+        let id = load_model(&state).await.unwrap();
+        let instance = state.instance(&id).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while state.child.lock().await.is_none() {
+            while instance.child.lock().await.is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1373,14 +1716,15 @@ mod tests {
         }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         tokio::time::timeout(Duration::from_secs(3), async {
-            while state.session.lock().await.is_some() {
+            while !state.instances.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        assert!(!*state.ready.lock().await);
-        assert!(state.child.lock().await.is_none());
+        assert!(!instance.is_ready());
+        assert!(instance.child.lock().await.is_none());
+        assert!(state.load_errors.lock().await[0].message.contains("identity did not match"));
         assert!(state
             .logs
             .lock()
@@ -1412,32 +1756,23 @@ mod tests {
             settings.mtp = std::env::var("NOULLAMA_MTP_HEAD").is_ok();
             settings.mtp_path = std::env::var("NOULLAMA_MTP_HEAD").unwrap_or_default();
         }
-        load_model(&state).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(300), async {
-            while !*state.ready.lock().await {
-                if let Some(error) = state.load_error.lock().await.clone() {
-                    panic!("load failed: {error}");
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(state.loaded_model.lock().await.as_ref().unwrap().layout.as_deref(), Some("winnow-v1"));
+        let id = load_model(&state).await.unwrap();
+        let instance = wait_until_ready(&state, &id, 300).await;
+        assert_eq!(instance.model().layout.as_deref(), Some("winnow-v1"));
         let request = json!({"state": {"ticket": "My card was charged twice for order #4411 and I need the duplicate refunded today."},
             "questions": {
                 "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
                 "topic": {"type": "choice", "instructions": "What is the ticket about?", "criteria": {"billing": "Charges, refunds, invoices", "shipping": null, "login": null}},
                 "urgency": {"type": "score", "instructions": "How urgent is it?", "criteria": ["Can wait", "Today", "Immediately"]}}});
         let started = std::time::Instant::now();
-        let result = state.infer(request.clone()).await.unwrap();
+        let result = state.infer_on(&instance, request.clone()).await.unwrap();
         println!("Winnow readout ({:?}): {result}", started.elapsed());
         assert!(result["answers"]["refund"]["noul"].as_f64().unwrap() > 0.9);
         assert_eq!(result["answers"]["topic"]["choice"], "billing");
         let score = result["answers"]["urgency"]["score"].as_f64().unwrap();
         assert!((1.0..2.0).contains(&score), "{score}");
         // The same request gives the same numbers.
-        assert_eq!(state.infer(request).await.unwrap()["answers"], result["answers"]);
+        assert_eq!(state.infer_on(&instance, request).await.unwrap()["answers"], result["answers"]);
         state.shutdown().await;
         std::fs::remove_dir_all(base).ok();
     }

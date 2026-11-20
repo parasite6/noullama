@@ -158,19 +158,8 @@ mod tests {
         }
         drop(runtime_reservation);
         crate::api::start_with_listener(state.clone(), api_reservation).await;
-        crate::runtime::load_model(&state).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(90), async {
-            while !*state.ready.lock().await {
-                assert!(
-                    state.session.lock().await.is_some(),
-                    "Startup failed: {:?}",
-                    state.logs.lock().await
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap();
+        let id = crate::runtime::load_model(&state).await.unwrap();
+        crate::runtime::wait_until_ready(&state, &id, 90).await;
         for port in [state.api_port, runtime_port] {
             assert!(
                 tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
@@ -187,8 +176,7 @@ mod tests {
                 "Port {port} remained open"
             );
         }
-        assert!(state.child.lock().await.is_none());
-        assert!(state.session.lock().await.is_none());
+        assert!(state.instances.lock().await.is_empty());
         println!(
             "Full exit released gateway {} and runtime {runtime_port}",
             state.api_port
