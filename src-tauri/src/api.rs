@@ -156,39 +156,49 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     )
 }
 async fn models(State(state): State<AppState>) -> Json<Value> {
-    let data = if *state.ready.lock().await {
-        vec![
-            json!({"id":"noullama", "object":"model", "created":0, "owned_by":"local", "architecture":{"output_modalities":["decisions"]}}),
-        ]
-    } else {
-        vec![]
-    };
+    // Every name refers to the one loaded model.
+    let data: Vec<Value> = state
+        .model_names()
+        .await
+        .into_iter()
+        .map(|id| json!({"id":id, "object":"model", "created":0, "owned_by":"local", "architecture":{"output_modalities":["decisions"]}}))
+        .collect();
     Json(json!({"object":"list", "data":data}))
 }
-async fn infer(state: &AppState, payload: Value) -> ApiResult {
+/// Runs a decision and returns the result with the model name the caller used.
+async fn infer(state: &AppState, payload: Value) -> Result<(Value, String), ApiError> {
     validate_request(&payload).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    if let Some(model) = payload.get("model") {
-        if model != "noullama" {
-            return Err(ApiError(
-                StatusCode::NOT_FOUND,
-                "Use model 'noullama'; only the loaded model is available.".into(),
-            ));
-        }
-    }
     if !*state.ready.lock().await {
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "No decision model is ready. Load one in noullama.".into(),
         ));
     }
-    state
+    let names = state.model_names().await;
+    let requested = match payload.get("model") {
+        None | Some(Value::Null) => "noullama".to_owned(),
+        Some(Value::String(model)) => match names.iter().find(|n| n.eq_ignore_ascii_case(model)) {
+            Some(_) => model.clone(),
+            None => {
+                return Err(ApiError(
+                    StatusCode::NOT_FOUND,
+                    format!("Unknown model '{model}'. The loaded model answers to: {}.", names.join(", ")),
+                ))
+            }
+        },
+        Some(_) => return Err(ApiError(StatusCode::BAD_REQUEST, "model must be a string.".into())),
+    };
+    let mut result = state
         .infer(payload)
         .await
-        .map(Json)
-        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e))
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e))?;
+    if let Some(model) = result.get_mut("model") {
+        *model = json!(requested);
+    }
+    Ok((result, requested))
 }
 async fn systemone(State(state): State<AppState>, Json(payload): Json<Value>) -> ApiResult {
-    infer(&state, payload).await
+    infer(&state, payload).await.map(|(result, _)| Json(result))
 }
 
 pub fn chat_payload(body: &Value) -> Result<Value, String> {
@@ -228,14 +238,14 @@ pub fn chat_payload(body: &Value) -> Result<Value, String> {
 
 async fn chat(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult {
     let payload = chat_payload(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    let Json(result) = infer(&state, payload).await?;
+    let (result, model) = infer(&state, payload).await?;
     let input = result["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     Ok(Json(json!({
-        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()), "object":"chat.completion", "created":created, "model":"noullama",
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()), "object":"chat.completion", "created":created, "model":model,
         "choices":[{"index":0,"message":{"role":"assistant","content":serde_json::to_string(&result).unwrap_or_default()},"finish_reason":"stop"}],
         "usage":{"prompt_tokens":input,"completion_tokens":0,"total_tokens":input}
     })))
@@ -462,6 +472,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn loaded_model_answers_to_its_file_name_and_aliases() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        *state.ready.lock().await = true;
+        *state.loaded_model.lock().await = Some(crate::runtime::LoadedModel {
+            path: "/models/acme/d1-3B-Q8_0.gguf".into(),
+            device: String::new(),
+            runtime_path: String::new(),
+            projector: false,
+            mtp: false,
+            layout: None,
+        });
+        state.settings.lock().await.model_aliases = vec!["triage".into(), "D1-3B-Q8_0".into()];
+        let app = router(state);
+        let get = |uri: &'static str| Request::builder().uri(uri).header("host", "127.0.0.1:11435").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(get("/v1/models")).await.unwrap();
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let ids: Vec<&str> = body["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["noullama", "d1-3B-Q8_0", "triage"]);
+        let post = |model: &str| {
+            let mut body = request();
+            body["model"] = json!(model);
+            Request::builder().method("POST").uri("/v1/systemone").header("host", "127.0.0.1:11435").header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()
+        };
+        let unknown = app.clone().oneshot(post("other")).await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let message: Value = serde_json::from_slice(&to_bytes(unknown.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(message["error"]["message"].as_str().unwrap().contains("noullama, d1-3B-Q8_0, triage"));
+        // A known name gets past the name check; with no runtime it then fails upstream.
+        for name in ["triage", "D1-3b-q8_0", "noullama"] {
+            assert_eq!(app.clone().oneshot(post(name)).await.unwrap().status(), StatusCode::BAD_GATEWAY);
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn aliases_are_trimmed_checked_and_deduplicated() {
+        let names = crate::runtime::normalize_aliases(&[" triage ".into(), "Triage".into(), "".into(), "noullama".into(), "acme/d1:q8".into()]).unwrap();
+        assert_eq!(names, ["triage", "acme/d1:q8"]);
+        assert!(crate::runtime::normalize_aliases(&["has space".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn settings_form_cannot_overwrite_aliases_or_keep_context() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let stale = state.settings.lock().await.clone();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.model_aliases = vec!["triage".into()];
+            settings.keep_context = true;
+        }
+        let mut edited = stale;
+        edited.context_size = 4096;
+        crate::runtime::save_from_editor(&state, edited).await.unwrap();
+        let settings = state.settings.lock().await.clone();
+        assert_eq!(settings.context_size, 4096);
+        assert_eq!(settings.model_aliases, ["triage"]);
+        assert!(settings.keep_context);
         std::fs::remove_dir_all(path).unwrap();
     }
 

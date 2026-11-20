@@ -33,9 +33,11 @@ In the app: **Hub** → download a GGUF (or **Models** → browse for a local fi
 | Ask about images | Turn on **Vision** in the model bar, load the model, then add images in the **State** box. |
 | Speed up generation with MTP | Turn on **MTP** in the model bar for a model with MTP layers or a matching MTP head in its folder, then load it. |
 | Save a preset | Enter a name under the questions editor and click **Save preset**. |
+| Let decisions build on earlier ones | Turn on **Keep context** under **Run settings** or in **Local API**. |
 | See why a load failed | Read the red panel under the model bar, or open **Runtime logs**. |
 | Use CPU inference | Set **GPU layers** to `0` in **Runtime**. |
 | Connect an application | Use `http://127.0.0.1:11435/v1`; native decisions are at `/systemone`. |
+| Call the model by another name | Add an alias under **Local API → Model names**. |
 
 Question types:
 
@@ -155,7 +157,7 @@ Hub search results show a local memory-fit estimate when a repository lists GGUF
 
 **Models** lists the GGUF models on this machine; **Hub** is where you find and download more. Multimodal projector (`mmproj`) files are not listed as models: a model with a projector in its folder is marked **Vision available**. Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory.
 
-The download panel shows one progress bar filled from both ends: network bytes received fill from the left and file reconstruction fills from the right, meeting in the middle when the file is done. Xet compression and deduplication can make the two values differ. Use **Cancel download** to stop; partial files are kept so an immediate retry resumes, and are deleted when you quit Noullama. While you are elsewhere in the app, a **Downloads** card in the bottom-right corner shows progress and can cancel the download or open its repository.
+The download panel shows one progress bar filled from both ends: network bytes received fill from the left and file reconstruction fills from the right, meeting in the middle when the file is done. Xet compression and deduplication can make the two values differ. Several files can download at once, such as a model and its projector; each file has its own panel and its own **Cancel download**. Partial files are kept so an immediate retry resumes, and are deleted when you quit Noullama. While you are elsewhere in the app, a **Downloads** card in the bottom-right corner lists every download with its progress; it can cancel one, dismiss a finished one, or open its repository.
 
 The **Models** list rescans the download directories every few seconds, so files added or removed outside the app show up without a refresh.
 
@@ -213,6 +215,16 @@ While the app is open, the gateway prefers `http://127.0.0.1:11435` by default. 
 The managed llama-server uses port `11436`. Both bind to localhost; changing the preferred gateway port takes effect after restarting the app.
 
 Local SDK and curl clients use the gateway without an API key. The gateway accepts requests addressed to `127.0.0.1` or `localhost` on its active port and rejects foreign browser origins. The private llama-server uses a temporary key generated for each model load; connect integrations to the gateway rather than the private port.
+
+### Model names
+
+The loaded model answers to `noullama`, to its file name without `.gguf` (for example `d1-3B-Q8_0`), and to any aliases added under **Local API → Model names**. Names are not case-sensitive. `/v1/models` lists every name while a model is loaded, and responses echo the name the request used. An unknown name returns 404 with the accepted names. Aliases use letters, digits and `. _ : / -`, up to 64 characters.
+
+### Keep context
+
+With **Keep context** on, each decision's state is sent with the earlier decisions before it: their states and short answers (`billing`, `yes (0.82)`, `0.73`). A text state gets a text block above it; a JSON state becomes `{"earlier_decisions": [...], "current_state": ...}`. The switch is shared by the Playground and the Local API page, and it applies to every local API request as well as the Playground.
+
+When a request no longer fits the context window, the oldest decisions are flushed, one at a time, until it does. The panel shows how many decisions are kept and how many the last run flushed. Turning it off, **Clear**, unloading or reloading the model empties the history. At most 64 decisions are kept; images are not carried forward.
 
 ### Native System One request
 
@@ -274,14 +286,16 @@ cargo test --manifest-path src-tauri/Cargo.toml \
   real_runtime_native_and_openai_requests -- --ignored --nocapture
 ```
 
+`real_runtime_flushes_oldest_decisions_at_the_context_limit` runs Keep context on the CPU at a 512-token context with the same variables.
+
 ## Current limits
 
 Noullama is in early beta. Known limits:
 
-- One loaded model, one model download, and one runtime installation at a time.
+- One loaded model and one runtime installation at a time.
 - No bundled runtime; use **Runtime → llama.cpp** to download one or point to your own `llama-server`.
 - Models without native decision support load only if they are Winnow GGUFs, and then without image input.
-- No automatic playground history. Only named custom presets are saved.
+- No automatic playground history. Only named custom presets are saved, and Keep context lasts until the model is unloaded.
 - Linux packages only (64-bit `.deb` and `.rpm`). There are no macOS or Windows builds yet.
 
 Found a bug or missing something? [Open an issue](https://github.com/parasite6/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/parasite6/noullama/issues/new?template=feature_request.md).

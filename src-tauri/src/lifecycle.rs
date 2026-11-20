@@ -1,5 +1,6 @@
 use std::{
-    sync::atomic::{AtomicBool, AtomicU16, Ordering},
+    collections::HashMap,
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     time::Duration,
 };
 use tokio::{
@@ -17,9 +18,11 @@ pub struct AppControl {
     pub active_api_port: AtomicU16,
     pub api_stop: watch::Sender<bool>,
     pub api_task: Mutex<Option<JoinHandle<()>>>,
-    pub download_task: Mutex<Option<JoinHandle<()>>>,
-    /// Set to cancel the active model download; reset when a download begins.
-    pub download_cancel: watch::Sender<bool>,
+    pub download_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// One cancel switch per running download, keyed by `repo/file`, with the
+    /// attempt it belongs to.
+    pub download_cancels: Mutex<HashMap<String, (u64, watch::Sender<bool>)>>,
+    pub download_attempts: AtomicU64,
     /// Partial files of cancelled downloads, keyed by the file they belong to and
     /// deleted on full exit.
     pub cancelled_partials: Mutex<Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)>>,
@@ -36,8 +39,9 @@ impl Default for AppControl {
             active_api_port: AtomicU16::new(0),
             api_stop: watch::channel(false).0,
             api_task: Mutex::new(None),
-            download_task: Mutex::new(None),
-            download_cancel: watch::channel(false).0,
+            download_tasks: Mutex::new(Vec::new()),
+            download_cancels: Mutex::new(HashMap::new()),
+            download_attempts: AtomicU64::new(0),
             cancelled_partials: Mutex::new(Vec::new()),
             exit_lock: Mutex::new(()),
         }
@@ -63,11 +67,14 @@ pub async fn shutdown_app(state: &AppState) {
             let _ = task.await;
         }
     }
-    if let Some(mut task) = state.app.download_task.lock().await.take() {
-        if tokio::time::timeout(Duration::from_secs(2), &mut task)
-            .await
-            .is_err()
-        {
+    // Downloads also stop on api_stop; give them one shared deadline to finish.
+    for (_, cancel) in state.app.download_cancels.lock().await.values() {
+        cancel.send_replace(true);
+    }
+    let tasks = std::mem::take(&mut *state.app.download_tasks.lock().await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    for mut task in tasks {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
             task.abort();
             let _ = task.await;
         }

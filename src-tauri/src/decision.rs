@@ -255,6 +255,11 @@ pub fn compile(body: &Value, labels: &[String], thought: bool) -> Result<Vec<Que
 }
 
 /// The request's `winnow.temperature`, or the model's.
+/// Whether `decide` failed because a prompt did not fit the context.
+pub fn is_context_overflow(error: &str) -> bool {
+    error.contains("-token context.")
+}
+
 pub fn temperature(body: &Value, default: f64) -> Result<f64, String> {
     let Some(t) = body.get("winnow").and_then(|w| w.get("temperature")) else {
         return Ok(default);

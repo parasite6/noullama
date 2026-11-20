@@ -1,7 +1,7 @@
 import { Download, FolderOpen, ArrowRight, X } from 'lucide-react';
 import { CopyButton } from './CopyButton';
 
-export type DownloadState = { active: boolean; cancelled: boolean; repo: string; file: string; message: string; path: string | null; error: string | null; progress: number | null; downloaded_bytes: number; transferred_bytes: number; total_bytes: number | null };
+export type DownloadState = { id: string; active: boolean; cancelled: boolean; repo: string; file: string; message: string; path: string | null; error: string | null; progress: number | null; downloaded_bytes: number; transferred_bytes: number; total_bytes: number | null };
 const bytes = (value: number) => value >= 1e9 ? `${(value / 1e9).toFixed(2)} GB` : `${(value / 1e6).toFixed(1)} MB`;
 
 export function DownloadPanel({ download, onSelect, onReveal, onCancel, busy }: { download: DownloadState; onSelect: () => void; onCancel: () => void; onReveal: () => void; busy: boolean }) {

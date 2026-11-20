@@ -33,6 +33,12 @@ pub struct Settings {
     pub hf_path: String,
     pub download_dir: String,
     pub library_path: String,
+    // Extra names the local API accepts for the loaded model, besides
+    // "noullama" and the model's file name. Changed only by set_model_aliases.
+    pub model_aliases: Vec<String>,
+    // Carry earlier decisions into each request's state (see context.rs).
+    // Changed only by set_keep_context.
+    pub keep_context: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -50,6 +56,8 @@ impl Default for Settings {
             hf_path: "hf".into(),
             download_dir: String::new(),
             library_path: String::new(),
+            model_aliases: Vec::new(),
+            keep_context: false,
         }
     }
 }
@@ -65,7 +73,8 @@ pub struct AppState {
     pub startup_warning: Option<String>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
     pub token: Arc<Mutex<Option<String>>>,
-    pub download: Arc<Mutex<DownloadState>>,
+    // Model downloads, oldest first; several can run at once, one per file.
+    pub downloads: Arc<Mutex<Vec<DownloadState>>>,
     pub ready: Arc<Mutex<bool>>,
     pub api_error: Arc<Mutex<Option<String>>>,
     pub api_notice: Arc<Mutex<Option<String>>>,
@@ -73,6 +82,8 @@ pub struct AppState {
     // Why the last load failed or the runtime stopped on its own, shown in the UI.
     pub load_error: Arc<Mutex<Option<String>>>,
     pub presets_lock: Arc<Mutex<()>>,
+    // Earlier decisions for Keep context, shared by the Playground and the API.
+    pub context: Arc<Mutex<crate::context::History>>,
     pub local_client: reqwest::Client,
     pub data_dir: PathBuf,
     pub api_port: u16,
@@ -154,6 +165,11 @@ pub struct LoadedModel {
 
 #[derive(Clone, Default, Serialize)]
 pub struct DownloadState {
+    /// `repo/file`; one entry per file.
+    pub id: String,
+    /// Which attempt owns this entry, so a slow old task cannot overwrite a retry.
+    #[serde(skip)]
+    pub attempt: u64,
     pub active: bool,
     pub cancelled: bool,
     pub repo: String,
@@ -204,13 +220,14 @@ impl AppState {
             startup_warning,
             logs: Default::default(),
             token: Default::default(),
-            download: Default::default(),
+            downloads: Default::default(),
             ready: Default::default(),
             api_error: Default::default(),
             api_notice: Default::default(),
             load_error: Default::default(),
             loaded_model: Default::default(),
             presets_lock: Default::default(),
+            context: Default::default(),
             local_client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(120))
@@ -253,25 +270,69 @@ impl AppState {
             let _ = child.wait().await;
         }
         *self.loaded_model.lock().await = None;
+        // Unloading or reloading starts Keep context afresh.
+        self.context.lock().await.clear();
     }
-    pub async fn infer(&self, mut payload: Value) -> Result<Value, String> {
-        validate_request(&payload)?;
+    /// Names the local API accepts for the loaded model: "noullama" first,
+    /// then the model's file name without its extension, then custom aliases.
+    /// Empty while no model is ready.
+    pub async fn model_names(&self) -> Vec<String> {
         if !*self.ready.lock().await {
-            return Err("Load a decision model before running inference.".into());
+            return Vec::new();
+        }
+        let file = self.loaded_model.lock().await.as_ref().map(|m| {
+            let name = Path::new(&m.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            name.strip_suffix(".gguf").map(str::to_owned).unwrap_or(name)
+        });
+        let aliases = self.settings.lock().await.model_aliases.clone();
+        let mut names = vec!["noullama".to_owned()];
+        for name in file.into_iter().chain(aliases) {
+            if !name.is_empty() && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
+        names
+    }
+    /// Runs a decision, with earlier decisions added when Keep context is on.
+    pub async fn infer(&self, payload: Value) -> Result<Value, String> {
+        crate::context::infer(self, payload).await
+    }
+
+    /// One request to the runtime. `with_history` marks a state that carries
+    /// earlier decisions, which must fit whole rather than be cut short.
+    pub async fn infer_once(&self, mut payload: Value, with_history: bool) -> Result<Value, crate::context::Failure> {
+        use crate::context::Failure::{ContextFull, Other};
+        validate_request(&payload).map_err(Other)?;
+        if !*self.ready.lock().await {
+            return Err(Other("Load a decision model before running inference.".into()));
         }
         let session = self
             .session
             .lock()
             .await
             .clone()
-            .ok_or("The runtime has stopped.")?;
+            .ok_or_else(|| Other("The runtime has stopped.".into()))?;
         if let Some(readout) = session.readout.get() {
             if has_images(&payload) {
-                return Err("Images are not supported for this model yet: it is read through Winnow's text prompt layout.".into());
+                return Err(Other("Images are not supported for this model yet: it is read through Winnow's text prompt layout.".into()));
             }
             let _one_at_a_time = session.readout_lock.lock().await;
             let server = crate::decision::Server { client: &self.local_client, port: session.port, key: &session.key };
-            return server.decide(readout, &payload).await.map_err(|e| e.replace(&session.key, "[redacted]"));
+            let redact = |e: String| e.replace(&session.key, "[redacted]");
+            // The Winnow layout cuts a long state short from the end, which
+            // would drop the current state behind the earlier decisions.
+            if with_history {
+                let text = crate::decision::safe(&payload["state"]);
+                if text.len() > crate::decision::STATE_TOKENS
+                    && server.tokenize(&text, false, false).await.map_err(|e| Other(redact(e)))?.len() > crate::decision::STATE_TOKENS
+                {
+                    return Err(ContextFull(format!("The state is longer than {} tokens.", crate::decision::STATE_TOKENS)));
+                }
+            }
+            return server.decide(readout, &payload).await.map_err(|e| {
+                let e = redact(e);
+                if crate::decision::is_context_overflow(&e) { ContextFull(e) } else { Other(e) }
+            });
         }
         payload["model"] = json!(session.alias);
         let response = self
@@ -281,31 +342,33 @@ impl AppState {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| format!("Runtime connection failed: {e}"))?;
+            .map_err(|e| Other(format!("Runtime connection failed: {e}")))?;
         let status = response.status();
         let body = response
             .text()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| Other(e.to_string()))?
             .replace(&session.key, "[redacted]");
         let mut value: Value = serde_json::from_str(&body).map_err(|_| {
-            format!(
+            Other(format!(
                 "Runtime returned non-JSON ({status}): {}",
                 body.chars().take(500).collect::<String>()
-            )
+            ))
         })?;
         if !status.is_success() {
             if status == reqwest::StatusCode::NOT_IMPLEMENTED && has_images(&payload) {
-                return Err("This model cannot read images as loaded. Turn on Vision for a model with a multimodal projector, then reload it.".into());
+                return Err(Other("This model cannot read images as loaded. Turn on Vision for a model with a multimodal projector, then reload it.".into()));
             }
             let detail = value["error"]["message"]
                 .as_str()
                 .map(str::to_owned)
                 .unwrap_or_else(|| value.to_string());
-            return Err(format!(
+            let message = format!(
                 "Runtime {status}: {}",
                 detail.chars().take(500).collect::<String>()
-            ));
+            );
+            // llama-server reports a prompt longer than the slot's context this way.
+            return Err(if value["error"]["type"] == "exceed_context_size_error" { ContextFull(message) } else { Other(message) });
         }
         if let Some(model) = value.get_mut("model") {
             *model = json!("noullama");
@@ -519,7 +582,11 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     };
     let settings = state.settings.lock().await.clone();
     let logs = state.logs.lock().await.clone();
-    let download = state.download.lock().await.clone();
+    let downloads = state.downloads.lock().await.clone();
+    let context = {
+        let history = state.context.lock().await;
+        json!({"entries": history.len(), "last_flushed": history.last_flushed})
+    };
     let loaded_model = state.loaded_model.lock().await.clone();
     let ready = *state.ready.lock().await;
     let api_error = state.api_error.lock().await.clone();
@@ -542,7 +609,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     );
     Ok(
         json!({"settings": settings, "running": running, "ready": ready,
-        "logs": logs, "download": download, "loaded_model":loaded_model,
+        "logs": logs, "downloads": downloads, "context": context, "loaded_model":loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
         "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_error": load_error, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit,
         "model_missing": !settings.model_path.is_empty() && !Path::new(&settings.model_path).is_file()}),
@@ -554,7 +621,52 @@ pub async fn save_settings(
     settings: Settings,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    persist_settings(state.inner(), settings).await
+    save_from_editor(state.inner(), settings).await
+}
+
+/// The settings form sends every field, but its copy of the alias list and the
+/// keep-context switch can be stale; those have their own commands, so keep
+/// the server's values here.
+pub async fn save_from_editor(state: &AppState, mut settings: Settings) -> Result<(), String> {
+    {
+        let current = state.settings.lock().await;
+        settings.model_aliases = current.model_aliases.clone();
+        settings.keep_context = current.keep_context;
+    }
+    persist_settings(state, settings).await
+}
+
+/// Trims, checks and de-duplicates model aliases for the local API.
+pub fn normalize_aliases(aliases: &[String]) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    for alias in aliases.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
+        if alias.len() > 64
+            || !alias
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
+        {
+            return Err(format!("Model name \"{alias}\" can use letters, digits and . _ : / - only, up to 64 characters."));
+        }
+        if alias.eq_ignore_ascii_case("noullama") {
+            continue;
+        }
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(alias)) {
+            names.push(alias.to_owned());
+        }
+    }
+    if names.len() > 16 {
+        return Err("Use at most 16 model names.".into());
+    }
+    Ok(names)
+}
+
+#[tauri::command]
+pub async fn set_model_aliases(aliases: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let aliases = normalize_aliases(&aliases)?;
+    let mut settings = state.settings.lock().await.clone();
+    settings.model_aliases = aliases.clone();
+    persist_settings(state.inner(), settings).await?;
+    Ok(aliases)
 }
 
 pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<(), String> {
@@ -587,11 +699,11 @@ pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<()
     {
         return Err("Choose an absolute path for the download directory.".into());
     }
-    if state.download.lock().await.active
+    if state.downloads.lock().await.iter().any(|d| d.active)
         && state.settings.lock().await.download_dir != settings.download_dir
     {
         return Err(
-            "Wait for the current download to finish before changing its directory.".into(),
+            "Wait for downloads to finish before changing their directory.".into(),
         );
     }
     if !settings.download_dir.trim().is_empty() {

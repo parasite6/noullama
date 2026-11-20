@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Toggle } from './Toggle';
@@ -9,6 +9,8 @@ import { buildRequest, convertState, presets } from './presets';
 import { QuitDialog } from './QuitDialog';
 import { DeletePresetDialog } from './DeletePresetDialog';
 import { CopyButton } from './CopyButton';
+import { KeepContext } from './KeepContext';
+import { ModelNames } from './ModelNames';
 import { UpdatesDialog, type UpdateView } from './UpdatesDialog';
 import { ContextMenu } from './ContextMenu';
 import { NumberField } from './NumberField';
@@ -27,9 +29,9 @@ import './styles.css';
 
 const logoUrl = new URL('../logo.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; model_aliases: string[]; keep_context: boolean };
 
-type Snapshot = { settings: Settings; running: boolean; ready: boolean; api_port: number; api_error: string | null; api_notice: string | null; load_error: string | null; runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; download: DownloadState; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; fit: Fit | null; model_missing: boolean };
+type Snapshot = { settings: Settings; running: boolean; ready: boolean; api_port: number; api_error: string | null; api_notice: string | null; load_error: string | null; runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; downloads: DownloadState[]; context: { entries: number; last_flushed: number }; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; fit: Fit | null; model_missing: boolean };
 type Hardware = { ram_bytes: number; vram_bytes: number | null; gpu: string | null; cpu_cores: number };
 type Fit = { level: number; label: string; detail: string; model_bytes: number; required_bytes: number };
 type SavedPreset = { id: string; name: string; questions: unknown; state: string; state_mode: 'text' | 'json' };
@@ -38,7 +40,7 @@ type ModelFile = { name: string; size?: number; projector: boolean; mtp_head: bo
 type Inspection = { repo: string; files: ModelFile[]; sha: string };
 type Session = { authenticated: boolean; account: string | null; cli_available: boolean; token_present: boolean };
 type Result = { answers?: Record<string, { type?: string; choice?: string; score?: number; noul?: number; confidence?: number; probabilities?: Record<string, number> }>; usage?: { input_tokens: number; output_tokens: number }; [key: string]: unknown };
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '' };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', model_aliases: [], keep_context: false };
 const icons = [Route, ShieldCheck, Shield, Mail, Network, Plus];
 const pages: Record<string, [string, string]> = {
   playground: ['Playground', 'Ask typed questions about a piece of content.'],
@@ -69,12 +71,15 @@ function App() {
   const [savedPresets, setSavedPresets] = useState<SavedPreset[]>([]);
   const [presetName, setPresetName] = useState('');
   const [presetToDelete, setPresetToDelete] = useState<SavedPreset | null>(null);
+  // Shown at once while set_keep_context saves; the snapshot is the truth after.
+  const [keepOverride, setKeepOverride] = useState<boolean | null>(null);
   const [dismissedApi, setDismissedApi] = useState<string | null>(null);
   const [dismissedApiNotice, setDismissedApiNotice] = useState(false);
   const [dismissedLoadError, setDismissedLoadError] = useState<string | null>(null);
   const [dismissedStartup, setDismissedStartup] = useState(false);
   const [previewDismissed, setPreviewDismissed] = useState(false);
-  const [downloadAnchor, setDownloadAnchor] = useState<{repo:string;file:string} | null>(null);
+  // Downloads whose request is still being checked, by repo/file id.
+  const [preparing, setPreparing] = useState<string[]>([]);
   const [questions, setQuestions] = useState(pretty(presets[0].questions));
   const [content, setContent] = useState(presets[0].state);
   const [stateMode, setStateMode] = useState<'text' | 'json'>('text');
@@ -92,8 +97,11 @@ function App() {
   const [showLogs, setShowLogs] = useState(false);
   const [query, setQuery] = useState('');
   const [searched, setSearched] = useState('');
-  const [toastDismissed, setToastDismissed] = useState('');
+  const [toastDismissed, setToastDismissed] = useState<string[]>([]);
   const [toastCollapsed, setToastCollapsed] = useState(false);
+  // The downloads card's height, so the page can keep its last controls clear of it.
+  const toastRef = useRef<HTMLElement>(null);
+  const [toastHeight, setToastHeight] = useState(0);
   const [models, setModels] = useState<Model[]>([]);
   const [inspection, setInspection] = useState<Inspection | null>(null);
   const [scanTick, setScanTick] = useState(0);
@@ -107,6 +115,8 @@ function App() {
   const [updates, setUpdates] = useState<UpdateView | null>(null);
   const [updatesOpen, setUpdatesOpen] = useState(false);
   const desktop = isTauri();
+  // Rescan local models when a download finishes.
+  const finishedDownloads = (snapshot?.downloads ?? []).map(d => d.path ?? '').filter(Boolean).join('\n');
 
   useEffect(() => { window.scrollTo({ top: 0, behavior: 'instant' }); }, [tab]);
   useEffect(containScrollChaining, []);
@@ -152,7 +162,7 @@ function App() {
     return () => { live = false; };
   }, [settings.model_path, scanTick]);
   useEffect(() => { if (desktop && tab === 'hub' && !session) invoke<Session>('hf_session').then(setSession).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab]);
-  useEffect(() => { if (desktop && tab !== 'hub' && tab !== 'api') invoke<{ models: typeof localModels; warnings: string[] }>('local_models').then(scan => { setLocalModels(scan.models); setScanWarnings(scan.warnings); }).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab, snapshot?.download.path, scanTick, snapshot?.download_dir, settings.model_path]);
+  useEffect(() => { if (desktop && tab !== 'hub' && tab !== 'api') invoke<{ models: typeof localModels; warnings: string[] }>('local_models').then(scan => { setLocalModels(scan.models); setScanWarnings(scan.warnings); }).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab, finishedDownloads, scanTick, snapshot?.download_dir, settings.model_path]);
   async function action(name: string, task: () => Promise<void>) {
     if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
     setBusy(name); setNotice(null);
@@ -217,6 +227,18 @@ function App() {
     setPresetToDelete(null);
   }
   const copyError = (text: string) => setNotice({ text, error: true });
+  async function toggleKeepContext(on: boolean) {
+    if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
+    setKeepOverride(on);
+    try { await invoke('set_keep_context', { on }); await refresh(); }
+    catch (e) { setNotice({ text: errorText(e), error: true }); }
+    finally { setKeepOverride(null); }
+  }
+  async function clearContext() { await action('clear-context', async () => { await invoke('clear_context'); }); }
+  async function saveAliases(aliases: string[]) {
+    if (!desktop) throw new Error('Launch the desktop app with npm run desktop to use the local backend.');
+    await invoke('set_model_aliases', { aliases }); await refresh();
+  }
   async function browseFile(field: 'model_path' | 'mmproj_path' | 'mtp_path') {
     await action('browse', async () => {
       const path = await invoke<string | null>('pick_model_file');
@@ -238,13 +260,20 @@ function App() {
   async function openRepo(id: string) {
     await action('inspect', async () => { setInspection(await invoke('inspect_model', { contextSize: settings.context_size, gpuLayers: settings.gpu_layers, repo: id })); });
   }
-  async function cancelDownload() { await action('cancel', async () => { await invoke('cancel_download'); }); }
+  async function cancelDownload(id: string) { await action('cancel', async () => { await invoke('cancel_download', { id }); }); }
+  async function dismissDownload(id: string) {
+    setToastDismissed(current => [...current, id]);
+    if (desktop) await invoke('dismiss_download', { id }).catch(() => {});
+  }
+  // Not run through action(): that would hold the global busy flag, and every
+  // other Download button, until this file's repository check finishes.
   async function startDownload(repo: string, file: string) {
-    setDownloadAnchor({ repo, file }); setToastDismissed(''); setToastCollapsed(false);
-    await action('download', async () => {
-      try { await invoke('download_model', { repo, filename: file }); }
-      catch (error) { setDownloadAnchor(null); throw error; }
-    });
+    const id = `${repo}/${file}`;
+    if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
+    setPreparing(current => [...current, id]); setToastDismissed(current => current.filter(other => other !== id)); setToastCollapsed(false); setNotice(null);
+    try { await invoke('download_model', { repo, filename: file }); await refresh(); }
+    catch (e) { setNotice({ text: errorText(e), error: true }); }
+    finally { setPreparing(current => current.filter(other => other !== id)); }
   }
   function switchStateMode(next: 'text' | 'json') {
     try {
@@ -290,6 +319,10 @@ function App() {
   const loadError = !running && snapshot?.load_error && snapshot.load_error !== dismissedLoadError ? snapshot.load_error : null;
   const hardware = snapshot?.hardware ?? null;
   const chosenRuntime = runtimeStatus(settings.runtime_path, running ? snapshot?.loaded_model?.runtime_path ?? snapshot?.settings.runtime_path ?? null : null, running, snapshot?.data_dir ?? '');
+  const keepContext = keepOverride ?? snapshot?.settings.keep_context ?? false;
+  const contextInfo = snapshot?.context ?? { entries: 0, last_flushed: 0 };
+  const keepContextControl = <KeepContext on={keepContext} entries={contextInfo.entries} lastFlushed={contextInfo.last_flushed} disabled={!desktop} onToggle={on => void toggleKeepContext(on)} onClear={() => void clearContext()}/>;
+  const loadedFileName = snapshot?.loaded_model ? basename(snapshot.loaded_model.path).replace(/\.gguf$/i, '') : null;
   const apiOrigin = `http://127.0.0.1:${snapshot?.api_port ?? 11435}`;
   const apiBase = `${apiOrigin}/v1`;
   const pythonExample = `import json\nfrom openai import OpenAI\n\nclient = OpenAI(base_url="${apiBase}", api_key="local")\n\nrequest = {\n    "state": "I was charged twice. Please refund the duplicate.",\n    "questions": {\n        "refund": {\n            "type": "noul",\n            "instructions": "Is the customer requesting a refund?"\n        }\n    }\n}\n\nresponse = client.chat.completions.create(\n    model="noullama",\n    messages=[{"role": "user", "content": json.dumps(request)}],\n    stream=False,\n)\ndecision = json.loads(response.choices[0].message.content)\nprint(decision["answers"])`;
@@ -301,11 +334,24 @@ function App() {
 
   const [pageTitle, pageSubtitle] = pages[tab];
   const repoLike = /^[\w.-]+\/[\w.-]+$/.test(query.trim()) && !models.some(m => m.id === query.trim());
-  const download = snapshot?.download;
-  const showDownloadToast = !!download && (download.active || (!!download.path && !download.error && !download.cancelled)) && download.file !== '' && !(tab === 'hub' && inspection?.repo === download.repo) && toastDismissed !== `${download.repo}/${download.file}` && !showLogs;
+  const downloads = snapshot?.downloads ?? [];
+  const downloadFor = (repo: string, file: string) => downloads.find(d => d.id === `${repo}/${file}`);
+  const anyDownloadActive = downloads.some(d => d.active);
+  // Downloads shown in the floating list: running or finished, not dismissed,
+  // and not already on screen in the repository being viewed.
+  const toastDownloads = downloads.filter(d => (d.active || (!!d.path && !d.error && !d.cancelled)) && !toastDismissed.includes(d.id) && !(tab === 'hub' && inspection?.repo === d.repo));
+  const showDownloadToast = toastDownloads.length > 0 && !showLogs;
   const hubRow = (group: string, id: string, meta: React.ReactNode, fitInfo: Fit | null, fitTitle?: string) => <button key={`${group}:${id}`} className={`hub-row ${inspection?.repo === id ? 'selected' : ''}`} onClick={() => openRepo(id)}><AuthorLogo author={id.split('/')[0]} size={34}/><span className="hub-row-name"><strong>{id.split('/').slice(1).join('/') || id}</strong><small>{id.split('/')[0]}</small></span><span className="hub-row-meta">{meta}</span>{fitInfo && <span className={`fit-dot fit-level-${fitInfo.level}`} title={fitTitle ?? fitInfo.detail}><span className="fit-bars" aria-hidden="true">{[1, 2, 3, 4].map(n => <i key={n} className={n <= fitInfo.level ? 'on' : ''}/>)}</span><span className="sr-only">{fitInfo.label}</span></span>}</button>;
 
-  return <div className={`app-shell ${showDownloadToast ? toastCollapsed ? 'has-toast collapsed-toast' : 'has-toast' : ''}`}>
+  useEffect(() => {
+    const card = toastRef.current;
+    if (!showDownloadToast || !card) { setToastHeight(0); return; }
+    const observer = new ResizeObserver(() => setToastHeight(card.offsetHeight));
+    observer.observe(card);
+    return () => observer.disconnect();
+  }, [showDownloadToast]);
+
+  return <div className={`app-shell ${showDownloadToast ? 'has-toast' : ''}`} style={{ '--toast-h': `${toastHeight}px` } as React.CSSProperties}>
     <aside className="sidebar">
       <div className="brand"><img className="brand-logo" src={logoUrl} width={28} height={28} alt=""/><span>noullama</span><span className="brand-tag">Beta</span></div>
       <nav>{[
@@ -363,6 +409,7 @@ function App() {
           <aside className="run-settings" aria-label="Run settings">
             <h2>Run settings</h2>
             <div className="rail-section"><div className="rail-label">Preset</div><div className="preset-chips">{presets.map((p, i) => { const Icon = icons[i]; return <button key={p.id} className={`preset-chip ${p.id === preset ? 'selected' : ''}`} aria-pressed={p.id === preset} title={p.subtitle} onClick={() => selectPreset(p.id)}><Icon size={14}/>{p.title}</button>; })}{savedPresets.map(p => <span className={`preset-chip saved ${p.id === preset ? 'selected' : ''}`} key={p.id}><button aria-pressed={p.id === preset} onClick={() => selectPreset(p.id)}><FileJson size={14}/>{p.name}</button><button className="chip-remove" aria-label={`Delete preset ${p.name}`} title={`Delete ${p.name}`} disabled={!!busy} onClick={() => setPresetToDelete(p)}><X size={13}/></button></span>)}</div><p className="rail-note">{presets.find(p => p.id === preset)?.subtitle ?? (preset.startsWith('saved-') ? 'Custom preset' : 'Custom questions')}</p></div>
+            <div className="rail-section">{keepContextControl}</div>
             <section className="question-panel"><div className="rail-heading"><span className="rail-label">Questions <span className="code-badge">JSON</span></span><div className="heading-actions"><button className="text-button" onClick={() => { try { setQuestions(pretty(JSON.parse(questions))); } catch (e) { setNotice({ text: errorText(e), error: true }); } }}>Format</button><button className="icon-button" aria-label="Copy questions" onClick={() => copy(questions, 'questions')}>{copied === 'questions' ? <Check size={14}/> : <Copy size={14}/>}</button></div></div><JsonEditor label="Questions JSON" value={questions} onChange={value => { setQuestions(value); setResult(null); }}/><div className="editor-footer"><span className={questionError ? 'invalid' : 'valid'}><span className={`status-dot ${questionError ? 'red' : 'green'}`}/>{questionError ? 'Check JSON' : `${Object.keys(JSON.parse(questions)).length} questions`}</span><span>choice, noul or score</span></div></section>
             <form className="preset-save" onSubmit={e => { e.preventDefault(); saveCustom(); }}><input aria-label="Custom preset name" placeholder="Preset name" maxLength={80} value={presetName} onChange={e => setPresetName(e.target.value)}/><button className="secondary compact" disabled={!!busy || !!jsonError || !presetName.trim()}><Save size={13}/>{preset.startsWith('saved-') ? 'Save changes' : 'Save preset'}</button></form>
           </aside>
@@ -372,7 +419,7 @@ function App() {
           {modelFiles.length === 0 && <div className="local-empty"><FolderOpen size={18}/><p>No models on this machine yet. Download one from the <button className="text-button" onClick={() => setTab('hub')}>Hub</button> or point Noullama at a GGUF file.</p></div>}
           {scanWarnings.length > 0 && <div className="hint" role="status">{scanWarnings.map(warning => <p key={warning}>{warning}</p>)}</div>}
           <div className="import-note"><FolderOpen size={18}/><div><strong>Local GGUF</strong><p>Already have a GGUF file? Pick it here instead of downloading.</p></div><button className="text-button" onClick={() => browseFile('model_path')}>Browse local model<ArrowRight size={14}/></button></div>
-          <section className="panel directory-panel"><label>Model download directory<div className="file-input-row"><input aria-label="Model download directory" value={downloadDir} placeholder={snapshot ? `${snapshot.data_dir}/models` : 'Default app model directory'} onChange={e => setDownloadDir(e.target.value)}/><button className="secondary" type="button" disabled={!!busy || !!snapshot?.download.active || downloadDir === snapshot?.settings.download_dir} onClick={saveDownloadDirectory}>Save directory</button></div><small>New downloads use this directory. Existing files stay in place.</small></label></section>
+          <section className="panel directory-panel"><label>Model download directory<div className="file-input-row"><input aria-label="Model download directory" value={downloadDir} placeholder={snapshot ? `${snapshot.data_dir}/models` : 'Default app model directory'} onChange={e => setDownloadDir(e.target.value)}/><button className="secondary" type="button" disabled={!!busy || anyDownloadActive || downloadDir === snapshot?.settings.download_dir} onClick={saveDownloadDirectory}>Save directory</button></div><small>New downloads use this directory. Existing files stay in place.</small></label></section>
         </>}
         {tab === 'hub' && <>
           <form className="hub-search" onSubmit={e => { e.preventDefault(); const q = query.trim(); action('search', async () => { setModels(await invoke('search_models', { query: q, contextSize: settings.context_size, gpuLayers: settings.gpu_layers })); setSearched(q); }); }}><div className="search-input"><Search size={17}/><input aria-label="Search decision models" value={query} onChange={e => setQuery(e.target.value)} placeholder="Search decision models, or enter organization/repository"/>{query && <button type="button" className="icon-button" aria-label="Clear search" onClick={() => { setQuery(''); setModels([]); setSearched(''); }}><X size={15}/></button>}</div><button className="secondary" disabled={!!busy}>{busy === 'search' ? 'Searching…' : 'Search'}</button></form>
@@ -394,7 +441,7 @@ function App() {
               {!inspection ? <div className="hub-empty">{busy === 'inspect' ? <><RefreshCw className="spin" size={20}/><p>Reading repository…</p></> : <><Network size={22}/><p>Pick a repository to see its GGUF files.</p></>}</div> : <>
                 <div className="detail-head"><AuthorLogo author={inspection.repo.split('/')[0]} size={56}/><div><h2>{inspection.repo.split('/').slice(1).join('/')}</h2><p>{inspection.repo.split('/')[0]}</p></div><CopyButton className="detail-copy" value={inspection.repo} label="Copy repository id" size={15} onError={copyError}/></div>
                 <div className="detail-chips"><span className="chip">GGUF</span><span className="chip">{inspection.files.length} {inspection.files.length === 1 ? 'file' : 'files'}</span>{inspection.sha && <span className="chip chip-copy" title={inspection.sha}>Revision <code>{inspection.sha.slice(0, 10)}</code><CopyButton value={inspection.sha} label="Copy full revision" size={12} onError={copyError}/></span>}</div>
-                <div className="files" id="hub-files">{inspection.files.length === 0 ? <p className="hint">No GGUF files in this repository. Open a GGUF conversion of this model.</p> : inspection.files.map(file => <div className="file-entry" key={file.name}><div className="file-row"><FileJson size={17}/><div><span className="identity-line"><strong>{file.name}</strong><CopyButton value={file.name} label={`Copy file name ${file.name}`} size={12} onError={copyError}/></span><small>{file.projector ? 'Multimodal projector' : file.mtp_head ? 'MTP head' : 'Model weights'}{file.size ? ` / ${(file.size / 1e9).toFixed(2)} GB` : ''}</small></div>{!file.projector && !file.mtp_head && <FileFit fit={file.fit}/>}<button className="secondary compact" disabled={snapshot?.download.active || !!busy} onClick={() => startDownload(inspection.repo, file.name)}><ArrowDownToLine size={14}/>Download</button></div>{snapshot?.download.repo === inspection.repo && snapshot.download.file === file.name ? <DownloadPanel download={snapshot.download} busy={!!busy} onCancel={cancelDownload} onReveal={() => revealFile(snapshot.download.path!)} onSelect={() => { if (file.projector) edit('mmproj_path', snapshot.download.path!); else if (file.mtp_head) { edit('mtp_path', snapshot.download.path!); edit('mtp', true); } else selectModel(snapshot.download.path!); setTab('runtime'); }}/> : downloadAnchor?.repo === inspection.repo && downloadAnchor.file === file.name && busy === 'download' ? <div className="download-preparing" role="status"><RefreshCw className="spin" size={14}/>Preparing download…</div> : null}</div>)}</div>
+                <div className="files" id="hub-files">{inspection.files.length === 0 ? <p className="hint">No GGUF files in this repository. Open a GGUF conversion of this model.</p> : inspection.files.map(file => { const fileDownload = downloadFor(inspection.repo, file.name); const isPreparing = preparing.includes(`${inspection.repo}/${file.name}`); return <div className="file-entry" key={file.name}><div className="file-row"><FileJson size={17}/><div><span className="identity-line"><strong>{file.name}</strong><CopyButton value={file.name} label={`Copy file name ${file.name}`} size={12} onError={copyError}/></span><small>{file.projector ? 'Multimodal projector' : file.mtp_head ? 'MTP head' : 'Model weights'}{file.size ? ` / ${(file.size / 1e9).toFixed(2)} GB` : ''}</small></div>{!file.projector && !file.mtp_head && <FileFit fit={file.fit}/>}<button className="secondary compact" disabled={!!fileDownload?.active || isPreparing} onClick={() => startDownload(inspection.repo, file.name)}><ArrowDownToLine size={14}/>Download</button></div>{fileDownload ? <DownloadPanel download={fileDownload} busy={!!busy} onCancel={() => cancelDownload(fileDownload.id)} onReveal={() => revealFile(fileDownload.path!)} onSelect={() => { if (file.projector) edit('mmproj_path', fileDownload.path!); else if (file.mtp_head) { edit('mtp_path', fileDownload.path!); edit('mtp', true); } else selectModel(fileDownload.path!); setTab('runtime'); }}/> : isPreparing ? <div className="download-preparing" role="status"><RefreshCw className="spin" size={14}/>Preparing download…</div> : null}</div>; })}</div>
               </>}
             </section>
           </div>
@@ -421,17 +468,21 @@ function App() {
         </>}
         {tab === 'api' && <>
           <section className="endpoint-card"><div><span className={`status-dot ${!snapshot?.api_error && desktop ? 'green' : ''}`}/><strong>{apiBase}</strong><button className="icon-button" aria-label="Copy API URL" onClick={() => copy(apiBase, 'api')}>{copied === 'api' ? <Check size={16}/> : <Copy size={16}/>}</button></div><p>{snapshot?.api_error ?? 'Localhost only. No API key needed. Available while Noullama is open.'}</p></section>
-          <div className="endpoint-list">{([['GET', '/v1/models', 'List the loaded decision model'], ['POST', '/v1/systemone', 'Native state + typed questions'], ['POST', '/v1/chat/completions', 'OpenAI chat response envelope'], ['GET', '/health', 'Gateway health and model readiness (outside /v1)']] as const).map(([method, path, text]) => <div key={path}><span className={`method ${method === 'GET' ? 'get' : ''}`}>{method}</span><code>{path}</code><span>{text}</span><CopyButton value={`${apiOrigin}${path}`} label={`Copy ${apiOrigin}${path}`} size={13} onError={copyError}/></div>)}</div>
+          <section className="panel keep-context-card">{keepContextControl}</section>
+          <div className="endpoint-list">{([['GET', '/v1/models', 'List the names the loaded model answers to'], ['POST', '/v1/systemone', 'Native state + typed questions'], ['POST', '/v1/chat/completions', 'OpenAI chat response envelope'], ['GET', '/health', 'Gateway health and model readiness (outside /v1)']] as const).map(([method, path, text]) => <div key={path}><span className={`method ${method === 'GET' ? 'get' : ''}`}>{method}</span><code>{path}</code><span>{text}</span><CopyButton value={`${apiOrigin}${path}`} label={`Copy ${apiOrigin}${path}`} size={13} onError={copyError}/></div>)}</div>
+          <ModelNames fileName={loadedFileName} aliases={snapshot?.settings.model_aliases ?? []} disabled={!desktop} onSave={saveAliases} onError={copyError}/>
           <section className="panel code-panel"><div className="panel-heading"><span>Native decision request</span><button className="icon-button" aria-label="Copy native API example" onClick={() => copy(`curl ${apiBase}/systemone -H 'Content-Type: application/json' -d '${requestJson.replace(/'/g, "'\\''")}'`, 'curl')}>{copied === 'curl' ? <Check size={14}/> : <Copy size={14}/>}</button></div><pre>{`curl ${apiBase}/systemone \\\n  -H 'Content-Type: application/json' \\\n  -d '${requestJson.replace(/'/g, "'\\''")}'`}</pre></section>
           <section className="panel code-panel"><div className="panel-heading"><span>Python · OpenAI SDK</span><div className="heading-actions"><span className="chip">Non-streaming</span><CopyButton value={pythonExample} label="Copy Python example" onError={copyError}/></div></div><pre>{pythonExample}</pre></section>
           <div className="api-note"><BookOpen size={18}/><div><strong>Request format</strong><p>Send one user message containing a JSON request with state and questions. The assistant content contains the native result as JSON. Chat history, tools, and streaming are unsupported. Questions use choice, noul, or score; this runtime does not support extraction or multi-select.</p><a href="https://github.com/ggml-org/llama.cpp/blob/b11938/tools/server/README.md#post-v1systemone-typesafe-compatible-system-one-api" target="_blank" rel="noreferrer">llama.cpp decision API reference<ExternalLink size={12}/></a></div></div>
         </>}
       </div>
     </main>
-    {showDownloadToast && download && <aside className="download-toast" aria-label="Downloads">
-      <div className="toast-head"><strong>Downloads</strong><span>{!download.active && <button className="icon-button" aria-label="Dismiss" onClick={() => setToastDismissed(`${download.repo}/${download.file}`)}><X size={15}/></button>}<button className="icon-button" aria-label={toastCollapsed ? 'Show downloads' : 'Collapse downloads'} aria-expanded={!toastCollapsed} onClick={() => setToastCollapsed(v => !v)}>{toastCollapsed ? <ChevronUp size={15}/> : <ChevronDown size={15}/>}</button></span></div>
-      {!toastCollapsed && <><div className="toast-row"><button className="toast-open" onClick={() => { setTab('hub'); openRepo(download.repo); }}><strong>{download.repo}</strong><small>{download.active ? `${download.file} / ${download.progress === null ? 'Connecting' : `${download.progress.toFixed(0)}%`}` : `${download.file} / Downloaded`}</small></button>{download.active ? <button className="icon-button" aria-label="Cancel download" title="Cancel download" disabled={busy === 'cancel'} onClick={cancelDownload}><X size={15}/></button> : <CircleCheck className="toast-done" size={17}/>}</div>
-      {download.active && <div className="download-track" aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, download.progress ?? 0))}%` }}/></div>}</>}
+    {showDownloadToast && <aside className="download-toast" aria-label="Downloads" ref={toastRef}>
+      <div className="toast-head"><strong>Downloads{toastDownloads.length > 1 ? ` (${toastDownloads.length})` : ''}</strong><button className="icon-button" aria-label={toastCollapsed ? 'Show downloads' : 'Collapse downloads'} aria-expanded={!toastCollapsed} onClick={() => setToastCollapsed(v => !v)}>{toastCollapsed ? <ChevronUp size={15}/> : <ChevronDown size={15}/>}</button></div>
+      {!toastCollapsed && <div className="toast-list">{toastDownloads.map(item => <div className="toast-item" key={item.id}>
+        <div className="toast-row"><button className="toast-open" onClick={() => { setTab('hub'); openRepo(item.repo); }}><strong>{item.file}</strong><small>{item.active ? `${item.repo} / ${item.progress === null ? 'Connecting' : `${item.progress.toFixed(0)}%`}` : `${item.repo} / Downloaded`}</small></button>{item.active ? <button className="icon-button" aria-label={`Cancel download of ${item.file}`} title="Cancel download" disabled={busy === 'cancel'} onClick={() => cancelDownload(item.id)}><X size={15}/></button> : <><CircleCheck className="toast-done" size={17}/><button className="icon-button" aria-label={`Dismiss ${item.file}`} title="Dismiss" onClick={() => void dismissDownload(item.id)}><X size={15}/></button></>}</div>
+        {item.active && <div className="download-track" aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, item.progress ?? 0))}%` }}/></div>}
+      </div>)}</div>}
     </aside>}
     <ContextMenu/>
     {updates && <UpdatesDialog open={updatesOpen} view={updates} onClose={() => setUpdatesOpen(false)} onCheck={() => { void updateCommand('check_for_update'); }} onInstall={() => { void updateCommand('install_update'); }} onPrefs={(includePrereleases, checkOnLaunch) => { setUpdates(view => view && { ...view, include_prereleases: includePrereleases, check_on_launch: checkOnLaunch }); void updateCommand('set_update_prefs', { includePrereleases, checkOnLaunch }); }}/>}

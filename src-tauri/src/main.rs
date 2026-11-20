@@ -1,4 +1,5 @@
 mod api;
+mod context;
 mod desktop;
 mod files;
 mod decision;
@@ -68,6 +69,9 @@ fn main() {
             runtime::stop_runtime,
             runtime::decide,
             runtime::model_memory,
+            runtime::set_model_aliases,
+            context::set_keep_context,
+            context::clear_context,
             hub::hf_session,
             hub::set_hf_token,
             hub::search_models,
@@ -77,6 +81,7 @@ fn main() {
             hub::local_models,
             hub::model_mtp,
             hub::cancel_download,
+            hub::dismiss_download,
             presets::list_presets,
             presets::save_preset,
             presets::delete_preset,

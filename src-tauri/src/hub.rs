@@ -78,15 +78,28 @@ fn redact_diagnostic(line: &str, secrets: &[String]) -> String {
         .to_owned()
 }
 
+/// The entry for one download attempt; None once a retry has replaced it.
+fn entry<'a>(downloads: &'a mut [DownloadState], key: &DownloadKey) -> Option<&'a mut DownloadState> {
+    downloads.iter_mut().find(|d| d.id == key.id && d.attempt == key.attempt)
+}
+
+#[derive(Clone)]
+struct DownloadKey {
+    id: String,
+    attempt: u64,
+}
+
 async fn handle_hf_line(
     line: &[u8],
     state: &AppState,
+    key: &DownloadKey,
     secrets: &[String],
     tail: &mut VecDeque<String>,
 ) {
     let line = String::from_utf8_lossy(line);
     if let Some(progress) = parse_hf_progress(&line) {
-        let mut download = state.download.lock().await;
+        let mut downloads = state.downloads.lock().await;
+        let Some(download) = entry(&mut downloads, key) else { return };
         if let Some(percent) = progress.percent {
             download.progress = Some(percent);
         }
@@ -115,6 +128,7 @@ async fn handle_hf_line(
 async fn track_hf_progress(
     mut stderr: tokio::process::ChildStderr,
     state: AppState,
+    key: DownloadKey,
     secrets: Vec<String>,
 ) -> VecDeque<String> {
     let mut chunk = [0u8; 4096];
@@ -129,7 +143,7 @@ async fn track_hf_progress(
         for byte in &chunk[..count] {
             if *byte == b'\r' || *byte == b'\n' {
                 if !oversized {
-                    handle_hf_line(&pending, &state, &secrets, &mut tail).await;
+                    handle_hf_line(&pending, &state, &key, &secrets, &mut tail).await;
                 }
                 pending.clear();
                 oversized = false;
@@ -144,7 +158,7 @@ async fn track_hf_progress(
         }
     }
     if !oversized && !pending.is_empty() {
-        handle_hf_line(&pending, &state, &secrets, &mut tail).await;
+        handle_hf_line(&pending, &state, &key, &secrets, &mut tail).await;
     }
     tail
 }
@@ -649,11 +663,25 @@ pub async fn download_model(
 }
 
 #[tauri::command]
-pub async fn cancel_download(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    // Checked under the download lock so a cancel cannot leak into the next download.
-    if state.download.lock().await.active {
-        state.app.download_cancel.send_replace(true);
+pub async fn cancel_download(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    cancel_one(state.inner(), &id).await;
+    Ok(())
+}
+
+// Checked under the downloads lock so a cancel cannot leak into the next attempt.
+async fn cancel_one(state: &AppState, id: &str) {
+    let downloads = state.downloads.lock().await;
+    if downloads.iter().any(|d| d.id == id && d.active) {
+        if let Some((_, cancel)) = state.app.download_cancels.lock().await.get(id) {
+            cancel.send_replace(true);
+        }
     }
+}
+
+/// Removes a finished, failed or cancelled download from the list.
+#[tauri::command]
+pub async fn dismiss_download(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.downloads.lock().await.retain(|d| d.id != id || d.active);
     Ok(())
 }
 
@@ -672,38 +700,54 @@ fn download_revision(model: &Value) -> Result<&str, String> {
         .ok_or_else(|| "Hub returned an invalid commit revision".into())
 }
 
+/// Finished entries kept for the downloads list; older ones drop off.
+const KEPT_FINISHED_DOWNLOADS: usize = 8;
+
 async fn begin_download(state: &AppState, repo: String, filename: String) -> Result<(), String> {
     if !valid_repo(&repo) || !valid_filename(&filename) {
         return Err("Choose a relative GGUF filename (not starting with '-') from an owner/model repository.".into());
     }
-    let settings = {
+    let id = format!("{repo}/{filename}");
+    let (settings, key, cancel) = {
         let _guard = state.lifecycle.lock().await;
         if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("Noullama is shutting down.".into());
         }
-        let mut download = state.download.lock().await;
-        if download.active {
-            return Err("A model download is already in progress.".into());
+        let mut downloads = state.downloads.lock().await;
+        if downloads.iter().any(|d| d.id == id && d.active) {
+            return Err(format!("{filename} is already downloading."));
         }
-        state.app.download_cancel.send_replace(false);
-        *download = DownloadState {
+        let attempt = state.app.download_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        state.app.download_cancels.lock().await.insert(id.clone(), (attempt, sender));
+        downloads.retain(|d| d.id != id);
+        downloads.push(DownloadState {
+            id: id.clone(),
+            attempt,
             active: true,
             repo: repo.clone(),
             file: filename.clone(),
             message: "Checking repository access and preparing download…".into(),
             ..Default::default()
-        };
-        state.settings.lock().await.clone()
+        });
+        while downloads.iter().filter(|d| !d.active).count() > KEPT_FINISHED_DOWNLOADS {
+            if let Some(oldest) = downloads.iter().position(|d| !d.active) {
+                downloads.remove(oldest);
+            }
+        }
+        (state.settings.lock().await.clone(), DownloadKey { id, attempt }, receiver)
     };
-    let mut cancel = state.app.download_cancel.subscribe();
+    let mut waiter = cancel.clone();
     let prepared = tokio::select! {
-        result = prepare_download(state, &settings, &repo, &filename) => result,
-        _ = cancel.wait_for(|cancelled| *cancelled) => Err("Download cancelled.".into()),
+        result = prepare_download(state, &settings, &repo, &filename, &key, cancel.clone()) => result,
+        _ = waiter.wait_for(|cancelled| *cancelled) => Err("Download cancelled.".into()),
     };
     if let Err(error) = prepared {
-        let mut download = state.download.lock().await;
+        release_cancel(state, &key).await;
+        let mut downloads = state.downloads.lock().await;
+        let Some(download) = entry(&mut downloads, &key) else { return Err(error) };
         download.active = false;
-        if *state.app.download_cancel.borrow() {
+        if *cancel.borrow() {
             download.cancelled = true;
             download.message = "Download cancelled before it started.".into();
             return Ok(());
@@ -715,11 +759,20 @@ async fn begin_download(state: &AppState, repo: String, filename: String) -> Res
     Ok(())
 }
 
+async fn release_cancel(state: &AppState, key: &DownloadKey) {
+    let mut cancels = state.app.download_cancels.lock().await;
+    if cancels.get(&key.id).is_some_and(|(attempt, _)| *attempt == key.attempt) {
+        cancels.remove(&key.id);
+    }
+}
+
 async fn prepare_download(
     state: &AppState,
     settings: &Settings,
     repo: &str,
     filename: &str,
+    key: &DownloadKey,
+    cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let model = metadata(state, repo).await?;
     if !model["siblings"]
@@ -733,7 +786,7 @@ async fn prepare_download(
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|e| e.to_string())?;
-    let destination = directory.join(&filename).to_string_lossy().into_owned();
+    let destination = directory.join(filename).to_string_lossy().into_owned();
     let mut command = Command::new(&settings.hf_path);
     command
         .args([
@@ -757,18 +810,19 @@ async fn prepare_download(
     if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("Noullama is shutting down.".into());
     }
-    if *state.app.download_cancel.borrow() {
+    if *cancel.borrow() {
         return Err("Download cancelled.".into());
     }
-    let started = std::time::SystemTime::now();
     let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().map_err(|e| format!("Cannot start hf: {e}. Install the Hugging Face CLI or configure its executable path."))?;
     {
-        let mut download = state.download.lock().await;
-        download.message = "Downloading with hf; resumable files are kept on disk…".into();
-        download.total_bytes = model["siblings"]
-            .as_array()
-            .and_then(|files| files.iter().find(|file| file["rfilename"] == filename))
-            .and_then(|file| file["size"].as_u64());
+        let mut downloads = state.downloads.lock().await;
+        if let Some(download) = entry(&mut downloads, key) {
+            download.message = "Downloading with hf; resumable files are kept on disk…".into();
+            download.total_bytes = model["siblings"]
+                .as_array()
+                .and_then(|files| files.iter().find(|file| file["rfilename"] == filename))
+                .and_then(|file| file["size"].as_u64());
+        }
     }
     state
         .log(format!(
@@ -779,6 +833,7 @@ async fn prepare_download(
     let state = state.clone();
     let repo = repo.to_owned();
     let filename = filename.to_owned();
+    let key = key.clone();
     let app = state.app.clone();
     // hf keeps resume state under <local-dir>/.cache/huggingface/download/<filename>.*
     let partial_base = directory
@@ -791,15 +846,17 @@ async fn prepare_download(
         .lock()
         .await
         .retain(|(base, _)| *base != partial_base);
-    let mut task_slot = app.download_task.lock().await;
+    let mut tasks = app.download_tasks.lock().await;
+    tasks.retain(|task| !task.is_finished());
     let task = tokio::spawn(async move {
         let mut stop = state.app.api_stop.subscribe();
-        let mut cancel = state.app.download_cancel.subscribe();
+        let mut cancel = cancel;
         let stderr = child.stderr.take();
         let progress_state = state.clone();
+        let progress_key = key.clone();
         let reader = tokio::spawn(async move {
             if let Some(stderr) = stderr {
-                track_hf_progress(stderr, progress_state, token.into_iter().collect()).await
+                track_hf_progress(stderr, progress_state, progress_key, token.into_iter().collect()).await
             } else {
                 VecDeque::new()
             }
@@ -829,36 +886,41 @@ async fn prepare_download(
             .filter(|m| m.is_file())
             .map(|m| m.len());
         let success = result.as_ref().is_ok_and(|s| s.success()) && size.is_some();
-        let mut download = state.download.lock().await;
-        download.active = false;
+        release_cancel(&state, &key).await;
         if cancelled {
             // Keep the partial files until the app exits so an immediate retry can resume.
-            let files = cancelled_partial_files(&partial_base, started);
+            let files = cancelled_partial_files(&partial_base);
             let mut partials = state.app.cancelled_partials.lock().await;
             partials.retain(|(base, _)| *base != partial_base);
             partials.push((partial_base, files));
-            download.cancelled = true;
-            download.message =
-                "Download cancelled; partial files are kept until you quit Noullama.".into();
-        } else if success {
-            download.downloaded_bytes = size.unwrap_or(download.downloaded_bytes);
-            download.total_bytes = size.or(download.total_bytes);
-            download.progress = Some(100.0);
-            download.path = Some(destination);
-            download.message = "Download complete. Ready to load.".into();
-        } else {
-            let status = match result {
-                Ok(status) => status.to_string(),
-                Err(error) => error.to_string(),
-            };
-            download.error = Some(if diagnostics.is_empty() {
-                format!("hf download failed ({status}). Check connection, disk space, and repository access; retry resumes the download.")
-            } else {
-                format!("hf download failed ({status}):\n{diagnostics}")
-            });
-            download.message = "Download failed; partial files were preserved.".into();
         }
-        drop(download);
+        let mut downloads = state.downloads.lock().await;
+        if let Some(download) = entry(&mut downloads, &key) {
+            download.active = false;
+            if cancelled {
+                download.cancelled = true;
+                download.message =
+                    "Download cancelled; partial files are kept until you quit Noullama.".into();
+            } else if success {
+                download.downloaded_bytes = size.unwrap_or(download.downloaded_bytes);
+                download.total_bytes = size.or(download.total_bytes);
+                download.progress = Some(100.0);
+                download.path = Some(destination);
+                download.message = "Download complete. Ready to load.".into();
+            } else {
+                let status = match &result {
+                    Ok(status) => status.to_string(),
+                    Err(error) => error.to_string(),
+                };
+                download.error = Some(if diagnostics.is_empty() {
+                    format!("hf download failed ({status}). Check connection, disk space, and repository access; retry resumes the download.")
+                } else {
+                    format!("hf download failed ({status}):\n{diagnostics}")
+                });
+                download.message = "Download failed; partial files were preserved.".into();
+            }
+        }
+        drop(downloads);
         state
             .log(if success {
                 format!("Download complete: {filename}")
@@ -867,30 +929,37 @@ async fn prepare_download(
             })
             .await;
     });
-    *task_slot = Some(task);
+    tasks.push(task);
     Ok(())
 }
 
-// hf names the partial data `<hash>.<etag>.incomplete` beside `<filename>.metadata`
-// and `<filename>.lock`, so the data file is found by its write time instead of
-// its name: it is the one this download (or the resume it continued) touched.
-fn cancelled_partial_files(base: &Path, started: std::time::SystemTime) -> Vec<std::path::PathBuf> {
+/// huggingface_hub's name for a file's partial data: the URL-safe base64 of the
+/// SHA-1 of `<file>.metadata`, then the etag (`_local_folder.py`, `_short_hash`).
+fn partial_data_prefix(file_name: &str) -> String {
+    use base64::Engine;
+    use sha1::Digest;
+    let digest = sha1::Sha1::digest(format!("{file_name}.metadata").as_bytes());
+    format!("{}.", base64::engine::general_purpose::URL_SAFE.encode(digest))
+}
+
+// Several downloads from one repository share this cache folder, so the
+// partial data is matched by the name hf derives from this file only.
+fn cancelled_partial_files(base: &Path) -> Vec<std::path::PathBuf> {
     let with_suffix = |suffix: &str| {
         let mut name = base.as_os_str().to_owned();
         name.push(suffix);
         std::path::PathBuf::from(name)
     };
     let mut files = vec![with_suffix(".metadata"), with_suffix(".lock")];
-    let since = started - Duration::from_secs(2);
+    let Some(file_name) = base.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return files;
+    };
+    let prefix = partial_data_prefix(&file_name);
     if let Some(entries) = base.parent().and_then(|dir| std::fs::read_dir(dir).ok()) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            let touched = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|modified| modified >= since);
-            if touched && path.extension().is_some_and(|e| e == "incomplete") {
-                files.push(path);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) && name.ends_with(".incomplete") {
+                files.push(entry.path());
             }
         }
     }
@@ -1008,6 +1077,7 @@ mod tests {
         let tail = track_hf_progress(
             child.stderr.take().unwrap(),
             state,
+            DownloadKey { id: "acme/m/model.gguf".into(), attempt: 1 },
             vec!["custom-secret".into()],
         )
         .await;
@@ -1052,7 +1122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_metadata_does_not_block_snapshots_or_settings_and_reserves_one_download() {
+    async fn slow_metadata_does_not_block_snapshots_or_settings_and_reserves_each_file() {
         use tokio::io::AsyncWriteExt;
         let base =
             std::env::temp_dir().join(format!("noullama-download-lock-{}", uuid::Uuid::new_v4()));
@@ -1086,7 +1156,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(snapshot["download"]["active"], true);
+        assert_eq!(snapshot["downloads"][0]["active"], true);
+        assert_eq!(snapshot["downloads"][0]["id"], "acme/decision-model-GGUF/model.gguf");
         let mut settings = state.settings.lock().await.clone();
         settings.hf_path = "/custom/hf".into();
         tokio::time::timeout(
@@ -1100,17 +1171,30 @@ mod tests {
         assert!(crate::runtime::persist_settings(&state, settings)
             .await
             .is_err());
-        assert!(tokio::time::timeout(
+        // The same file cannot start twice while it is active.
+        let duplicate = tokio::time::timeout(
             Duration::from_millis(500),
-            begin_download(
-                &state,
-                "acme/decision-model-GGUF".into(),
-                "second.gguf".into()
-            )
+            begin_download(&state, "acme/decision-model-GGUF".into(), "model.gguf".into()),
         )
         .await
-        .unwrap()
-        .is_err());
+        .unwrap();
+        assert!(duplicate.unwrap_err().contains("already downloading"));
+        // A different file starts alongside it.
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            begin_download(&second_state, "acme/decision-model-GGUF".into(), "second.gguf".into()).await
+        });
+        let (mut second_connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.downloads.lock().await.iter().filter(|d| d.active).count(), 2);
+        second_connection
+            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        drop(second_connection);
+        assert!(tokio::time::timeout(Duration::from_secs(2), second).await.unwrap().unwrap().is_err());
         connection
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
             .await
@@ -1121,7 +1205,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_err());
-        assert!(!state.download.lock().await.active);
+        let downloads = state.downloads.lock().await.clone();
+        assert_eq!(downloads.len(), 2);
+        assert!(downloads.iter().all(|d| !d.active && d.error.is_some()));
+        assert!(state.app.download_cancels.lock().await.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
@@ -1143,13 +1230,14 @@ mod tests {
     async fn progress_reader_handles_carriage_return_frames() {
         let base = std::env::temp_dir().join(format!("noullama-progress-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(base.clone()).unwrap();
-        state.download.lock().await.total_bytes = Some(168_000_000);
+        let key = DownloadKey { id: "acme/m/model.gguf".into(), attempt: 1 };
+        state.downloads.lock().await.push(DownloadState { id: key.id.clone(), attempt: 1, total_bytes: Some(168_000_000), ..Default::default() });
         // Exercise the actual stderr framing path, not a file-size approximation.
         let mut child = Command::new("sh").args(["-c", "printf 'model: downloading bytes: | 12.3MB, 2MB/s\\rmodel: reconstructing file: 40%%|#### | 67.8MB / 168MB\\n' >&2"])
             .stderr(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
-        track_hf_progress(child.stderr.take().unwrap(), state.clone(), Vec::new()).await;
+        track_hf_progress(child.stderr.take().unwrap(), state.clone(), key, Vec::new()).await;
         child.wait().await.unwrap();
-        let download = state.download.lock().await.clone();
+        let download = state.downloads.lock().await[0].clone();
         assert_eq!(download.progress, Some(40.0));
         assert_eq!(download.transferred_bytes, 12_300_000);
         assert_eq!(download.downloaded_bytes, 67_800_000);
@@ -1189,49 +1277,50 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_cleanup_finds_hashed_incomplete_files_written_by_this_download() {
+    fn partial_data_names_match_huggingface_hub() {
+        // base64.urlsafe_b64encode(hashlib.sha1(b"model.gguf.metadata").digest())
+        assert_eq!(partial_data_prefix("model.gguf"), "oXa0XAG8ZeXAcRMIPdQRwbfnQrg=.");
+    }
+
+    #[test]
+    fn cancelled_cleanup_keeps_partials_of_other_downloads_in_the_same_folder() {
         let base = std::env::temp_dir().join(format!("noullama-partials-{}", uuid::Uuid::new_v4()));
-        let cache = base.join(".cache/huggingface/download/folder");
+        let cache = base.join(".cache/huggingface/download");
         std::fs::create_dir_all(&cache).unwrap();
-        let started = std::time::SystemTime::now();
-        // hf names the data file after a hash of the metadata name, not the model file.
-        let current = cache.join("Xk3fQ0w=.0123abcd.incomplete");
-        std::fs::write(&current, b"partial").unwrap();
-        let older = cache.join("other=.4567.incomplete");
-        std::fs::write(&older, b"old").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&older)
-            .unwrap()
-            .set_modified(started - Duration::from_secs(3600))
-            .unwrap();
-        let files = cancelled_partial_files(&cache.join("model.gguf"), started);
-        assert!(files.contains(&current));
-        assert!(!files.contains(&older));
+        let mine = cache.join(format!("{}0123abcd.incomplete", partial_data_prefix("model.gguf")));
+        let other = cache.join(format!("{}4567.incomplete", partial_data_prefix("mmproj.gguf")));
+        std::fs::write(&mine, b"partial").unwrap();
+        std::fs::write(&other, b"still downloading").unwrap();
+        let files = cancelled_partial_files(&cache.join("model.gguf"));
+        assert!(files.contains(&mine));
+        assert!(!files.contains(&other));
         assert!(files.contains(&cache.join("model.gguf.metadata")));
         assert!(files.contains(&cache.join("model.gguf.lock")));
         std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
-    async fn cancel_only_applies_while_a_download_is_active() {
+    async fn cancel_only_applies_to_the_named_active_download() {
         let base = std::env::temp_dir().join(format!("noullama-cancel-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(base.clone()).unwrap();
-        // An idle cancel must not leak into the next download.
-        if state.download.lock().await.active {
-            state.app.download_cancel.send_replace(true);
-        }
-        assert!(!*state.app.download_cancel.borrow());
-        state.download.lock().await.active = true;
-        if state.download.lock().await.active {
-            state.app.download_cancel.send_replace(true);
-        }
-        // A waiter subscribing after the cancel (the download task) still sees it.
-        let mut late = state.app.download_cancel.subscribe();
-        tokio::time::timeout(Duration::from_millis(100), late.wait_for(|c| *c))
-            .await
-            .unwrap()
-            .unwrap();
+        let switch = |attempt| {
+            let (sender, receiver) = tokio::sync::watch::channel(false);
+            (attempt, sender, receiver)
+        };
+        let (a, a_tx, mut a_rx) = switch(1);
+        let (b, b_tx, b_rx) = switch(2);
+        state.app.download_cancels.lock().await.insert("r/a.gguf".into(), (a, a_tx));
+        state.app.download_cancels.lock().await.insert("r/b.gguf".into(), (b, b_tx));
+        // An idle entry must not be cancelled, so a cancel cannot leak into its next attempt.
+        state.downloads.lock().await.push(DownloadState { id: "r/a.gguf".into(), attempt: a, active: false, ..Default::default() });
+        state.downloads.lock().await.push(DownloadState { id: "r/b.gguf".into(), attempt: b, active: true, ..Default::default() });
+        cancel_one(&state, "r/a.gguf").await;
+        assert!(!*a_rx.borrow());
+        state.downloads.lock().await[0].active = true;
+        cancel_one(&state, "r/a.gguf").await;
+        tokio::time::timeout(Duration::from_millis(100), a_rx.wait_for(|c| *c)).await.unwrap().unwrap();
+        // The other download keeps going.
+        assert!(!*b_rx.borrow());
         std::fs::remove_dir_all(base).unwrap();
     }
 }
