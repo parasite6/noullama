@@ -303,8 +303,8 @@ fn render(entries: &[Entry]) -> Result<String, String> {
     Ok(format!("{HEADER}\n{body}"))
 }
 
-fn now_millis() -> u128 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis()
+fn now_nanos() -> u128 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 
 /// Saves `text` to backups/models and keeps the newest few.
@@ -314,7 +314,12 @@ fn backup(data_dir: &Path, text: &str) -> Result<(), String> {
     }
     let dir = backups_dir(data_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
-    std::fs::write(dir.join(format!("models-{}.yml", now_millis())), text).map_err(|e| format!("Cannot back up models.yml: {e}"))?;
+    use std::io::Write;
+    let backup = dir.join(format!("models-{}-{}.yml", now_nanos(), uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(backup)
+        .map_err(|e| format!("Cannot back up models.yml: {e}"))?;
+    file.write_all(text.as_bytes()).and_then(|_| file.sync_all())
+        .map_err(|e| format!("Cannot back up models.yml: {e}"))?;
     let mut backups: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map_err(|e| e.to_string())?
         .flatten()
@@ -410,6 +415,7 @@ fn refresh_locked(data_dir: &Path, library: &mut Library, legacy: &BTreeMap<Stri
     };
     library.stamp = Some(current);
     if text == library.text {
+        library.error = None;
         return;
     }
     match parse(&text) {
@@ -495,9 +501,12 @@ pub async fn set_aliases(state: &AppState, path: &str, aliases: Vec<String>) -> 
 }
 
 /// Records the sha256 of one of the files of the entry for `model`.
-async fn set_sha256(state: &AppState, model: &str, slot: Slot, sha256: &str) -> Result<(), String> {
+async fn set_sha256(state: &AppState, model: &str, slot: Slot, file: &str, sha256: &str) -> Result<(), String> {
     update(state, Change::Checksums, |entries| match entries.iter_mut().find(|e| e.path == model) {
         Some(entry) => {
+            if entry.file(slot) != file {
+                return Err("The file changed in models.yml while its sha256 was being read. Try again.".into());
+            }
             *entry.sum_mut(slot) = sha256.to_owned();
             Ok(())
         }
@@ -622,7 +631,7 @@ pub fn hash_missing(state: AppState) {
             let Some((model, slot, file)) = next else { break };
             match current_hash(&state, &file, false).await {
                 Ok(sha256) => {
-                    if set_sha256(&state, &model, slot, &sha256).await.is_err() {
+                    if set_sha256(&state, &model, slot, &file, &sha256).await.is_err() {
                         break;
                     }
                 }
@@ -673,7 +682,7 @@ pub async fn verify(state: &AppState, model: &str, slot: Slot, check: Check, log
     state.log(format!("{log_prefix}Checking the {}'s sha256…", slot.label())).await;
     let actual = current_hash(state, &file, check == Check::EveryLoad).await?;
     if expected.is_empty() {
-        let _ = set_sha256(state, model, slot, &actual).await;
+        let _ = set_sha256(state, model, slot, &file, &actual).await;
         return Ok(());
     }
     if expected == actual {
@@ -770,7 +779,7 @@ pub async fn record_sha256(path: String, slot: Slot, state: tauri::State<'_, App
         Some(sha256) => sha256,
         None => current_hash(state.inner(), &file, true).await?,
     };
-    set_sha256(state.inner(), &path, slot, &sha256).await?;
+    set_sha256(state.inner(), &path, slot, &file, &sha256).await?;
     state.mismatches.lock().await.remove(&file);
     Ok(())
 }
@@ -793,6 +802,49 @@ mod tests {
 
     fn entry(name: &str, path: &str) -> Entry {
         Entry { name: name.into(), path: path.into(), ..Entry::default() }
+    }
+
+    #[test]
+    fn restoring_last_good_text_clears_parse_error() {
+        let dir = std::env::temp_dir().join(format!("noullama-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut library = Library::default();
+        refresh_locked(&dir, &mut library, &BTreeMap::new());
+        let good = library.text.clone();
+        std::fs::write(file_path(&dir), "models: [").unwrap();
+        library.stamp = None;
+        refresh_locked(&dir, &mut library, &BTreeMap::new());
+        assert!(library.error.is_some());
+        std::fs::write(file_path(&dir), good).unwrap();
+        library.stamp = None;
+        refresh_locked(&dir, &mut library, &BTreeMap::new());
+        assert!(library.error.is_none());
+    }
+
+    #[test]
+    fn rapid_backups_preserve_each_version() {
+        let dir = std::env::temp_dir().join(format!("noullama-backups-{}", uuid::Uuid::new_v4()));
+        for i in 0..BACKUPS_KEPT {
+            backup(&dir, &format!("version {i}")).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(backups_dir(&dir)).unwrap().count(), BACKUPS_KEPT);
+    }
+
+    #[tokio::test]
+    async fn hashing_an_old_companion_cannot_overwrite_a_new_selection() {
+        let (state, _) = temp_state().await;
+        refresh(&state).await;
+        let mut model = entry("m", "/m/model.gguf");
+        model.mmproj = "/m/old.gguf".into();
+        update(&state, Change::Edit, |entries| { entries.push(model); Ok(()) }).await.unwrap();
+        // A slow hash began with old.gguf; the user saves another path before it finishes.
+        update(&state, Change::Edit, |entries| {
+            entries[0].mmproj = "/m/new.gguf".into();
+            Ok(())
+        }).await.unwrap();
+        let result = set_sha256(&state, "/m/model.gguf", Slot::Mmproj, "/m/old.gguf", &"ab".repeat(32)).await;
+        assert!(result.is_err(), "a digest for the old path must be rejected");
+        assert!(state.library.lock().await.entries[0].mmproj_sha256.is_empty());
     }
 
     #[test]
@@ -881,7 +933,7 @@ mod tests {
         let backups = || std::fs::read_dir(backups_dir(&dir)).map(|d| d.count()).unwrap_or(0);
         let before = backups();
         // The background hasher records the sum while someone edits the entry.
-        set_sha256(&state, &model, Slot::Model, &"ab".repeat(32)).await.unwrap();
+        set_sha256(&state, &model, Slot::Model, &model, &"ab".repeat(32)).await.unwrap();
         assert_eq!(state.library.lock().await.revision, revision);
         assert_eq!(backups(), before, "a recorded sha256 is not worth a backup");
         entries[0].name = "renamed".into();
@@ -906,13 +958,13 @@ mod tests {
         state.library.lock().await.entries[0].sha256.clear();
         verify(&state, &model, Slot::Model, Check::Once, "").await.unwrap();
         assert_eq!(state.library.lock().await.entries[0].sha256, right);
-        set_sha256(&state, &model, Slot::Model, &"0".repeat(64)).await.unwrap();
+        set_sha256(&state, &model, Slot::Model, &model, &"0".repeat(64)).await.unwrap();
         assert!(verify(&state, &model, Slot::Model, Check::Once, "").await.unwrap_err().contains("does not match"));
         assert_eq!(state.mismatches.lock().await.get(&model).map(String::as_str), Some(right));
         verify(&state, &model, Slot::Model, Check::Warn, "").await.unwrap();
         verify(&state, &model, Slot::Model, Check::Off, "").await.unwrap();
         assert!(verify(&state, &model, Slot::Model, Check::EveryLoad, "").await.is_err());
-        set_sha256(&state, &model, Slot::Model, right).await.unwrap();
+        set_sha256(&state, &model, Slot::Model, &model, right).await.unwrap();
         verify(&state, &model, Slot::Model, Check::EveryLoad, "").await.unwrap();
         assert!(state.mismatches.lock().await.is_empty());
         state.shutdown().await;
