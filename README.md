@@ -4,169 +4,163 @@
 
 <h1 align="center">Noullama</h1>
 
-<p align="center">
-  <a href="https://noullama.dev">noullama.dev</a>
-</p>
+<p align="center"><a href="https://noullama.dev">noullama.dev</a></p>
+<p align="center">A local workbench and API for decision models using llama.cpp</p>
 
-<p align="center">A local workbench and API for native decision models using llama.cpp</p>
-
-[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Features](#features) · [Requirements](#requirements) · [Getting started](#getting-started) · [Runtime](#runtime) · [Models and presets](#models-and-presets) · [Images](#images) · [Multi-token prediction](#multi-token-prediction) · [Winnow models](#winnow-models) · [Local API](#local-api) · [Data and verification](#data-and-verification)
+[Quick start](#quick-start) · [What's new in v0.4.0](#whats-new-in-v040) · [Cheat sheet](#cheat-sheet) · [Requirements](#requirements) · [Runtime](#runtime) · [Memory protection](#memory-protection) · [Models and Library](#models-and-library) · [Playground](#playground) · [Images](#images) · [Multi-token prediction](#multi-token-prediction) · [Winnow models](#winnow-models) · [Local API](#local-api) · [Updates](#updates) · [Data and verification](#data-and-verification) · [Current limits](#current-limits)
 
 ## Quick start
+
+Install the Linux x86-64 package for your distribution from the [v0.4.0 release](https://github.com/parasite6/noullama/releases/tag/v0.4.0):
+
+```sh
+# Debian / Ubuntu
+curl -fLO https://github.com/parasite6/noullama/releases/download/v0.4.0/noullama_0.4.0_amd64.deb
+sudo apt install ./noullama_0.4.0_amd64.deb
+
+# Fedora / RPM-based distributions
+curl -fLO https://github.com/parasite6/noullama/releases/download/v0.4.0/noullama-0.4.0-1.x86_64.rpm
+sudo dnf install ./noullama-0.4.0-1.x86_64.rpm
+```
+
+These URLs are pinned to v0.4.0. Installed packages can check for later releases through **Updates**.
+
+In the app: **Hub** → download a GGUF, or **Models → Browse file** → **Runtime** → choose or download a compatible llama.cpp build → **Load model** → **Playground**.
+
+For development from source, install the [requirements](#requirements), then:
 
 ```sh
 git clone https://github.com/parasite6/noullama.git
 cd noullama
-npm install
+npm ci
 npm run desktop
 ```
 
-In the app: **Hub** → download a GGUF (or **Models** → browse for a local file) → **Runtime** → choose a llama.cpp build → **Load model** → **Playground**.
+## What's new in v0.4.0
+
+- **Several models at once**, each with its own runtime process, settings, private port, context history, API names and aliases. Eject one without stopping the others, including from the sidebar's loaded-model list.
+- **Library and models.yml** for model names, aliases, Hugging Face accounts, file paths, MTP heads, projectors and sha256 values. Edit in the app or your text editor, with backups and protection against overwriting newer changes.
+- **OOM prevention** with conservative load checks and automatic recovery from sustained critical memory pressure on Linux. **Allow force fit** disables this protection. A separate crowded-load prompt offers to eject another model and can be hidden without disabling protection.
+- **Steadier interactions**: actions no longer dim unrelated controls across the app, unchanged polling results preserve displayed state, and MTP controls stay visible during rescans. Notifications float over the page rather than shifting its contents.
+- **Concurrent downloads**, per-file cancellation, named model routing, and shared **Keep context** controls for the Playground and API.
+- **Runtime download improvements**: remember the chosen backend, select the nightly after installation, and keep the official stable build as a fallback for that backend when available.
+- App-drawn Library suggestions, copy controls, clearer load errors and confirmation before deleting a preset.
 
 ## Cheat sheet
 
 | I want to… | Do this |
 | --- | --- |
-| Download a model | Open **Hub**, search or type `organization/repository`, pick a repository, and download a GGUF file. |
-| Use an existing model | Open **Models**, choose **Browse local model**, then click **Load model**. |
-| Run a decision | In **Playground**, pick a preset under **Run settings**, edit the questions and state, then click **Run decision**. |
-| Ask about images | Turn on **Vision** in the model bar, load the model, then add images in the **State** box. |
-| Speed up generation with MTP | Turn on **MTP** in the model bar for a model with MTP layers or a matching MTP head in its folder, then load it. |
-| Save a preset | Enter a name under the questions editor and click **Save preset**. |
-| Let decisions build on earlier ones | Turn on **Keep context** under **Run settings** or in **Local API**. |
-| See why a load failed | Read the red panel under the model bar, or open **Runtime logs**. |
-| Use CPU inference | Set **GPU layers** to `0` in **Runtime**. |
-| Connect an application | Use `http://127.0.0.1:11435/v1`; native decisions are at `/systemone`. |
-| Run several models at once | Select another model and click **Load beside**; each loaded model has its own **Eject** under **Models → Loaded**. |
-| Route API requests to a model | Send its name from **Library** as `model`, or give it an alias there, under **Models** or under **Local API → Model routing**. |
-| Rename a model or edit models.yml | Open **Library**, or **Edit models.yml** to open the file in your default editor. |
-| Choose how model files are checked | **Settings → sha256 before loading**. |
-
-Question types:
-
-- **`choice`** selects an option.
-- **`noul`** answers yes/no.
-- **`score`** rates an ordered set of levels.
-
-## Features
-
-- Discover and download decision-model GGUFs from Hugging Face using an existing login or a session token.
-- Load a local model with a compatible llama.cpp runtime and configure GPU offloading. A **Vision** switch loads the model's multimodal projector.
-- Run typed questions against text or JSON state, and against images when a projector is loaded, using editable presets, JSON linting, and syntax highlighting.
-- Turn on multi-token prediction (MTP) for models that ship MTP layers or a separate MTP head, using llama.cpp's speculative decoding.
-- Load Winnow GGUFs, which have no native decision support, through Winnow's own prompt layout on a stock llama.cpp.
-- See why a model failed to load, with llama.cpp's own error lines, without opening the logs.
-- Hover the runtime card in the sidebar for the loaded model's settings and live graphics-memory use.
-- Save, update, and delete named custom presets.
-- Connect through a local System One endpoint or an OpenAI-compatible chat adapter.
+| Download a model | **Hub** → search or enter `organization/repository` → pick a GGUF. |
+| Use an existing model | **Models → Browse file**, or **Library → Add model**. |
+| Run a decision | **Playground → Run settings** → choose a loaded model and preset, edit state/questions, then **Run decision**. |
+| Run several models | Select another model and choose **Load beside**. |
+| Unload one model | Use its **Eject** button in **Models → Loaded** or the sidebar. |
+| Configure API names | Edit the name or aliases in **Library**; aliases are also editable under **Models** and **Local API → Model routing**. |
+| Use CPU inference | **Runtime → GPU layers** → `0`. |
+| Ask about images | Configure the projector in **Library** or **Runtime**, enable **Vision**, then load the model and add images to State. |
+| Enable MTP | Choose a model with built-in MTP or a matching head, turn on **MTP**, then load or reload it. |
+| Keep earlier decisions | Enable **Keep context** in **Run settings** or **Local API**. |
+| Override memory protection | **Settings → Allow force fit**. |
+| Restore the crowded-load prompt | **Settings → Show crowded-load warning again**. |
+| Choose model-file checks | **Settings → sha256 before loading**. |
+| Diagnose a failed load | Read its error panel or open **Runtime logs**. |
+| Connect a client | Copy the actual endpoint from **Local API**; the default base URL is `http://127.0.0.1:11435/v1`. |
 
 ## Requirements
 
-Needed to build from source. The `.deb` and `.rpm` packages install the system libraries themselves, but still need `hf` and a `llama-server`.
+Packaged installs need the runtime libraries supplied through their package dependencies. Building from source also needs:
 
-- Node.js 24+ and Rust (with cargo).
-- The Hugging Face CLI (`hf`) for downloads. Public models do not require a login; gated models require access and authentication.
-- A compatible `llama-server`. Liquid d1-2B requires a build containing [llama.cpp PR #31275](https://github.com/ggml-org/llama.cpp/pull/31275), such as b11954 or a compatible newer build.
-- On Linux, the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux), including GTK 3 and WebKitGTK 4.1 development packages.
+- **Node.js 24+**, npm and a stable Rust toolchain with Cargo.
+- On Linux, GTK 3, WebKitGTK 4.1 and the other [Tauri build prerequisites](https://v2.tauri.app/start/prerequisites/#linux).
 
-## Getting started
+For model inference and downloads:
 
-### Install or build
+- A compatible **llama-server**. Download builds under **Runtime → llama.cpp**, or use your own. Native decision models need a runtime that supports their architecture and `/v1/systemone`; MTP and vision also require compatible runtime support. A memory-fit badge does not establish model/runtime compatibility.
+- The **Hugging Face CLI (`hf`)** on PATH, or configured under Runtime, for Hub downloads. Public ungated models do not need a login; gated models need access and authentication. Local GGUFs can be used without downloading them through the Hub.
 
-Tagged releases publish `.deb` and `.rpm` packages for 64-bit Linux, linked from [noullama.dev/download](https://noullama.dev/download/). Once installed from a package, Noullama can update itself; see [Updates](#updates).
-
-To build a standalone executable instead:
+To build release packages and a standalone executable:
 
 ```sh
-npm run desktop:build             # release
-npm run desktop:build -- --debug  # debug
+npm run desktop:build
+# Debug build:
+npm run desktop:build -- --debug
 ```
 
-- On Linux, the binaries are written to `src-tauri/target/release/noullama` and `src-tauri/target/debug/noullama`.
-- Standalone builds include the frontend and do not require a Vite server.
-- Development builds use a separate target directory.
-
-### Updates
-
-**Updates** in the sidebar shows the installed version and checks GitHub for a newer release. When one exists, the entry changes to **Update to** followed by the version.
-
-- **Install and restart** downloads the package for your install type (`.deb` or `.rpm`), verifies its signature, and asks for your password through the system prompt to install it. Noullama then unloads the model, stops the local API, and restarts.
-- **Check when noullama starts** checks once a few seconds after launch. Nothing is downloaded until you choose **Install and restart**.
-- **Include pre-releases** offers pre-release versions too. It starts on when the installed version is itself a pre-release.
-
-Only copies installed from the `.deb` or `.rpm` package can update themselves. A source build or standalone executable shows the newest version but must be updated by hand. Versions before 0.2.1 have no updater; install 0.2.1 or later from the package once.
-
-### First run
-
-1. Open **Hub**, search for a decision model or type a repository such as `LiquidAI/d1-2B-GGUF`, pick it, and download a GGUF. Already have a file? Open **Models** and browse for it instead.
-2. In **Runtime → llama.cpp**, choose an installed build, download one, or enter a custom `llama-server` path and click **Check** to list its devices. Under **Model**, set GPU layers (`0` for CPU inference) and, for image-capable models, turn on the multimodal projector.
-3. Click **Load model** in the model bar. The bar shows the selected model's state and device, with **Eject** to unload it. Select another model and click **Load beside** to run it next to the first. If loading fails, a red panel names the model and gives the reason.
-4. In **Playground**, pick the loaded model under **Run settings → Model**, choose a preset, edit the questions and state, and run a decision.
+Linux executables are written to `src-tauri/target/release/noullama` or `src-tauri/target/debug/noullama`. They include the frontend and do not need a Vite server. `npm run desktop` uses the separate `src-tauri/target/dev` directory. `npm run dev` alone is an interface preview without the Rust backend.
 
 ## Runtime
 
-### Finding llama.cpp
+### Finding and downloading llama.cpp
 
-The runtime path starts unset. Noullama searches managed installs, nearby builds, and `PATH`. In **Runtime → llama.cpp**, select a discovered build under **Installed builds** or enter one under **Custom path**.
+The runtime path starts unset. **Runtime → llama.cpp** discovers managed installs, the configured location, nearby builds and PATH. Choose **Use** beside an installed build or enter a folder/executable under **Custom path**. **Check** runs device detection.
 
-For GPU builds, set **Shared-library folders** if the runtime cannot find its libraries. On Linux, noullama also checks common CUDA 12 and 13 locations and passes the library paths to the runtime process.
+**Check official releases** previews the latest nightly and official stable release assets for the selected OS, architecture and backend. It reads metadata only. **Download nightly + fallback** downloads and verifies those archives, installs them under the app-data `runtimes/` directory, and selects the nightly for your next load. The stable build stays available to select manually. It uses the chosen backend when available, otherwise CPU, or Metal on macOS. Versioned upstream releases that link a separate binary build use that linked build. The chosen download backend is remembered.
 
-The runtime card at the bottom of the sidebar shows whether a model is ready and which llama.cpp build is selected. While a model is running, it shows the build in use and marks any different selection as not applied. Hover or focus it for the loaded model's device, projector, context size, GPU layers, API address, and graphics memory: the runtime's own use (NVIDIA) and the card's total use (NVIDIA and AMD), read only while the card is open.
+Archives are verified against GitHub's SHA-256 digests. Linux downloads use the official Ubuntu-built archives; a custom build may be needed for your system or model.
 
-### When loading fails
+For GPU builds, configure **Shared-library folders** if libraries cannot be found. On Linux, Noullama also checks common CUDA 12 and 13 locations and passes these paths to the child process. Set **GPU layers** to `0` for CPU inference.
 
-Loading runs in the background. If it fails, or the runtime stops on its own after loading, a red panel under the model bar gives the reason together with the last error lines llama.cpp printed during that load. **View logs** opens the full runtime output.
+### Loading and observing models
 
-### Downloading llama.cpp builds
+Each model loads in the background in its own `llama-server`. Select another and choose **Load beside** to keep both running, subject to available memory. Different models can use different runtime builds. A file can be loaded only once; **Reload model** ejects that file and loads it again with the current settings.
 
-**Runtime → llama.cpp** scans the configured location, nearby builds, PATH, and managed installs before offering a download.
+Changes to runtime path, context, GPU layers, projector or MTP apply to new loads. Already loaded models keep their original settings. **Playground → Run settings → Model** selects which loaded model answers a decision.
 
-1. Under **Download a build**, choose a backend and **Check official releases** to preview OS/architecture-matched assets from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/releases). Checking fetches metadata only.
-2. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the latest official stable release, both for the backend you picked (the stable fallback uses CPU, or Metal on macOS, only if that release has no build for your backend). When the download finishes, the nightly is selected as your runtime; the official build stays installed as a fallback you can switch to. The backend you pick is remembered.
-3. Select **Use** beside an installed runtime, then check or load it normally.
+The sidebar runtime card shows readiness and the selected build; a different selection from the running build is marked as not applied. Hover or focus the card for model settings and live graphics-memory use. NVIDIA provides per-process usage; NVIDIA and AMD provide card-wide usage where available. These readings are fetched only while the card is open. Each sidebar loaded-model row has its own **Eject**.
 
-Archives are checked against GitHub's SHA-256 digests and installed under the app-data `runtimes/` directory; existing custom paths are preserved. Linux uses the official Ubuntu-built archives; unsupported platforms can use a custom build.
+A failed load or a runtime that exits after becoming ready produces an error panel with its recent llama.cpp error lines. **View logs** opens the runtime output. Each model's log lines carry its own label.
 
-### Tray and lifecycle
+### Tray and shutdown
 
-On desktops with an active system tray, closing the window keeps the model and local API running. Use **Open Noullama** in the tray menu to restore the window.
+With an active system tray, closing the window keeps loaded models, downloads and the local API running. **Open Noullama** restores the window. **Quit Noullama** in the tray or sidebar asks for confirmation; **Keep running** or Escape cancels. Confirming stops the gateway, all owned runtimes and active downloads, and removes cancelled-download partial files.
 
-**Quit Noullama**, available in the tray menu and sidebar, opens a centered confirmation. Confirming shuts down the API, owned runtime, and active downloads and deletes partial files from cancelled downloads before exiting; **Keep running** or Escape cancels.
+Linux tray mode needs an AppIndicator library and a tray host. GNOME may need an AppIndicator extension. Without tray support, closing the window asks for confirmation before quitting.
 
-Linux tray mode needs an AppIndicator library and a desktop tray host. GNOME setups without tray support may need an AppIndicator extension. If the library or host is unavailable, closing the window asks for confirmation before quitting.
+On Linux, relaunching the same executable with the same app-data directory replaces its older instance. Startup also cleans up orphaned runtimes with Noullama's identity and app-data key-file markers. Other applications' processes and ports are left alone.
 
-Noullama releases its own ports on full exit; a port occupied by another service remains that service's responsibility.
+## Memory protection
 
-On Linux, relaunching the same executable with the same app-data directory shuts down its older instance before starting the API. Startup also cleans up orphaned llama-server processes carrying Noullama's runtime identity and app-data key-file markers. Processes belonging to other applications or app-data directories are left running.
+Protection is enabled by default. Before a load is accepted, and again before its runtime starts, Noullama checks for clear oversubscription using estimated model, companion-file, context and buffer requirements against available memory. Full GPU-offload checks use live VRAM readings when available; CPU-load checks use available RAM on Linux. Estimates include a substantial uncertainty margin: borderline estimates and uncertain partial-offload allocations are not treated as definite OOMs.
 
-## Models and presets
+If another model is loaded and the new load clearly exceeds the available budget, **“This probably won't fit”** offers **Cancel** or **Eject [model name]**. Choosing an eject target stops that model and rechecks before trying the load. With several other models, each is offered separately; ejecting one is not a promise the new load will fit.
+
+**Don't show this again** hides only this crowded-load message. It does **not** enable force fit and does **not** bypass load checks. Restore it with **Settings → Show crowded-load warning again**.
+
+### Automatic recovery on Linux
+
+High utilization alone never ejects a model: **7,000 MB used out of 8,000 MB is not an OOM condition**. Recovery requires all of the following:
+
+- Available RAM below the smaller of **1% of the memory budget** and **256 MiB**.
+- Full memory-pressure stalls of at least **5% over the recent 10-second window**.
+- At least **three consecutive one-second samples**, followed by a recheck before intervention.
+
+Linux cgroup v2 memory limits and pressure are included where readable. Missing telemetry never triggers ejection. Recovery selects an owned runtime using more than 128 MiB of resident RAM, preferring the largest measured user, and unloads one model. It records an explanation, waits five seconds, then requires fresh pressure evidence before another intervention. VRAM utilization by itself never triggers automatic recovery.
+
+**Settings → Allow force fit**, off by default, disables both pre-load prevention and automatic recovery immediately and is saved across restarts. It is independent of the prompt's suppression preference. The operating system or llama.cpp can still reject or stop a model that runs out of memory; protection cannot guarantee every allocation will succeed. Automatic pressure recovery currently requires Linux telemetry.
+
+## Models and Library
 
 ### Hub and downloads
 
-Hugging Face discovery uses decision-model tags and architecture metadata. Downloads use `hf download` at the inspected repository revision. noullama supports the standard Hugging Face token locations and `HF_TOKEN`; a token entered in the app is held for the session and passed to `hf` through its environment.
+**Hub** discovers decision-model repositories using tags and architecture metadata. Search results show repositories on the left and the selected repository's GGUFs on the right. Entering `organization/repository` offers to open it directly.
 
-Author logos are fetched from each author's public Hugging Face profile the first time they appear in the Hub or a downloaded model, then cached for the session. Images are filtered at the display's pixel density for sharper small icons; authors without a profile image show their initials. No author artwork is bundled with the app.
+Downloads use `hf download` at the inspected repository revision. Saved Hugging Face credentials and `HF_TOKEN` are supported; a token entered in the app is held only for the session and passed to `hf` through its environment.
 
-Search results appear on the left and the picked repository's files on the right. Typing `organization/repository` offers to open that repository directly.
+Several files can download concurrently. Each has a progress panel and **Cancel download**; network progress fills from one side and file reconstruction from the other. Xet compression and deduplication can make those values differ. Cancelled partial files remain available for an immediate resume and are removed on full quit. The floating **Downloads** card provides cancellation, completion dismissal and repository navigation while you use other tabs.
 
-Hub search results show a local memory-fit estimate when a repository lists GGUF file sizes:
+Memory-fit badges use file sizes and the selected context/GPU-layer settings. Search cards estimate the smallest model GGUF; repository inspection estimates each weight file separately. Projectors and MTP heads are excluded as standalone models; missing metadata shows **Fit unavailable**. The selected local model's fit also accounts for estimated memory held by other loaded models. These are estimates, not compatibility or allocation guarantees.
 
-- Search cards use the smallest non-projector GGUF.
-- Inspecting a repository shows a separate estimate beside each model weight file before downloading.
-- Projector files are excluded, and missing metadata is shown as “Fit unavailable”.
-- Estimates use the current context-size and GPU-layer settings; they are a rough guide, not a guarantee.
+Author avatars come from public Hugging Face profiles and are cached for the session; missing images fall back to initials. No author artwork is bundled.
 
-### Local models
+### Local files and download directory
 
-**Models** lists the GGUF models on this machine; **Hub** is where you find and download more. Multimodal projector (`mmproj`) files are not listed as models: a model with a projector in its folder is marked **Vision available**. Set an absolute **Model download directory** in **Models** to choose where new downloads go. Changing it does not move existing files. The library scans the current download directory and the original app-data models directory.
+**Models** lists local GGUFs. Projectors and MTP heads are companions, not standalone models. **Vision available**, **MTP available** and **Winnow layout** identify detected capabilities.
 
-The download panel shows one progress bar filled from both ends: network bytes received fill from the left and file reconstruction fills from the right, meeting in the middle when the file is done. Xet compression and deduplication can make the two values differ. Several files can download at once, such as a model and its projector; each file has its own panel and its own **Cancel download**. Partial files are kept so an immediate retry resumes, and are deleted when you quit Noullama. While you are elsewhere in the app, a **Downloads** card in the bottom-right corner lists every download with its progress; it can cancel one, dismiss a finished one, or open its repository.
-
-The **Models** list rescans the download directories every few seconds, so files added or removed outside the app show up without a refresh.
+Set an absolute **Model download directory** under Models to choose where new downloads go. This does not move existing files. Scans include that directory and the original app-data models directory; the Models tab rescans every few seconds. Use **Browse file** or **Library → Add model** for files elsewhere.
 
 ### Library and models.yml
 
-`models.yml` in the app-data directory lists every model Noullama knows: one entry per GGUF file, holding the model's **name**, its **aliases**, its **path**, the Hugging Face **account** its avatar comes from (such as `LiquidAI`), its **sha256**, and the **MTP head** (`mtp`) and **projector** (`mmproj`) that go with it, each with its own sha256. Every model found on this machine or downloaded gets an entry automatically, named after its file; projector (`mmproj`) files and MTP heads do not get one.
+The app-data `models.yml` holds one entry per model: its API **name**, **aliases**, file **path**, Hugging Face **account**, **sha256**, and optional **MTP head** and **projector**, each with its own sha256. Discovered models are registered automatically. Companion files do not get separate model entries.
 
 ```yaml
 version: 1
@@ -176,107 +170,96 @@ models:
   - triage
   path: /home/u/models/LiquidAI--d1-3B-GGUF/d1-3B-Q8_0.gguf
   account: LiquidAI
-  sha256: 3b5f…
+  sha256: ''
   mtp: /home/u/models/LiquidAI--d1-3B-GGUF/mtp-d1-3B.gguf
-  mtp_sha256: 9c01…
+  mtp_sha256: ''
   mmproj: ''
   mmproj_sha256: ''
 ```
 
-- `mtp` and `mmproj` name the head and projector used when you turn on **MTP** or **Vision** for this model. **Empty means Noullama looks in the model's folder**, as it always has. New entries record what the folder holds; a head or projector downloaded later into a model's folder is recorded for that model if its field is empty. A head must still fit the model; a listed file that no longer exists stops the load with a message pointing to Library.
+- **Library** edits names, aliases, paths, accounts, companions and hashes. Account/path suggestions are drawn inside the app. Changes stay in a draft until **Save models.yml**.
+- Empty `mtp` or `mmproj` fields allow folder discovery. New entries record detected companions, and later discoveries can fill an empty field. A listed missing companion stops a load that uses it. MTP heads must still match the model.
+- **Edit models.yml** opens your default editor. Noullama rereads outside changes during snapshots and relevant model/API operations. Renaming the API name never renames the file; moving a file requires updating its path.
+- Backups go to `backups/models`; the newest 20 are kept. App edits are backed up except automatic hash recording, and outside changes preserve the previous valid version. **Backups** opens the folder.
+- Invalid YAML, duplicate names and relative paths are rejected without overwriting the file. The last valid library remains active until corrected. Saving a draft based on an older on-disk revision is refused; discard it and edit the newer version.
 
-- **Library** edits each entry with text fields, alias chips, a file browser and an account picker. **Add model** adds a file from anywhere on disk. Changes are kept as a draft until **Save models.yml**.
-- **Edit models.yml** opens the file in your default editor. Noullama rereads it whenever it changes: on every snapshot and API request, and before loading, ejecting, finishing a download, scanning for models and changing Keep context.
-- Renaming a model changes only its API name; the file stays where it is. Renaming or moving the *file* does not update models.yml: the entry is marked **File missing** until you fix its path or remove it.
-- Noullama backs up models.yml to `backups/models` before every change it makes (other than recording a sha256), and backs up the previous version when it notices an outside edit. The newest 20 copies are kept; **Backups** opens the folder.
-- A file with an error (bad YAML, a duplicate name, a relative path) is never overwritten. Noullama shows the error in **Library** and keeps using the last valid version until the file is fixed or saved from **Library**.
-- If models.yml changes on disk while you have unsaved edits in **Library**, saving is refused so you do not overwrite the newer file; discard and edit again.
+### Model-file verification
 
-**Settings → sha256 before loading** chooses how the recorded sha256 is used:
+**Settings → sha256 before loading** controls checks for the model and the listed companions used by a load:
 
-| Mode | What happens |
-|---|---|
-| **Hash once** (default) | Each file is hashed once in the background. Before a load, the sha256 is read again only if the file's size or modified time changed. A mismatch stops the load. |
-| **Every load** | The whole file is hashed before every load; slower for large models. |
-| **Warn only** | As **Hash once**, but a mismatch only adds a warning to the log. |
-| **Off** | No hashing; recorded values are kept but not checked. |
+| Mode | Behavior |
+| --- | --- |
+| **Hash once** (default) | Hash missing values in the background; before loading, hash again if size or modification time changed. A mismatch stops the load. |
+| **Every load** | Read and hash the complete file before each load. |
+| **Warn only** | Use the Hash once policy, but log mismatches instead of blocking. |
+| **Off** | Keep recorded hashes without computing or checking them. |
 
-The model, its listed MTP head and its listed projector are each checked when a load uses them; a head or projector found by looking in the folder has no recorded sum and is not checked. After a mismatch, **Library** marks the entry **sha256 changed**; **Accept new sha256** records the new value if you replaced the file on purpose. The check catches a wrong, truncated or replaced file; it is not a security boundary. Computed hashes are cached in `sha256-cache.json` by size and modified time.
+Library shows missing files, hashing progress and **sha256 changed**. If you intentionally replaced a file, **Accept new sha256** records its new value. Hash writes do not overwrite a newer companion selection. Size/modification-time caching uses `sha256-cache.json`. An unrecorded folder-discovered companion has no saved hash to compare. These checks help detect replaced, truncated or incorrect files; they are not a security boundary.
 
-### Questions and presets
+## Playground
 
-Questions use the `choice`, `noul`, and `score` types. The JSON editors provide syntax highlighting and inline lint diagnostics. The state editor accepts text or JSON; switching modes converts the representation while preserving the content.
+Choose a loaded model under **Run settings → Model**, then edit State and Questions. Supported question types are:
 
-Presets are in the **Run settings** panel beside the state. Enter a name under the questions editor and choose **Save preset** to save the questions, state, and state format across restarts. Select a saved preset to update it, or use the × on it to delete it. Built-in presets are starting points; calibrate decision thresholds and criteria against your own data.
+- **`choice`**: select an option.
+- **`noul`**: answer yes/no with a probability.
+- **`score`**: evaluate an ordered set of levels.
+
+State accepts text or JSON. Switching representations preserves the content; JSON editors provide syntax highlighting and inline diagnostics. Named custom presets save questions, state and state format across restarts. Select one to update it, or use its × button to delete it after confirmation. Built-in presets are starting points; calibrate criteria and thresholds against your own data.
+
+Actions show pending state on the relevant controls. Background polling preserves unchanged state and unsaved edits. Notifications appear over the page rather than moving the content.
+
+### Keep context
+
+Enable **Keep context** in Run settings or **Local API** to include earlier decision states and short answers. A text state gets a preceding text block; a JSON state becomes `{"earlier_decisions": [...], "current_state": ...}`. The shared switch applies to both entry points, but each loaded model has its own history.
+
+If a request exceeds its context window, the oldest decisions are flushed one at a time until it fits. Up to 64 are kept, and images are not carried forward. Turning the switch off clears all histories. **Clear** in Playground clears the selected model's history; in Local API it clears every model's. Ejecting or reloading clears that model's history. Histories do not survive restarts.
 
 ## Images
 
-Image input needs a model that supports it and its multimodal projector.
+Image input requires a model that supports images and its matching multimodal projector. Set `mmproj` in Library, choose a projector under **Runtime → Model**, or put a file containing `mmproj` in its name beside the model for discovery.
 
-1. Put the projector `.gguf` (its name contains `mmproj`) in the same folder as the model. The Hub lists projectors next to the weights.
-2. Turn on **Vision** in the model bar, or the projector switch in **Runtime → Model**, and load the model. Selecting a model from another folder turns the projector off.
-3. In **Playground**, add images with **Add images**, by dropping files on the **State** box, or by pasting. The state text can be left empty to ask about the images alone.
+Enable **Vision**, then load or reload the model. Add images with **Add images**, drag and drop onto State, or paste them. The text state can be empty. Switching model folders can clear the previous projector selection; verify the selection before loading.
 
-Images are sent as base64 data URLs in the request's `images` field. PNG, JPEG, GIF, and BMP are sent unchanged; other formats the app can display, such as WebP, are converted to PNG first. Each image can be up to 20 MB and all images together up to 60 MB.
+Images are sent as base64 data URLs in `images`. PNG, JPEG, GIF and BMP are sent unchanged; other browser-readable formats, such as WebP, are converted to PNG. The app allows 20 MB per image and 60 MB combined. The gateway separately caps the entire JSON request at **16 MiB**, including base64 overhead, so requests through it may need smaller images.
 
 ## Multi-token prediction
 
-Some models can predict several tokens per step with multi-token prediction (MTP) layers. llama.cpp uses them for speculative decoding, which can speed up generation without changing the result.
+MTP can speed up models that predict several tokens per step. Noullama detects built-in MTP layers in GGUF metadata or a separate head whose metadata identifies it as MTP-only and whose width matches the model. A head can be listed in Library, chosen under Runtime or discovered in the model's folder. It is not a standalone model. Before download, the Hub labels possible heads by filename.
 
-An MTP model comes in one of two forms:
-
-- **Built-in layers.** The MTP layers are inside the model GGUF. Noullama reads the file's metadata to find them.
-- **A separate head.** A small GGUF made only of MTP layers (for example `winnow-mtp.gguf`) sits in the same folder as the model. Noullama recognizes it from its metadata, whatever its name, and only pairs it with a model whose width it matches. Heads are not listed as models. Before download, the Hub can only go by the name, so it labels files with `mtp` in the name as **MTP head**.
-
-When either is found, the model bar shows an **MTP** switch, and **Models** marks the model **MTP available**. Turn it on, or use the switch in **Runtime → Model**, then load the model. Selecting a different model turns MTP off, because a head only fits the model it was made for.
-
-With MTP on, Noullama starts llama-server with `--spec-type draft-mtp`. A separate head is also passed with `--spec-draft-model`, using the same GPU-layer setting as the model. This needs a llama.cpp build with MTP support; an older build fails to load and the error panel shows why.
-
-Decision results are short, so MTP mostly helps models and requests that generate more than a few tokens.
+Enable **MTP** in the model bar or Runtime, then load/reload. Selecting a different model turns it off. The runtime receives `--spec-type draft-mtp` and, for a separate head, `--spec-draft-model` with the same GPU-layer setting. A compatible llama.cpp build is required; unsupported models or mismatched heads fail with an explanation. Decision outputs are short, so the benefit depends on the model and request.
 
 ## Winnow models
 
-A native decision model records its decision type in its GGUF metadata, and llama.cpp then answers `/v1/systemone` itself. Winnow GGUFs (EldanRing's Winnow-E2B, -E4B and -12B) have no such entry. They are Gemma 4 models trained to answer with an option's letter, so Noullama reads them another way:
+Native decision models advertise decision metadata that a compatible llama.cpp serves at `/v1/systemone`. Winnow GGUFs use a separate path: Noullama implements the `winnow-v1` layout, builds one prompt per question, reads the next-token probabilities for letter-labelled options, and converts those into the usual decision response.
 
-1. It builds Winnow's own prompt for each question: the state, the question, and the options labelled `A`, `B`, `C`, ….
-2. It asks llama-server for the probability of each option's label as the next token.
-3. It turns those into the usual answers: `noul` is the probability of true; `choice` and `score` get per-option probabilities and a confidence.
+Automatic detection recognizes Gemma 4 models whose name or filename contains `winnow`. For a differently named Winnow model, choose **Runtime → Model → Decision mode → Winnow**. **Native** requires native decision support; **Auto** chooses from metadata. The layout follows [Ollaya](https://github.com/ollaya-dev/ollaya), including Winnow-E4B's fitted temperature of 1.2574; requests can override it with `"winnow": {"temperature": ...}`. Each question uses a fresh evaluation rather than reusing the preceding prompt cache.
 
-This follows the `winnow-v1` layout as specified by [Ollaya](https://github.com/ollaya-dev/ollaya), including Winnow-E4B's fitted temperature (1.2574). A request can override it with `"winnow": {"temperature": …}`. Each question is evaluated from scratch, so the same request always gives the same numbers. Responses have the same shape as native ones, so the Playground and both API routes work unchanged.
-
-**Models** marks these files **Winnow layout**, and files Noullama cannot read as decision models **Not a decision model**. Detection uses the file's metadata: a Gemma 4 model whose name or file name contains "winnow". For a Winnow model under another name, set **Runtime → Model → Decision mode** to **Winnow**. **Native** requires native support, and **Auto** (the default) picks for you.
-
-Images are not supported in the Winnow layout yet.
+The Playground and gateway expose the same response shape for either path. Images are not supported by the Winnow layout.
 
 ## Local API
 
 ### Ports and access
 
-While the app is open, the gateway prefers `http://127.0.0.1:11435` by default. If that port is occupied, Noullama binds a nearby free port, skips the private runtime port, and saves the replacement as its preferred port for future launches. The actual endpoint appears in **Local API** and a one-time notice when it changes. Copy that endpoint into your client; the examples below assume the default port.
+The gateway prefers `http://127.0.0.1:11435`. If occupied, it finds a nearby free port, skips the configured private runtime port, saves the replacement and shows the actual endpoint in **Local API**. Copy that endpoint into your client; the examples below assume the default.
 
-The managed llama-server uses port `11436`. Both bind to localhost; changing the preferred gateway port takes effect after restarting the app.
+Every model has its own private localhost port: the first available port in the 64-port range starting at **Private llama-server port**, default `11436`, excluding occupied ports and the active gateway. Gateway port changes take effect after restart.
 
-Local SDK and curl clients use the gateway without an API key. The gateway accepts requests addressed to `127.0.0.1` or `localhost` on its active port and rejects foreign browser origins. The private llama-server uses a temporary key generated for each model load; connect integrations to the gateway rather than the private port.
+Local SDK/curl clients need no gateway API key. Requests must address `127.0.0.1` or `localhost` on the active port; foreign browser origins are rejected. Private runtimes use temporary per-load keys. Integrations should use the gateway.
 
-### Several models and routing
+### Model names and routing
 
-Any number of models can be loaded at once, each in its own `llama-server` on its own private port: the first free port at or above **Private llama-server port**. **Models → Loaded** lists them with their device, context and an **Eject** button that unloads only that model. A file can be loaded once; **Reload model** in the model bar ejects it and loads it again with the current settings. Runtime settings can be changed and saved while models are loaded; they apply to the next load, and loaded models keep the settings they started with. The fit badge counts the memory the other loaded models are estimated to hold.
+Every decision request must include a case-sensitive `model`: the name in models.yml, any alias, or the filename stem for a loaded file without a library entry. Rename names in Library and edit aliases there, in Models or in **Local API → Model routing**. Names/aliases allow letters, digits and `. _ : / -`, up to 64 characters, with up to 16 aliases per model. Library names must be unique ignoring case.
 
-Every local API request must name its model in the `model` field, exactly as written; names are case-sensitive:
+| Condition | Response |
+| --- | --- |
+| Missing `model` | **400**, with accepted names. |
+| Unknown name | **404**; case-only differences suggest the known spelling. |
+| Known model unloaded or still loading | **503**. |
+| Ambiguous name shared by loaded files | **409**. |
 
-- A model's **name** in models.yml (by default its file name without `.gguf`, for example `d1-3B-Q8_0`). Rename it in **Library**.
-- Any of its **aliases**. Add them in **Library**, with the tag button on a row in **Models** or in the **Loaded** list, or under **Local API → Model routing**.
-- A loaded file with no models.yml entry answers to its file name without `.gguf`.
+`GET /v1/models` lists names reaching ready models. Responses echo the requested name or alias. Each model serializes its own decisions; different models have independent runtime processes. The Playground selects a loaded instance directly.
 
-A request with no `model` returns 400 listing the accepted names. An unknown name returns 404; if it differs from a known name only by case, the message suggests the right one. A name or alias whose model is not loaded, or is still loading, returns 503. Names and aliases are unique across models.yml, ignoring case, so a request reaches exactly one model; a name shared by two loaded files without entries returns 409. `/v1/models` lists every name that reaches a ready model, and responses echo the name the request used. Names and aliases use letters, digits and `. _ : / -`, up to 64 characters, with up to 16 aliases per model; no two may differ only by case. The Playground picks its model from **Run settings → Model** and needs no name.
-
-### Keep context
-
-With **Keep context** on, each decision's state is sent with the earlier decisions before it: their states and short answers (`billing`, `yes (0.82)`, `0.73`). A text state gets a text block above it; a JSON state becomes `{"earlier_decisions": [...], "current_state": ...}`. The switch is shared by the Playground and the Local API page. Each loaded model keeps its own history, which the Playground and every local API request that reaches that model read and add to.
-
-When a request no longer fits the context window, the oldest decisions are flushed, one at a time, until it does. The panel shows how many decisions are kept and how many the last run flushed. Turning it off empties every history; **Clear** in the Playground empties the chosen model's, and in **Local API** every model's. Ejecting or reloading a model empties its own. At most 64 decisions are kept; images are not carried forward.
-
-### Native System One request
+### System One request
 
 ```sh
 curl http://127.0.0.1:11435/v1/systemone \
@@ -297,56 +280,67 @@ curl http://127.0.0.1:11435/v1/systemone \
 
 ### OpenAI-compatible adapter
 
-The gateway also exposes `/v1/models`, `/v1/chat/completions`, and `/health`. The OpenAI adapter expects one user message containing a JSON object with `state` and `questions`; the assistant message contains the native decision result as JSON.
+`POST /v1/chat/completions` accepts one user message containing a JSON object with `state` and `questions`. The assistant message contains the decision response as JSON. This adapter does not provide arbitrary chat, message history, tools or streaming. `GET /health` reports gateway/model readiness.
 
 ```python
 import json
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:11435/v1", api_key="local")
-request = {
-    "state": "I was charged twice. Please refund the duplicate payment.",
-    "questions": {
-        "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}
-    },
-}
 response = client.chat.completions.create(
-    model="d1-3B-Q8_0",  # a loaded model's name or alias from Library, exact case
-    messages=[{"role": "user", "content": json.dumps(request)}],
+    model="d1-3B-Q8_0",  # exact name or alias from Library
+    messages=[{"role": "user", "content": json.dumps({
+        "state": "I was charged twice. Please refund the duplicate payment.",
+        "questions": {
+            "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"}
+        },
+    })}],
     stream=False,
 )
 print(json.loads(response.choices[0].message.content)["answers"])
 ```
 
-The adapter does not support chat history, tools, streaming, or arbitrary chat prompts. Multi-select, extraction, estimates, boxes, and video are not supported by this integration. Native clients can send images to `/v1/systemone` as an `images` array of `data:image/...;base64,...` URLs when the model is loaded with its projector. Requests through the gateway are limited to 16 MB.
+Native clients can supply an `images` array of `data:image/...;base64,...` URLs to `/v1/systemone` when the selected model has a projector. Gateway request bodies are limited to 16 MiB. Multi-select, extraction, estimates, boxes and video are not supported by this integration.
+
+## Updates
+
+**Updates** in the sidebar shows the installed version and checks GitHub. A newer eligible release changes the entry to **Update to [version]**.
+
+- **Install and restart** downloads the matching `.deb` or `.rpm`, verifies its signature, asks for system installation authorization, then stops owned runtimes and the local API and restarts after installation.
+- **Check when noullama starts** checks a few seconds after launch. It does not automatically download an update.
+- **Include pre-releases** also offers prereleases; prerelease builds enable this preference by default.
+
+Only package-installed copies can update themselves. Source/standalone builds show available updates but must be updated manually. Versions before 0.2.1 need a one-time package installation of a newer version to gain the updater.
 
 ## Data and verification
 
-Settings, `models.yml` and its backups, saved presets, and downloads use the platform app-data directory (`~/.local/share/dev.noullama.desktop` on a typical Linux desktop). Existing GGUFs are used in place.
+Settings, models.yml, backups, hash caches, saved presets, managed runtimes and default downloads live under the platform app-data directory: typically `~/.local/share/dev.noullama.desktop` on Linux. External GGUFs remain in place; a custom download directory affects new downloads only.
 
 ```sh
-npm run build
 npm test
-cargo test --manifest-path src-tauri/Cargo.toml
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 ```
 
-An optional real-model integration test can be run with `NOULLAMA_TEST_MODEL` and `NOULLAMA_TEST_RUNTIME` set to absolute paths. Set `NOULLAMA_TEST_GPU_LAYERS=99` to test GPU offloading:
+The Rust tests include localhost mock servers; serial execution avoids test-port conflicts. Real-model tests are opt-in. Set absolute `NOULLAMA_TEST_MODEL` and `NOULLAMA_TEST_RUNTIME` paths, and optionally `NOULLAMA_TEST_GPU_LAYERS=99`, then:
 
 ```sh
 cargo test --manifest-path src-tauri/Cargo.toml \
   real_runtime_native_and_openai_requests -- --ignored --nocapture
 ```
 
-`real_runtime_flushes_oldest_decisions_at_the_context_limit` runs Keep context on the CPU at a 512-token context with the same variables. `real_runtime_two_models_route_by_alias_and_eject_one` also needs `NOULLAMA_TEST_MODEL_2`, a different GGUF (`NOULLAMA_TEST_GPU_LAYERS_2` sets its GPU layers): it loads both at once, routes a request to each by alias, ejects the first and checks the second still answers.
+`real_runtime_flushes_oldest_decisions_at_the_context_limit` checks Keep context on CPU with a 512-token context. `real_runtime_two_models_route_by_alias_and_eject_one` also needs a different `NOULLAMA_TEST_MODEL_2`; `NOULLAMA_TEST_GPU_LAYERS_2` configures it. It loads both, routes by alias, ejects one and checks the other still answers.
 
 ## Current limits
 
-Noullama is in early beta. Known limits:
+Noullama is in early beta:
 
-- One runtime installation at a time. Each loaded model runs one request at a time.
-- No bundled runtime; use **Runtime → llama.cpp** to download one or point to your own `llama-server`.
-- Models without native decision support load only if they are Winnow GGUFs, and then without image input.
-- No automatic playground history. Only named custom presets are saved, and Keep context lasts until its model is ejected.
-- Linux packages only (64-bit `.deb` and `.rpm`). There are no macOS or Windows builds yet.
+- Published packages target **Linux x86-64** (`.deb` and `.rpm`); no published macOS or Windows app builds yet.
+- No bundled llama.cpp runtime. Download one in Runtime or provide a compatible build.
+- Model/runtime compatibility is independent of memory fit. Unrecognized non-native models are supported only through the Winnow layout, without images.
+- Memory estimates are approximate; automatic pressure recovery currently uses Linux telemetry and cannot prevent every OOM.
+- Each loaded model handles one decision request at a time. Running several models is limited by your hardware and the available private-port range.
+- Only named presets persist Playground input. Keep context is temporary, per model, and does not preserve images.
+- The OpenAI-compatible endpoint is a decision adapter, not a general chat API.
 
-Found a bug or missing something? [Open an issue](https://github.com/parasite6/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/parasite6/noullama/issues/new?template=feature_request.md).
+[Report a bug](https://github.com/parasite6/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/parasite6/noullama/issues/new?template=feature_request.md).
