@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Select } from './Select';
 import { CopyButton } from './CopyButton';
@@ -10,13 +10,22 @@ type Asset = { name: string; size: number };
 type Build = { release: string; tag: string; backend: string; assets: Asset[] };
 type Plan = { id: string; platform: string; nightly: Build; fallback: Build; total_bytes: number };
 export type RuntimeDownload = { active: boolean; message: string; downloaded: number; total: number; error: string | null; installed: LocalRuntime[] };
+// The backend picked for downloads is remembered on this machine.
+const BACKEND_KEY = 'noullama.runtimeBackend';
+const savedBackend = () => { try { return localStorage.getItem(BACKEND_KEY); } catch { return null; } };
+const saveBackend = (value: string) => { try { localStorage.setItem(BACKEND_KEY, value); } catch { /* not kept; the default is used next time */ } };
 const backendNames: Record<string, string> = { cpu: 'CPU', metal: 'Metal', vulkan: 'Vulkan', cuda12: 'NVIDIA CUDA 12', cuda13: 'NVIDIA CUDA 13' };
 const size = (bytes: number) => `${(bytes / 1e6).toFixed(1)} MB`;
 
 export function RuntimeManager({ currentPath, running, progress, onSelect, onRefresh, children }: { currentPath: string; running: boolean; progress?: RuntimeDownload; onSelect: (runtime: LocalRuntime) => void; onRefresh: () => Promise<void>; children?: React.ReactNode }) {
   const desktop = isTauri();
   const [scan, setScan] = useState<Scan | null>(null);
-  const [backend, setBackend] = useState('cpu');
+  const [backend, setBackendState] = useState(() => savedBackend() ?? 'cpu');
+  const setBackend = (value: string | ((current: string) => string)) => setBackendState(current => {
+    const next = typeof value === 'function' ? value(current) : value;
+    if (next !== current) saveBackend(next);
+    return next;
+  });
   const [plan, setPlan] = useState<Plan | null>(null);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -25,11 +34,17 @@ export function RuntimeManager({ currentPath, running, progress, onSelect, onRef
     setPending('scan'); setError(null);
     try {
       const next = await invoke<Scan>('discover_runtimes'); setScan(next);
-      setBackend(current => next.backends.includes(current) ? current : next.backends[0]);
+      setBackendState(current => next.backends.includes(current) ? current : next.backends[0]);
     } catch (error) { setError(String(error)); } finally { setPending(null); }
   }
   useEffect(() => { if (desktop) void discover(); }, []);
   useEffect(() => { if (desktop && progress?.installed.length && !progress.active) void discover(); }, [progress?.installed.length, progress?.active]);
+  // When a download finishes, select the nightly (installed first); the official build stays as the fallback.
+  const wasActive = useRef(false);
+  useEffect(() => {
+    if (wasActive.current && progress && !progress.active && !progress.error && progress.installed.length) onSelect(progress.installed[0]);
+    wasActive.current = !!progress?.active;
+  }, [progress?.active]);
   async function checkReleases() {
     setPending('releases'); setError(null); setPlan(null);
     try { setPlan(await invoke<Plan>('runtime_releases', { backend })); }
@@ -54,9 +69,9 @@ export function RuntimeManager({ currentPath, running, progress, onSelect, onRef
       {scan?.warnings.map(warning => <p className="hint" key={warning}>{warning}</p>)}
       {running && <p className="hint">Loaded models keep the build they started with. A new choice applies to the next model you load.</p>}
       <div className="subsection"><h3>Custom path</h3>{children}</div>
-      <div className="subsection"><h3>Download a build</h3><p className="hint">Downloads the newest nightly for the backend you pick, plus an official CPU build as a fallback. Checking only reads release details from GitHub.</p></div>
+      <div className="subsection"><h3>Download a build</h3><p className="hint">Downloads the newest nightly for the backend you pick, which becomes your runtime, plus the latest official stable release for the same backend as a fallback. Checking only reads release details from GitHub.</p></div>
       <div className="runtime-release-controls field"><span>Nightly backend</span><div className="file-input-row"><Select label="Nightly runtime backend" value={backend} disabled={!!pending || progress?.active} onChange={value => { setBackend(value); setPlan(null); }} options={(scan?.backends ?? ['cpu']).map(backend => ({ value: backend, label: backendNames[backend] ?? backend }))}/><button className="secondary" disabled={!desktop || !scan || !!pending || progress?.active} onClick={() => void checkReleases()}><RefreshCw size={14} className={pending === 'releases' ? 'spin' : ''}/>{pending === 'releases' ? 'Checking GitHub…' : 'Check official releases'}</button></div></div>
-      {plan && <div className="runtime-download-plan">{[['Nightly', plan.nightly], ['Official fallback', plan.fallback]].map(([label, value]) => { const build = value as Build; return <div className="runtime-plan-build" key={String(label)}><strong>{String(label)} <span className="pill">{build.release} / {build.tag} / {backendNames[build.backend]}</span></strong>{build.assets.map(asset => <div className="runtime-asset" key={asset.name}><code>{asset.name}</code><span>{size(asset.size)}</span></div>)}</div>; })}<div className="runtime-download-confirm"><span className="hint">{size(plan.total_bytes)} in total. Checked against SHA-256 and extracted locally.</span><button className="primary compact" disabled={!!pending || progress?.active} onClick={() => void download()}><ArrowDownToLine size={14}/>Download nightly + fallback</button></div></div>}
+      {plan && <div className="runtime-download-plan">{[['Nightly (default)', plan.nightly], ['Official stable (fallback)', plan.fallback]].map(([label, value]) => { const build = value as Build; return <div className="runtime-plan-build" key={String(label)}><strong>{String(label)} <span className="pill">{build.release} / {build.tag} / {backendNames[build.backend]}</span></strong>{build.assets.map(asset => <div className="runtime-asset" key={asset.name}><code>{asset.name}</code><span>{size(asset.size)}</span></div>)}</div>; })}<div className="runtime-download-confirm"><span className="hint">{size(plan.total_bytes)} in total. Checked against SHA-256 and extracted locally.</span><button className="primary compact" disabled={!!pending || progress?.active} onClick={() => void download()}><ArrowDownToLine size={14}/>Download nightly + fallback</button></div></div>}
       {progress?.message && <div className="runtime-install-status" role="status"><p>{progress.message}</p>{progress.active && <><div className="download-track" role="progressbar" aria-label="Runtime download progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.total ? Math.min(100, Math.round(progress.downloaded / progress.total * 100)) : undefined}><i style={{ width: `${progress.total ? Math.min(100, progress.downloaded / progress.total * 100) : 0}%` }}/></div><small>{size(progress.downloaded)} / {size(progress.total)}</small></>}</div>}
       {message && <div className="notice error" role="alert"><span>{message}</span><button aria-label="Dismiss runtime error" onClick={() => { setError(null); setDismissedError(progress?.error ?? null); }}><X size={16}/></button></div>}
     </div>

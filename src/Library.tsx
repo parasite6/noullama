@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { AlertCircle, ArchiveRestore, FileCog, FolderOpen, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { CopyButton } from './CopyButton';
+import { ComboInput } from './Select';
 
 // One entry of models.yml, as the editor holds it.
 export type LibraryEntry = { name: string; aliases: string[]; path: string; account: string; sha256: string; mtp: string; mtp_sha256: string; mmproj: string; mmproj_sha256: string };
@@ -69,7 +70,8 @@ export function Library({ library, loadedPaths, companions, desktop, onSave, onR
     setDraft(library.entries.map(strip)); setBase({ revision: library.revision, entries: library.entries.map(strip) });
   }, [latest, library?.revision, dirty]);
   const stale = !!library && !!base && dirty && base.revision !== library.revision;
-  const accounts = [...new Set([...draft.map(e => e.account), ...draft.map(e => authorFromPath(e.path) ?? '')].filter(Boolean))].sort();
+  // Suggestions come from the saved file, so a half-typed value is never offered back.
+  const accounts = [...new Set([...rows.map(e => e.account), ...draft.map(e => authorFromPath(e.path) ?? '')].filter(Boolean))].sort();
   const edit = (index: number, change: Partial<LibraryEntry>) => setDraft(entries => entries.map((e, i) => i === index ? { ...e, ...change } : e));
   async function run(name: string, task: () => Promise<void>) {
     setPending(name);
@@ -137,7 +139,7 @@ export function Library({ library, loadedPaths, companions, desktop, onSave, onR
         <div className="library-fields">
           <label>Aliases<AliasInput label={`Aliases of ${entry.name}`} aliases={entry.aliases} onChange={aliases => edit(index, { aliases })}/></label>
           <label>File<div className="file-input-row"><input aria-label={`Path of ${entry.name}`} value={entry.path} onChange={e => edit(index, { path: e.target.value })}/><button type="button" className="secondary" disabled={!desktop} onClick={() => void run('browse', async () => { const path = await onBrowse(); if (path) edit(index, { path, account: entry.account || authorFromPath(path) || '' }); })}><FolderOpen size={14}/>Browse</button></div></label>
-          <label>Hugging Face account<input list="library-accounts" aria-label={`Account of ${entry.name}`} placeholder={authorFromPath(entry.path) ?? 'For the avatar, such as LiquidAI'} value={entry.account} maxLength={96} onChange={e => edit(index, { account: e.target.value })}/></label>
+          <label>Hugging Face account<ComboInput label={`Account of ${entry.name}`} options={accounts} placeholder={authorFromPath(entry.path) ?? 'For the avatar, such as LiquidAI'} value={entry.account} maxLength={96} onChange={account => edit(index, { account })}/></label>
           <div className="library-sha"><span className="field-label">sha256</span>
             <ShaRow label={entry.name} sum={entry.sha256} status={row?.status.model} canRecord={!!row && !row.status.model.missing} blocked={!desktop ? 'Needs the desktop app' : dirty ? 'Save or discard your changes first' : null} pending={pending === `sha:${index}:model`} onRecord={() => void run(`sha:${index}:model`, () => onRecordSha(entry.path, 'model'))} onClear={() => edit(index, { sha256: '' })} onError={onError}/>
           </div>
@@ -146,16 +148,14 @@ export function Library({ library, loadedPaths, companions, desktop, onSave, onR
             const options = companions.filter(c => c.kind === slot).sort((a, b) => Number(folderOf(b.path) === folderOf(entry.path)) - Number(folderOf(a.path) === folderOf(entry.path)));
             const title = slot === 'mtp' ? 'MTP head' : 'Projector (mmproj)';
             return <div className="library-companion" key={slot}>
-              <label>{title}<div className="file-input-row"><input list={`library-${slot}`} aria-label={`${title} of ${entry.name}`} placeholder="Empty: look in the model's folder" value={entry[slot]} onChange={e => edit(index, { [slot]: e.target.value })}/><button type="button" className="secondary" disabled={!desktop} onClick={() => void run('browse', async () => { const path = await onBrowse(); if (path) edit(index, { [slot]: path }); })}><FolderOpen size={14}/>Browse</button></div></label>
+              <label>{title}<div className="file-input-row"><ComboInput label={`${title} of ${entry.name}`} options={options.map(o => o.path)} placeholder="Empty: look in the model's folder" value={entry[slot]} onChange={value => edit(index, { [slot]: value })}/><button type="button" className="secondary" disabled={!desktop} onClick={() => void run('browse', async () => { const path = await onBrowse(); if (path) edit(index, { [slot]: path }); })}><FolderOpen size={14}/>Browse</button></div></label>
               {entry[slot] && <><span className="field-label">{title} sha256</span>
                 <ShaRow label={`${entry.name} ${title}`} sum={entry[SUM[slot]]} status={row?.status[slot]} canRecord={!!listed && listed === entry[slot] && !row?.status[slot].missing} blocked={!desktop ? 'Needs the desktop app' : dirty ? 'Save or discard your changes first' : null} pending={pending === `sha:${index}:${slot}`} onRecord={() => void run(`sha:${index}:${slot}`, () => onRecordSha(entry.path, slot))} onClear={() => edit(index, { [SUM[slot]]: '' })} onError={onError}/></>}
-              {slot === 'mtp' ? <datalist id="library-mtp">{options.map(o => <option key={o.path} value={o.path}/>)}</datalist> : <datalist id="library-mmproj">{options.map(o => <option key={o.path} value={o.path}/>)}</datalist>}
             </div>;
           })}
         </div>
       </section>;
     })}</div>
-    <datalist id="library-accounts">{accounts.map(account => <option key={account} value={account}/>)}</datalist>
     <div className={`save-bar ${dirty ? 'dirty' : ''}`}><span className="hint">{dirty ? 'Unsaved changes to models.yml. Saving backs up the current file first.' : 'models.yml is up to date. Edits made in a text editor appear here when saved.'}</span><span className="save-actions">{dirty && <button className="text-button" onClick={discard}>Discard</button>}<button className={dirty ? 'primary' : 'secondary'} disabled={!dirty || !desktop || !!pending} onClick={save}><Save size={14}/>Save models.yml</button></span></div>
   </div>;
 }

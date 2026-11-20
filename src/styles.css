@@ -434,6 +434,7 @@ label small { font-weight: 400; line-height: 1.6; }
   :root { --sidebar-w: 72px; }
   .sidebar { padding-left: 10px; padding-right: 10px; }
   .brand > span, .nav-item > span, .runtime-card > span:last-child { display: none; }
+  .sidebar-loaded { display: none; }
   .brand { justify-content: center; margin: 0 0 24px; }
   .nav-item, .runtime-card { justify-content: center; padding: 0; }
   .runtime-card { height: 52px; background: none; }
@@ -495,6 +496,12 @@ label small { font-weight: 400; line-height: 1.6; }
 /* Hover card beside the sidebar runtime card */
 .runtime-card-wrap { position: relative; margin-top: 10px; }
 .runtime-card-wrap .runtime-card { margin-top: 0; }
+/* Loaded models under the runtime card, each with its own Eject */
+.sidebar-loaded { list-style: none; margin: 4px 0 0; padding: 4px; display: grid; gap: 2px; border-radius: 12px; background: var(--surface); }
+.sidebar-loaded li { display: flex; align-items: center; gap: 8px; padding-left: 8px; min-width: 0; }
+.sidebar-loaded-name { flex: 1; min-width: 0; justify-content: flex-start; padding: 6px 0; background: none; font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; text-align: left; }
+.sidebar-loaded-name:hover { color: var(--accent, var(--text)); text-decoration: underline; }
+.sidebar-loaded .icon-button { padding: 6px; flex-shrink: 0; }
 .model-details { position: absolute; left: calc(100% + 14px); bottom: 0; z-index: 40; width: 340px; padding: 16px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--line-strong); box-shadow: 0 18px 50px rgba(0, 0, 0, .5); font-size: 12.5px; }
 .model-details::before { content: ""; position: absolute; left: -14px; top: 0; bottom: 0; width: 14px; }
 .model-details-head { display: grid; gap: 2px; margin-bottom: 12px; }
@@ -612,3 +619,28 @@ label small { font-weight: 400; line-height: 1.6; }
   .library-fields { grid-template-columns: minmax(0, 1fr); padding-left: 0; }
   .library-head { flex-wrap: wrap; }
 }
+
+/* Notifications float over the page and animate in and out instead of pushing it down. */
+.toast-region { position: fixed; top: 14px; left: var(--sidebar-w); right: 0; z-index: 40; display: flex; justify-content: center; padding: 0 24px; pointer-events: none; }
+.notice.toast { pointer-events: auto; width: 100%; max-width: 680px; margin: 0; background: var(--surface-2); box-shadow: 0 0 0 1px var(--line-strong), 0 16px 40px rgba(0, 0, 0, .45); animation: toast-in .24s cubic-bezier(.2, .8, .2, 1); }
+.notice.toast.error { background: #3a2829; box-shadow: inset 0 0 0 1px rgba(239, 138, 133, .35), 0 16px 40px rgba(0, 0, 0, .45); }
+.notice.toast.leaving { animation: toast-out .18s ease forwards; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(-12px) scale(.98); } }
+@keyframes toast-out { to { opacity: 0; transform: translateY(-8px) scale(.98); } }
+.load-error { animation: panel-in .22s ease; }
+@keyframes panel-in { from { opacity: 0; transform: translateY(-4px); } }
+@media (prefers-reduced-motion: reduce) { .notice.toast, .notice.toast.leaving, .load-error { animation-duration: 1ms; } }
+
+/* A text field with suggestions, drawn by the app instead of GTK. */
+.combo { position: relative; }
+.combo > input { width: 100%; }
+.combo .select-menu li { justify-content: space-between; }
+.combo .select-menu li svg { flex-shrink: 0; }
+.combo .select-menu li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.file-input-row .combo { flex: 1; min-width: 0; }
+/* Library cards let suggestion lists extend past their bottom edge. */
+.panel.library-entry { overflow: visible; }
+
+.memory-dialog { width: min(540px, calc(100vw - 40px)); }
+.memory-dialog label { display: block; margin-top: 18px; font-size: 13px; }
+.memory-dialog .quit-dialog-actions { flex-wrap: wrap; }

@@ -6,6 +6,7 @@ mod files;
 mod decision;
 mod gguf;
 mod hardware;
+mod oom;
 mod hub;
 mod instance;
 mod lifecycle;
@@ -46,6 +47,7 @@ fn main() {
             app.manage(updates);
             let state = AppState::new(data_dir)?;
             app.manage(state.clone());
+            runtime::start_memory_guard(state.clone());
             desktop::install_signal_handler(app.handle().clone());
             tauri::async_runtime::block_on(api::start(state));
             if let Err(error) = desktop::install_tray(app) {
@@ -78,6 +80,8 @@ fn main() {
             library::open_backups_folder,
             library::record_sha256,
             library::set_sha256_check,
+            runtime::set_memory_preference,
+            runtime::crowded_load_warning,
             runtime::dismiss_load_error,
             context::set_keep_context,
             context::clear_context,

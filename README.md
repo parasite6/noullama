@@ -122,7 +122,7 @@ Loading runs in the background. If it fails, or the runtime stops on its own aft
 **Runtime → llama.cpp** scans the configured location, nearby builds, PATH, and managed installs before offering a download.
 
 1. Under **Download a build**, choose a backend and **Check official releases** to preview OS/architecture-matched assets from [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp/releases). Checking fetches metadata only.
-2. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the binary build linked by the latest official release. The fallback uses CPU, or Metal on macOS.
+2. **Download nightly + fallback** explicitly approves the displayed downloads: the latest nightly and the latest official stable release, both for the backend you picked (the stable fallback uses CPU, or Metal on macOS, only if that release has no build for your backend). When the download finishes, the nightly is selected as your runtime; the official build stays installed as a fallback you can switch to. The backend you pick is remembered.
 3. Select **Use** beside an installed runtime, then check or load it normally.
 
 Archives are checked against GitHub's SHA-256 digests and installed under the app-data `runtimes/` directory; existing custom paths are preserved. Linux uses the official Ubuntu-built archives; unsupported platforms can use a custom build.

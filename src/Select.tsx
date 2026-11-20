@@ -50,3 +50,37 @@ export function Select({ value, options, onChange, disabled, label }: { value: s
     </ul>}
   </div>;
 }
+
+// A text field with suggestions. Like Select, it draws its own list because
+// the native <datalist> popup is drawn by GTK. Any text can be typed.
+export function ComboInput({ value, options, onChange, label, placeholder, maxLength, className }: { value: string; options: string[]; onChange: (value: string) => void; label: string; placeholder?: string; maxLength?: number; className?: string }) {
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  // Opening shows every option; typing narrows the list to what matches.
+  const [typed, setTyped] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const needle = typed ? value.trim().toLowerCase() : '';
+  const shown = options.filter((option, index) => option && options.indexOf(option) === index && (!needle || option.toLowerCase().includes(needle))).slice(0, 50);
+  function show() { setTyped(false); setActive(-1); setOpen(true); }
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: PointerEvent) => { if (!root.current?.contains(event.target as Node)) setOpen(false); };
+    window.addEventListener('pointerdown', close);
+    return () => window.removeEventListener('pointerdown', close);
+  }, [open]);
+  function choose(option: string | undefined) { if (option !== undefined) onChange(option); setOpen(false); setActive(-1); }
+  function onKeyDown(event: React.KeyboardEvent) {
+    if (event.key === 'ArrowDown') { event.preventDefault(); if (!open) show(); setActive(i => Math.min(shown.length - 1, i + 1)); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); setActive(i => Math.max(0, i - 1)); }
+    else if (event.key === 'Enter' && open && active >= 0) { event.preventDefault(); choose(shown[active]); }
+    else if (event.key === 'Escape' || event.key === 'Tab') setOpen(false);
+  }
+  return <div className={`combo ${className ?? ''}`} ref={root}>
+    <input role="combobox" aria-label={label} aria-autocomplete="list" aria-expanded={open && shown.length > 0} aria-controls={id} aria-activedescendant={open && active >= 0 ? `${id}-${active}` : undefined}
+      placeholder={placeholder} maxLength={maxLength} spellCheck={false} autoComplete="off" value={value} onFocus={show} onClick={() => { if (!open) show(); }} onChange={event => { onChange(event.target.value); setTyped(true); setOpen(true); setActive(-1); }} onKeyDown={onKeyDown}/>
+    {open && shown.length > 0 && <ul className="select-menu" role="listbox" id={id} aria-label={label}>
+      {shown.map((option, index) => <li key={option} id={`${id}-${index}`} role="option" aria-selected={index === active} className={index === active ? 'active' : ''} title={option} onPointerEnter={() => setActive(index)} onPointerDown={event => { event.preventDefault(); choose(option); }}><span><bdi dir="ltr">{option}</bdi></span>{option === value && <Check size={14}/>}</li>)}
+    </ul>}
+  </div>;
+}

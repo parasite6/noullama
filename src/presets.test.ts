@@ -88,3 +88,28 @@ test('text is kept verbatim while JSON state is parsed explicitly', () => {
   assert.throws(() => buildRequest('[]', '', 'text'));
   assert.throws(() => buildRequest('{"a":{}}', 'broken', 'json'));
 });
+
+test('pending actions isolate unrelated controls and reject duplicate submissions', async () => {
+  const { PendingActions } = await import('./refresh-state.ts');
+  const pending = new PendingActions();
+  assert.equal(pending.begin('memory-pref'), true);
+  assert.equal(pending.has('start'), false);
+  assert.equal(pending.begin('memory-pref'), false);
+  assert.equal(pending.begin('search'), true);
+  pending.end('memory-pref');
+  assert.equal(pending.has('search'), true);
+  assert.equal(pending.has('memory-pref'), false);
+});
+
+test('unchanged polling retains displayed state and stale replies cannot overwrite newer state', async () => {
+  const { retainEqual, LatestRequest } = await import('./refresh-state.ts');
+  const old = { settings: { allow_force_fit: false }, instances: [] };
+  assert.equal(retainEqual(old, structuredClone(old)), old);
+  const next = { ...old, settings: { allow_force_fit: true } };
+  assert.equal(retainEqual(old, next), next);
+  const requests = new LatestRequest();
+  const slow = requests.begin();
+  const fresh = requests.begin();
+  assert.equal(requests.isLatest(slow), false);
+  assert.equal(requests.isLatest(fresh), true);
+});

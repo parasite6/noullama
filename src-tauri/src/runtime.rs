@@ -46,6 +46,8 @@ pub struct Settings {
     // Carry earlier decisions into each request's state (see context.rs).
     // Changed only by set_keep_context.
     pub keep_context: bool,
+    pub allow_force_fit: bool,
+    pub hide_crowded_load_warning: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -66,6 +68,8 @@ impl Default for Settings {
             model_routes: BTreeMap::new(),
             sha256_check: "once".into(),
             keep_context: false,
+            allow_force_fit: false,
+            hide_crowded_load_warning: false,
         }
     }
 }
@@ -832,6 +836,8 @@ pub async fn save_from_editor(state: &AppState, mut settings: Settings) -> Resul
         settings.model_routes = current.model_routes.clone();
         settings.keep_context = current.keep_context;
         settings.sha256_check = current.sha256_check.clone();
+        settings.allow_force_fit = current.allow_force_fit;
+        settings.hide_crowded_load_warning = current.hide_crowded_load_warning;
     }
     persist_settings(state, settings).await
 }
@@ -871,9 +877,14 @@ pub async fn set_aliases(state: &AppState, path: String, aliases: Vec<String>) -
 }
 
 pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<(), String> {
+    persist_memory_settings(state, settings, None).await
+}
+
+async fn persist_memory_settings(state: &AppState, mut settings: Settings, update: Option<(&str, bool)>) -> Result<(), String> {
     // Loaded models keep the settings they started with, so these can change
     // at any time; they apply to the next load.
     let _guard = state.lifecycle.lock().await;
+    if update.is_some() { settings = state.settings.lock().await.clone(); }
     if settings.api_port == 0
         || settings.runtime_port == 0
         || settings.api_port == settings.runtime_port
@@ -908,6 +919,17 @@ pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<()
         tokio::fs::create_dir_all(settings.download_dir.trim())
             .await
             .map_err(|e| format!("Cannot create download directory: {e}"))?;
+    }
+    {
+        let current = state.settings.lock().await;
+        settings.allow_force_fit = current.allow_force_fit;
+        settings.hide_crowded_load_warning = current.hide_crowded_load_warning;
+    }
+    match update {
+        Some(("allow_force_fit", value)) => settings.allow_force_fit = value,
+        Some(("hide_crowded_load_warning", value)) => settings.hide_crowded_load_warning = value,
+        Some(_) => return Err("Unknown memory preference".into()),
+        None => {},
     }
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     let temp = state.data_dir.join("settings.json.tmp");
@@ -1002,6 +1024,9 @@ pub async fn load_model(state: &AppState) -> Result<String, String> {
     let loaded = state.instances.lock().await.clone();
     if loaded.iter().any(|i| i.path() == settings.model_path) {
         return Err(format!("{} is already loaded. Eject it first to load it again with other settings.", file_stem(&settings.model_path)));
+    }
+    if let Some(reason) = load_memory_risk(&settings).await {
+        return Err(format!("OOM prevention: {reason} Eject another model, reduce context or GPU offload, or enable Allow force fit in Settings."));
     }
     let port = free_runtime_port(state, &settings, &loaded)?;
     let stem = file_stem(&settings.model_path);
@@ -1224,6 +1249,11 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
         let _guard = state.lifecycle.lock().await;
         if !is_registered(state, instance).await {
             return Ok(());
+        }
+        let mut live_settings = settings.clone();
+        live_settings.allow_force_fit = state.settings.lock().await.allow_force_fit;
+        if let Some(reason) = load_memory_risk(&live_settings).await {
+            return Err(format!("OOM prevention: {reason}"));
         }
         drop(reservation);
         let mut child = runtime_command(settings)
@@ -1461,6 +1491,90 @@ pub async fn decide(payload: Value, model: Option<String>, state: tauri::State<'
 }
 
 /// Registers a loaded model with no runtime behind it, for routing tests.
+#[tauri::command]
+pub async fn set_memory_preference(key: String, value: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings.lock().await.clone();
+    persist_memory_settings(state.inner(), settings, Some((&key, value))).await
+}
+
+async fn load_memory_risk(settings: &Settings) -> Option<String> {
+    if settings.allow_force_fit { return None; }
+    let required = crate::hardware::estimate_bytes(&settings.model_path, &instance_extras(settings), settings.context_size)?;
+    let gpu_layers = settings.gpu_layers;
+    tokio::task::spawn_blocking(move || {
+        if gpu_layers != 0 {
+            let gpu = crate::hardware::memory_use(&[]);
+            if let (Some(total), Some(used)) = (gpu.total_bytes, gpu.used_bytes) {
+                if (gpu_layers == -1 || gpu_layers >= 99) && crate::oom::clearly_exceeds(required, total.saturating_sub(used)) {
+                    return Some(format!("Estimated GPU allocation {:.1} GiB clearly exceeds {:.1} GiB available VRAM.", required as f64 / 1073741824., total.saturating_sub(used) as f64 / 1073741824.));
+                }
+            }
+        }
+        // Partial offload cannot be divided accurately from file size alone.
+        // Do not pretend the entire file must be resident in system RAM.
+        if gpu_layers == 0 {
+            if let Some(m) = crate::oom::memory() {
+                if crate::oom::clearly_exceeds(required, m.available) {
+                    return Some(format!("Estimated allocation {:.1} GiB clearly exceeds {:.1} GiB available RAM.", required as f64 / 1073741824., m.available as f64 / 1073741824.));
+                }
+            }
+        }
+        None
+    }).await.ok().flatten()
+}
+
+#[tauri::command]
+pub async fn crowded_load_warning(state: tauri::State<'_, AppState>) -> Result<Option<Value>, String> {
+    let settings = state.settings.lock().await.clone();
+    if settings.hide_crowded_load_warning || settings.allow_force_fit { return Ok(None); }
+    let loaded = state.instances.lock().await.clone();
+    let others: Vec<_> = loaded.iter().filter(|i| i.path() != settings.model_path).collect();
+    if others.is_empty() { return Ok(None); }
+    Ok(load_memory_risk(&settings).await.map(|reason| json!({
+        "reason": reason,
+        "models": others.iter().map(|i| json!({"id": i.id, "name": i.label})).collect::<Vec<_>>()
+    })))
+}
+
+pub fn start_memory_guard(state: AppState) {
+    tauri::async_runtime::spawn(async move {
+        let mut pressure = crate::oom::Pressure::default();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) { break; }
+            if state.settings.lock().await.allow_force_fit {
+                pressure = Default::default();
+                continue;
+            }
+            let memory = tokio::task::spawn_blocking(crate::oom::memory).await.ok().flatten();
+            if !pressure.sample(memory) { continue; }
+            let _guard = state.lifecycle.lock().await;
+            // Recheck after waiting for the lock. The setting is global and live.
+            if state.settings.lock().await.allow_force_fit || !pressure.sample(crate::oom::memory()) { continue; }
+            let instances = state.instances.lock().await.clone();
+            let mut candidate = None;
+            let mut largest = 128 * 1024 * 1024;
+            for instance in instances.iter().rev() {
+                // Read only an owned, unreaped child while its handle is locked.
+                let child = instance.child.lock().await;
+                if let Some(rss) = child.as_ref().and_then(Child::id).and_then(crate::oom::resident_bytes) {
+                    if rss > largest { largest = rss; candidate = Some(instance.clone()); }
+                }
+            }
+            if let Some(instance) = candidate {
+                let message = "OOM prevention ejected this model after sustained critically low available RAM and memory stalls. Allow force fit in Settings disables this protection.".to_owned();
+                state.log(format!("{}{}", instance.prefix(), message)).await;
+                state.record_load_error(&instance, message).await;
+                state.unload_locked(&instance.id).await;
+            }
+            // One victim, then a cooldown and fresh evidence before any further action.
+            pressure = Default::default();
+            drop(_guard);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 pub async fn insert_test_instance(state: &AppState, path: &str, ready: bool) -> Arc<Instance> {
     let settings = Settings { model_path: path.into(), ..state.settings.lock().await.clone() };
@@ -1846,6 +1960,24 @@ mod tests {
                 PathBuf::from("/custom/other")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn memory_preferences_are_independent_persisted_and_survive_stale_forms() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.allow_force_fit && !old.hide_crowded_load_warning);
+        let base = std::env::temp_dir().join(format!("noullama-memory-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        persist_memory_settings(&state, old.clone(), Some(("hide_crowded_load_warning", true))).await.unwrap();
+        assert!(!state.settings.lock().await.allow_force_fit);
+        persist_memory_settings(&state, old.clone(), Some(("allow_force_fit", true))).await.unwrap();
+        save_from_editor(&state, old).await.unwrap();
+        let loaded = AppState::new(base.clone()).unwrap();
+        let settings = loaded.settings.lock().await;
+        assert!(settings.allow_force_fit && settings.hide_crowded_load_warning);
+        drop(settings);
+        assert!(load_memory_risk(&loaded.settings.lock().await.clone()).await.is_none());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

@@ -200,29 +200,28 @@ async fn plan_releases(state: &AppState, backend: &str) -> Result<RuntimePlan, S
         .as_str()
         .ok_or("Official release has no tag")?
         .to_owned();
-    let fallback_backend = if os == "macos" { "metal" } else { "cpu" };
-    let fallback = match release_build(&stable, os, arch, fallback_backend, stable_tag.clone()) {
-        Ok(build) => build,
+    // The fallback is the latest official (stable) release, built for the same
+    // backend as the nightly. Only if that release has no build for it does the
+    // fallback use the plain CPU (Metal on macOS) build, so there is always one.
+    let linked = match release_build(&stable, os, arch, backend, stable_tag.clone()) {
+        Ok(_) => None,
         Err(_) => {
             let body = stable["body"].as_str().unwrap_or_default();
             let pattern =
                 regex::Regex::new(r"https://github\.com/ggml-org/llama\.cpp/releases/tag/(b\d+)")
                     .unwrap();
-            let tag = pattern
-                .captures(body)
-                .and_then(|c| c.get(1))
-                .ok_or("Official release has no platform binaries or linked binary build")?
-                .as_str();
-            let linked = github_json(&state, &format!("releases/tags/{tag}")).await?;
-            release_build(
-                &linked,
-                os,
-                arch,
-                fallback_backend,
-                format!("Official {stable_tag}"),
-            )?
+            match pattern.captures(body).and_then(|c| c.get(1)) {
+                Some(tag) => Some(github_json(&state, &format!("releases/tags/{}", tag.as_str())).await?),
+                None => None,
+            }
         }
     };
+    let official = linked.as_ref().unwrap_or(&stable);
+    let label = if linked.is_some() { format!("Official {stable_tag}") } else { stable_tag.clone() };
+    let basic = if os == "macos" { "metal" } else { "cpu" };
+    let fallback = release_build(official, os, arch, backend, label.clone())
+        .or_else(|_| release_build(official, os, arch, basic, label.clone()))
+        .map_err(|_| "Official release has no platform binaries or linked binary build".to_owned())?;
     let total_bytes = nightly
         .assets
         .iter()
