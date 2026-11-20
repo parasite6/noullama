@@ -264,13 +264,20 @@ pub async fn local_models(state: tauri::State<'_, AppState>) -> Result<Value, St
     list_local_models(state.inner()).await
 }
 
-/// How the selected model can use MTP: its own layers, or a fitting head
-/// in its folder. Works for a model chosen from outside the scanned folders.
+/// How the selected model can use MTP: its own layers, or a head: the one
+/// models.yml lists for it, or else a fitting head in its folder. Works for a
+/// model chosen from outside the scanned folders.
 #[tauri::command]
-pub async fn model_mtp(path: String) -> Result<crate::gguf::ModelMtp, String> {
-    tokio::task::spawn_blocking(move || crate::gguf::model_mtp(&path))
+pub async fn model_mtp(path: String, state: tauri::State<'_, AppState>) -> Result<crate::gguf::ModelMtp, String> {
+    crate::library::refresh(state.inner()).await;
+    let listed = state.library.lock().await.entry(&path).map(|e| e.mtp.clone()).unwrap_or_default();
+    let mut found = tokio::task::spawn_blocking(move || crate::gguf::model_mtp(&path))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if !listed.is_empty() {
+        found.head = Some(listed);
+    }
+    Ok(found)
 }
 
 async fn list_local_models(state: &AppState) -> Result<Value, String> {
@@ -932,8 +939,12 @@ async fn prepare_download(
             }
         }
         drop(downloads);
-        if success && !cancelled && !filename.to_lowercase().contains("mmproj") && !crate::gguf::is_mtp_head(&model_path) {
-            crate::library::ensure(&state, &[model_path.clone()]).await;
+        if success && !cancelled {
+            if filename.to_lowercase().contains("mmproj") || crate::gguf::is_mtp_head(&model_path) {
+                crate::library::attach(&state, &model_path).await;
+            } else {
+                crate::library::ensure(&state, &[model_path.clone()]).await;
+            }
         }
         state
             .log(if success {

@@ -12,7 +12,7 @@ import { CopyButton } from './CopyButton';
 import { KeepContext } from './KeepContext';
 import { ModelAliases, ModelRouting, type Route as ApiRoute } from './ModelNames';
 import { Select } from './Select';
-import { Library, SHA_CHECKS, type LibraryEntry, type LibraryState } from './Library';
+import { Library, SHA_CHECKS, type Companion, type LibraryEntry, type LibraryState } from './Library';
 import { UpdatesDialog, type UpdateView } from './UpdatesDialog';
 import { ContextMenu } from './ContextMenu';
 import { NumberField } from './NumberField';
@@ -185,7 +185,7 @@ function App() {
   // Built-in MTP layers belong to one file, so a model switch turns MTP off unless its head file stays valid.
   function selectModel(path: string) {
     edit('model_path', path);
-    if (settings.mmproj_path && folder(settings.mmproj_path) !== folder(path)) edit('mmproj_path', '');
+    if (settings.mmproj_path && folder(settings.mmproj_path) !== folder(path) && settings.mmproj_path !== libraryEntries.find(e => e.path === path)?.mmproj) edit('mmproj_path', '');
     if (path !== settings.model_path) { edit('mtp', false); edit('mtp_path', ''); }
   }
   function setMtp(on: boolean) {
@@ -343,7 +343,7 @@ function App() {
   const activeInstance = instances.find(i => i.id === playModel) ?? defaultInstance ?? instances[0] ?? null;
   const ready = !!activeInstance?.ready;
   const visionLoaded = ready && !!activeInstance?.projector;
-  const projector = settings.mmproj_path || localModels.find(file => isProjector(file.path) && folder(file.path) === folder(settings.model_path))?.path || '';
+  const projector = settings.mmproj_path || (snapshot?.library?.entries ?? []).find(e => e.path === settings.model_path)?.mmproj || localModels.find(file => isProjector(file.path) && folder(file.path) === folder(settings.model_path))?.path || '';
   const mtpHead = settings.mtp_path || selectedMtp.head || '';
   const builtInMtp = selectedMtp.built_in;
   const mtpAvailable = builtInMtp || !!mtpHead;
@@ -517,8 +517,9 @@ function App() {
           <div className={`save-bar ${dirty ? 'dirty' : ''}`}><span className="hint">{dirty ? running ? 'Unsaved changes apply to the next model you load. Reload model applies them to the selected one.' : 'You have unsaved changes.' : running ? 'All changes saved. Loaded models keep the settings they started with.' : 'All changes saved.'}</span><button className={dirty ? 'primary' : 'secondary'} disabled={!dirty || !!busy} onClick={() => action('save', async () => { await save(); setNotice({ text: 'Settings saved.', error: false }); })}>Save settings</button></div>
         </>}
         {tab === 'library' && <Library library={snapshot?.library ?? null} loadedPaths={instances.map(i => i.path)} desktop={desktop}
+          companions={localModels.flatMap((file): Companion[] => file.mtp_head ? [{ path: file.path, kind: 'mtp' }] : isProjector(file.path) ? [{ path: file.path, kind: 'mmproj' }] : [])}
           onSave={saveLibrary} onReload={() => libraryCommand('reload_library')} onOpenFile={() => libraryCommand('open_models_file')} onOpenBackups={() => libraryCommand('open_backups_folder')}
-          onRecordSha={path => libraryCommand('record_sha256', { path })} onBrowse={() => invoke<string | null>('pick_model_file')} onError={copyError}/>}
+          onRecordSha={(path, slot) => libraryCommand('record_sha256', { path, slot })} onBrowse={() => invoke<string | null>('pick_model_file')} onError={copyError}/>}
         {tab === 'settings' && <>
           <section className="panel settings-panel"><div className="panel-heading"><span><ShieldCheck size={16}/> Model file checks</span></div><div className="settings-body">
             <div className="field"><div className="field-row"><span>sha256 before loading</span><div className="segmented" role="group" aria-label="sha256 check">{SHA_CHECKS.map(option => <button key={option.value} type="button" className={(snapshot?.settings.sha256_check ?? 'once') === option.value ? 'on' : ''} aria-pressed={(snapshot?.settings.sha256_check ?? 'once') === option.value} disabled={!desktop || busy === 'sha-check'} onClick={() => void setShaCheck(option.value)}>{option.label}</button>)}</div></div>

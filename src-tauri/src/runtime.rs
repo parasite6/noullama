@@ -979,12 +979,12 @@ pub async fn load_model(state: &AppState) -> Result<String, String> {
         return Err("Select a downloaded or local .gguf decision model first.".into());
     }
     if !settings.mmproj_path.is_empty() && !Path::new(&settings.mmproj_path).is_file() {
-        return Err("The multimodal projector path does not exist.".into());
+        return Err(format!("The multimodal projector {} does not exist. If models.yml lists it for this model, fix the path in Library.", settings.mmproj_path));
     }
     if settings.mtp {
         if !settings.mtp_path.is_empty() {
             if !Path::new(&settings.mtp_path).is_file() {
-                return Err("The MTP head path does not exist.".into());
+                return Err(format!("The MTP head {} does not exist. If models.yml lists it for this model, fix the path in Library.", settings.mtp_path));
             }
             // The Hub and the file picker go by name; the metadata decides.
             match crate::gguf::info(&settings.mtp_path) {
@@ -1172,7 +1172,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
     let settings = &instance.settings;
     let session = &instance.session;
     let prefix = instance.prefix();
-    crate::library::verify(state, &settings.model_path, crate::library::Check::parse(&settings.sha256_check), &prefix).await?;
+    crate::library::verify_load(state, settings, &prefix).await?;
     // Keep the port reserved during preflight, then verify the launch's random
     // alias over an authenticated endpoint before ever accepting inference.
     let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))

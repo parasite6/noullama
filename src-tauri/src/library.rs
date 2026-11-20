@@ -1,6 +1,6 @@
 //! models.yml: one entry per model file with the name the local API knows it
 //! by, its aliases, its path, the Hugging Face account its avatar comes from,
-//! and its sha256. People edit it in the Library tab or in any text editor;
+//! its sha256, and the MTP head and projector that go with it. People edit it in the Library tab or in any text editor;
 //! Noullama rereads it whenever it changes on disk and backs it up before
 //! every change it makes.
 
@@ -28,7 +28,13 @@ const HEADER: &str = "\
 #   path     Absolute path to the .gguf file.
 #   account  Hugging Face account the avatar comes from, such as LiquidAI.
 #   sha256   Checksum of the file. Filled in automatically; see Settings.
+#   mtp      Absolute path to the model's MTP head, if it has a separate one.
+#            Empty: Noullama looks for a fitting head in the model's folder.
+#   mmproj   Absolute path to the model's multimodal projector. Empty:
+#            Noullama looks for one in the model's folder.
+#   mtp_sha256, mmproj_sha256  Checksums of those files.
 ";
+const VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -38,6 +44,62 @@ pub struct Entry {
     pub path: String,
     pub account: String,
     pub sha256: String,
+    pub mtp: String,
+    pub mtp_sha256: String,
+    pub mmproj: String,
+    pub mmproj_sha256: String,
+}
+
+/// One of the files an entry names, each with its own sha256.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Slot {
+    Model,
+    Mtp,
+    Mmproj,
+}
+
+pub const SLOTS: [Slot; 3] = [Slot::Model, Slot::Mtp, Slot::Mmproj];
+
+impl Slot {
+    fn key(self) -> &'static str {
+        match self {
+            Slot::Model => "model",
+            Slot::Mtp => "mtp",
+            Slot::Mmproj => "mmproj",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Slot::Model => "model file",
+            Slot::Mtp => "MTP head",
+            Slot::Mmproj => "projector",
+        }
+    }
+}
+
+impl Entry {
+    pub fn file(&self, slot: Slot) -> &str {
+        match slot {
+            Slot::Model => &self.path,
+            Slot::Mtp => &self.mtp,
+            Slot::Mmproj => &self.mmproj,
+        }
+    }
+    pub fn sum(&self, slot: Slot) -> &str {
+        match slot {
+            Slot::Model => &self.sha256,
+            Slot::Mtp => &self.mtp_sha256,
+            Slot::Mmproj => &self.mmproj_sha256,
+        }
+    }
+    fn sum_mut(&mut self, slot: Slot) -> &mut String {
+        match slot {
+            Slot::Model => &mut self.sha256,
+            Slot::Mtp => &mut self.mtp_sha256,
+            Slot::Mmproj => &mut self.mmproj_sha256,
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -134,8 +196,37 @@ fn unique_name(path: &str, taken: &BTreeSet<String>) -> String {
         .unwrap_or(base)
 }
 
+fn is_projector_name(path: &str) -> bool {
+    Path::new(path).file_name().and_then(|n| n.to_str()).is_some_and(|n| n.to_lowercase().contains("mmproj"))
+}
+
+/// The MTP head and projector the model's folder holds, found the same way
+/// as when the fields are empty: a head whose metadata fits the model, and
+/// the first file named like a projector.
+fn discover(path: &str) -> (String, String) {
+    if !Path::new(path).is_file() {
+        return (String::new(), String::new());
+    }
+    let mtp = crate::gguf::model_mtp(path).head.unwrap_or_default();
+    let mmproj = Path::new(path)
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|files| {
+            let mut found: Vec<String> = files
+                .flatten()
+                .map(|f| f.path().to_string_lossy().into_owned())
+                .filter(|p| p.to_lowercase().ends_with(".gguf") && is_projector_name(p))
+                .collect();
+            found.sort();
+            found.into_iter().next().unwrap_or_default()
+        })
+        .unwrap_or_default();
+    (mtp, mmproj)
+}
+
 fn new_entry(path: &str, taken: &BTreeSet<String>) -> Entry {
-    Entry { name: unique_name(path, taken), aliases: Vec::new(), path: path.to_owned(), account: account_from_path(path), sha256: String::new() }
+    let (mtp, mmproj) = discover(path);
+    Entry { name: unique_name(path, taken), path: path.to_owned(), account: account_from_path(path), mtp, mmproj, ..Entry::default() }
 }
 
 fn taken_names(entries: &[Entry]) -> BTreeSet<String> {
@@ -164,10 +255,25 @@ pub fn validate(entries: &[Entry]) -> Result<Vec<Entry>, String> {
         if account.len() > 96 || !account.chars().all(valid_account_char) {
             return Err(format!("{label}: the account can use letters, digits and _ . - only."));
         }
-        let sha256 = raw.sha256.trim().to_lowercase();
-        if !sha256.is_empty() && (sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit())) {
-            return Err(format!("{label}: sha256 must be 64 hexadecimal characters, or empty."));
-        }
+        let sum = |value: &str, field: &str| {
+            let value = value.trim().to_lowercase();
+            if value.is_empty() || (value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())) {
+                Ok(value)
+            } else {
+                Err(format!("{label}: {field} must be 64 hexadecimal characters, or empty."))
+            }
+        };
+        let companion = |value: &str, field: &str| {
+            let value = value.trim().to_owned();
+            if value.is_empty() || (Path::new(&value).is_absolute() && value.to_lowercase().ends_with(".gguf") && value != path) {
+                Ok(value)
+            } else {
+                Err(format!("{label}: {field} must be empty or an absolute path to another .gguf file."))
+            }
+        };
+        let sha256 = sum(&raw.sha256, "sha256")?;
+        let (mtp, mtp_sha256) = (companion(&raw.mtp, "mtp")?, sum(&raw.mtp_sha256, "mtp_sha256")?);
+        let (mmproj, mmproj_sha256) = (companion(&raw.mmproj, "mmproj")?, sum(&raw.mmproj_sha256, "mmproj_sha256")?);
         let aliases: Vec<String> = normalize_aliases(&raw.aliases).map_err(|e| format!("{label}: {e}"))?.into_iter().filter(|a| *a != name).collect();
         for value in std::iter::once(&name).chain(&aliases) {
             if let Some(owner) = owners.insert(value.to_lowercase(), name.clone()) {
@@ -178,21 +284,22 @@ pub fn validate(entries: &[Entry]) -> Result<Vec<Entry>, String> {
                 });
             }
         }
-        out.push(Entry { name, aliases, path, account, sha256 });
+        out.push(Entry { name, aliases, path, account, sha256, mtp, mtp_sha256, mmproj, mmproj_sha256 });
     }
     Ok(out)
 }
 
-fn parse(text: &str) -> Result<Vec<Entry>, String> {
+/// The entries and the file's format version.
+fn parse(text: &str) -> Result<(Vec<Entry>, u32), String> {
     if text.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), VERSION));
     }
     let document: Document = serde_norway::from_str(text).map_err(|e| format!("models.yml could not be read: {e}"))?;
-    validate(&document.models).map_err(|e| format!("models.yml: {e}"))
+    Ok((validate(&document.models).map_err(|e| format!("models.yml: {e}"))?, document.version))
 }
 
 fn render(entries: &[Entry]) -> Result<String, String> {
-    let body = serde_norway::to_string(&Document { version: 1, models: entries.to_vec() }).map_err(|e| e.to_string())?;
+    let body = serde_norway::to_string(&Document { version: VERSION, models: entries.to_vec() }).map_err(|e| e.to_string())?;
     Ok(format!("{HEADER}\n{body}"))
 }
 
@@ -306,13 +413,23 @@ fn refresh_locked(data_dir: &Path, library: &mut Library, legacy: &BTreeMap<Stri
         return;
     }
     match parse(&text) {
-        Ok(entries) => {
+        Ok((mut entries, version)) => {
             // Someone edited the file: keep the version before their edit.
             let _ = backup(data_dir, &library.text);
-            library.entries = entries;
+            library.entries = entries.clone();
             library.text = text;
             library.error = None;
             library.revision += 1;
+            // Version 1 had no MTP head or projector fields: record what each
+            // model's folder holds, once.
+            if version == 1 {
+                for entry in &mut entries {
+                    (entry.mtp, entry.mmproj) = discover(&entry.path);
+                }
+                if let Err(error) = write(data_dir, library, entries, Change::Edit) {
+                    library.error = Some(error);
+                }
+            }
         }
         Err(error) => library.error = Some(format!("{error} Noullama keeps using the last valid version until it is fixed.")),
     }
@@ -377,15 +494,46 @@ pub async fn set_aliases(state: &AppState, path: &str, aliases: Vec<String>) -> 
     Ok(saved)
 }
 
-async fn set_sha256(state: &AppState, path: &str, sha256: &str) -> Result<(), String> {
-    update(state, Change::Checksums, |entries| match entries.iter_mut().find(|e| e.path == path) {
+/// Records the sha256 of one of the files of the entry for `model`.
+async fn set_sha256(state: &AppState, model: &str, slot: Slot, sha256: &str) -> Result<(), String> {
+    update(state, Change::Checksums, |entries| match entries.iter_mut().find(|e| e.path == model) {
         Some(entry) => {
-            entry.sha256 = sha256.to_owned();
+            *entry.sum_mut(slot) = sha256.to_owned();
             Ok(())
         }
         None => Err("This model has no entry in models.yml.".into()),
     })
     .await
+}
+
+/// Records a projector or MTP head downloaded into a model's folder for each
+/// model there whose field is still empty.
+pub async fn attach(state: &AppState, companion: &str) {
+    refresh(state).await;
+    let head = crate::gguf::is_mtp_head(companion);
+    if !head && !is_projector_name(companion) {
+        return;
+    }
+    let folder = Path::new(companion).parent().map(Path::to_path_buf);
+    let companion = companion.to_owned();
+    let result = update(state, Change::Edit, |entries| {
+        for entry in entries.iter_mut().filter(|e| Path::new(&e.path).parent().map(Path::to_path_buf) == folder) {
+            if head && entry.mtp.is_empty() {
+                let fits = crate::gguf::info(&companion).zip(crate::gguf::info(&entry.path)).is_some_and(|(h, m)| h.head_fits(&m));
+                if fits {
+                    entry.mtp = companion.clone();
+                }
+            } else if !head && entry.mmproj.is_empty() {
+                entry.mmproj = companion.clone();
+            }
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = result {
+        state.log(format!("models.yml was not updated: {error}")).await;
+    }
+    hash_missing(state.clone());
 }
 
 // ---------------------------------------------------------------- sha256
@@ -464,12 +612,17 @@ pub fn hash_missing(state: AppState) {
             let next = {
                 let library = state.library.lock().await;
                 let busy = state.hashing.lock().await.clone();
-                library.entries.iter().find(|e| e.sha256.is_empty() && !busy.contains(&e.path) && Path::new(&e.path).is_file()).map(|e| e.path.clone())
+                library.entries.iter().find_map(|e| {
+                    SLOTS.into_iter().find_map(|slot| {
+                        let file = e.file(slot);
+                        (e.sum(slot).is_empty() && !file.is_empty() && !busy.contains(file) && Path::new(file).is_file()).then(|| (e.path.clone(), slot, file.to_owned()))
+                    })
+                })
             };
-            let Some(path) = next else { break };
-            match current_hash(&state, &path, false).await {
+            let Some((model, slot, file)) = next else { break };
+            match current_hash(&state, &file, false).await {
                 Ok(sha256) => {
-                    if set_sha256(&state, &path, &sha256).await.is_err() {
+                    if set_sha256(&state, &model, slot, &sha256).await.is_err() {
                         break;
                     }
                 }
@@ -483,25 +636,52 @@ pub fn hash_missing(state: AppState) {
     });
 }
 
-/// Checks a model's file against its recorded sha256 before it loads.
-pub async fn verify(state: &AppState, path: &str, check: Check, log_prefix: &str) -> Result<(), String> {
+/// Checks the files a load uses against the sha256 values in models.yml: the
+/// model, and its MTP head and projector when they are the ones models.yml
+/// lists for it (a head or projector found by looking in the folder has no
+/// recorded sum).
+pub async fn verify_load(state: &AppState, settings: &crate::runtime::Settings, prefix: &str) -> Result<(), String> {
+    let check = Check::parse(&settings.sha256_check);
+    if check == Check::Off {
+        return Ok(());
+    }
+    verify(state, &settings.model_path, Slot::Model, check, prefix).await?;
+    let entry = state.library.lock().await.entry(&settings.model_path).cloned();
+    let Some(entry) = entry else { return Ok(()) };
+    for (slot, used) in [(Slot::Mtp, if settings.mtp { settings.mtp_path.as_str() } else { "" }), (Slot::Mmproj, settings.mmproj_path.as_str())] {
+        if !used.is_empty() && used == entry.file(slot) {
+            verify(state, &settings.model_path, slot, check, prefix).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Checks one file of the entry for `model` against its recorded sha256.
+pub async fn verify(state: &AppState, model: &str, slot: Slot, check: Check, log_prefix: &str) -> Result<(), String> {
     if check == Check::Off {
         return Ok(());
     }
     refresh(state).await;
-    let expected = state.library.lock().await.entry(path).map(|e| e.sha256.clone()).unwrap_or_default();
-    state.log(format!("{log_prefix}Checking the file's sha256…")).await;
-    let actual = current_hash(state, path, check == Check::EveryLoad).await?;
+    let (file, expected) = match state.library.lock().await.entry(model) {
+        Some(entry) => (entry.file(slot).to_owned(), entry.sum(slot).to_owned()),
+        None if slot == Slot::Model => (model.to_owned(), String::new()),
+        None => return Ok(()),
+    };
+    if file.is_empty() {
+        return Ok(());
+    }
+    state.log(format!("{log_prefix}Checking the {}'s sha256…", slot.label())).await;
+    let actual = current_hash(state, &file, check == Check::EveryLoad).await?;
     if expected.is_empty() {
-        let _ = set_sha256(state, path, &actual).await;
+        let _ = set_sha256(state, model, slot, &actual).await;
         return Ok(());
     }
     if expected == actual {
-        state.mismatches.lock().await.remove(path);
+        state.mismatches.lock().await.remove(&file);
         return Ok(());
     }
-    let message = format!("The file's sha256 ({}…) does not match the one in models.yml ({}…).", &actual[..12], &expected[..12.min(expected.len())]);
-    state.mismatches.lock().await.insert(path.to_owned(), actual);
+    let message = format!("The {}'s sha256 ({}…) does not match the one in models.yml ({}…).", slot.label(), &actual[..12], &expected[..12.min(expected.len())]);
+    state.mismatches.lock().await.insert(file, actual);
     if check == Check::Warn {
         state.log(format!("{log_prefix}Warning: {message} Loading anyway, as Settings allow.")).await;
         return Ok(());
@@ -518,7 +698,20 @@ pub async fn snapshot(state: &AppState) -> Value {
     let entries: Vec<Value> = library
         .entries
         .iter()
-        .map(|e| json!({"name": e.name, "aliases": e.aliases, "path": e.path, "account": e.account, "sha256": e.sha256, "missing": !Path::new(&e.path).is_file(), "hashing": hashing.contains(&e.path), "mismatch": mismatches.get(&e.path)}))
+        .map(|e| {
+            // Per file: missing on disk, being hashed, or its new sum when it no longer matches.
+            let status: serde_json::Map<String, Value> = SLOTS
+                .into_iter()
+                .map(|slot| {
+                    let file = e.file(slot);
+                    let mismatch = mismatches.get(file).filter(|actual| !file.is_empty() && actual.as_str() != e.sum(slot));
+                    (slot.key().to_owned(), json!({"missing": !file.is_empty() && !Path::new(file).is_file(), "hashing": !file.is_empty() && hashing.contains(file), "mismatch": mismatch}))
+                })
+                .collect();
+            let mut value = serde_json::to_value(e).unwrap_or_default();
+            value["status"] = Value::Object(status);
+            value
+        })
         .collect();
     json!({"entries": entries, "error": library.error, "revision": library.revision, "file": file_path(&state.data_dir), "backups": backups_dir(&state.data_dir)})
 }
@@ -564,15 +757,21 @@ pub async fn open_backups_folder(state: tauri::State<'_, AppState>) -> Result<()
     tauri_plugin_opener::open_path(dir, None::<&str>).map_err(|e| format!("Cannot open the backups folder: {e}"))
 }
 
-/// Reads the file now and records its sha256, replacing any recorded one.
+/// Reads one of an entry's files now and records its sha256, replacing any
+/// recorded one. `path` is the entry's model path.
 #[tauri::command]
-pub async fn record_sha256(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let sha256 = match state.mismatches.lock().await.get(&path).cloned() {
+pub async fn record_sha256(path: String, slot: Slot, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    refresh(state.inner()).await;
+    let file = state.library.lock().await.entry(&path).map(|e| e.file(slot).to_owned()).unwrap_or_default();
+    if file.is_empty() {
+        return Err(format!("models.yml lists no {} for this model.", slot.label()));
+    }
+    let sha256 = match state.mismatches.lock().await.get(&file).cloned() {
         Some(sha256) => sha256,
-        None => current_hash(state.inner(), &path, true).await?,
+        None => current_hash(state.inner(), &file, true).await?,
     };
-    set_sha256(state.inner(), &path, &sha256).await?;
-    state.mismatches.lock().await.remove(&path);
+    set_sha256(state.inner(), &path, slot, &sha256).await?;
+    state.mismatches.lock().await.remove(&file);
     Ok(())
 }
 
@@ -626,7 +825,7 @@ mod tests {
         a.account = "LiquidAI".into();
         let text = render(&[a.clone()]).unwrap();
         assert!(text.starts_with("# Noullama models"));
-        assert_eq!(parse(&text).unwrap(), [a]);
+        assert_eq!(parse(&text).unwrap(), (vec![a], VERSION));
         assert!(parse("models: [ {name: ").is_err());
     }
 
@@ -682,7 +881,7 @@ mod tests {
         let backups = || std::fs::read_dir(backups_dir(&dir)).map(|d| d.count()).unwrap_or(0);
         let before = backups();
         // The background hasher records the sum while someone edits the entry.
-        set_sha256(&state, &model, &"ab".repeat(32)).await.unwrap();
+        set_sha256(&state, &model, Slot::Model, &"ab".repeat(32)).await.unwrap();
         assert_eq!(state.library.lock().await.revision, revision);
         assert_eq!(backups(), before, "a recorded sha256 is not worth a backup");
         entries[0].name = "renamed".into();
@@ -705,18 +904,69 @@ mod tests {
         ensure(&state, &[model.clone()]).await;
         // An empty sha256 is filled in on the first load.
         state.library.lock().await.entries[0].sha256.clear();
-        verify(&state, &model, Check::Once, "").await.unwrap();
+        verify(&state, &model, Slot::Model, Check::Once, "").await.unwrap();
         assert_eq!(state.library.lock().await.entries[0].sha256, right);
-        set_sha256(&state, &model, &"0".repeat(64)).await.unwrap();
-        assert!(verify(&state, &model, Check::Once, "").await.unwrap_err().contains("does not match"));
+        set_sha256(&state, &model, Slot::Model, &"0".repeat(64)).await.unwrap();
+        assert!(verify(&state, &model, Slot::Model, Check::Once, "").await.unwrap_err().contains("does not match"));
         assert_eq!(state.mismatches.lock().await.get(&model).map(String::as_str), Some(right));
-        verify(&state, &model, Check::Warn, "").await.unwrap();
-        verify(&state, &model, Check::Off, "").await.unwrap();
-        assert!(verify(&state, &model, Check::EveryLoad, "").await.is_err());
-        set_sha256(&state, &model, right).await.unwrap();
-        verify(&state, &model, Check::EveryLoad, "").await.unwrap();
+        verify(&state, &model, Slot::Model, Check::Warn, "").await.unwrap();
+        verify(&state, &model, Slot::Model, Check::Off, "").await.unwrap();
+        assert!(verify(&state, &model, Slot::Model, Check::EveryLoad, "").await.is_err());
+        set_sha256(&state, &model, Slot::Model, right).await.unwrap();
+        verify(&state, &model, Slot::Model, Check::EveryLoad, "").await.unwrap();
         assert!(state.mismatches.lock().await.is_empty());
         state.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn projectors_are_recorded_with_their_model_and_checked_when_used() {
+        let (state, dir) = temp_state().await;
+        let folder = dir.join("acme--m-GGUF");
+        std::fs::create_dir_all(&folder).unwrap();
+        let (model, projector) = (folder.join("m.gguf"), folder.join("mmproj-m.gguf"));
+        std::fs::write(&model, b"abc").unwrap();
+        std::fs::write(&projector, b"projector").unwrap();
+        let (model, projector) = (model.to_str().unwrap().to_owned(), projector.to_str().unwrap().to_owned());
+        ensure(&state, &[model.clone()]).await;
+        assert_eq!(state.library.lock().await.entries[0].mmproj, projector, "a new entry records the projector beside it");
+        let mut settings = state.settings.lock().await.clone();
+        settings.model_path = model.clone();
+        settings.mmproj_path = projector.clone();
+        verify_load(&state, &settings, "").await.unwrap();
+        assert_eq!(state.library.lock().await.entries[0].mmproj_sha256.len(), 64, "the first load records the projector's sum");
+        std::fs::write(&projector, b"replaced").unwrap();
+        assert!(verify_load(&state, &settings, "").await.unwrap_err().contains("projector's sha256"));
+        // Without the projector the model loads; a projector models.yml does not list is not checked.
+        settings.mmproj_path.clear();
+        verify_load(&state, &settings, "").await.unwrap();
+        settings.mmproj_path = dir.join("elsewhere.gguf").to_str().unwrap().to_owned();
+        verify_load(&state, &settings, "").await.unwrap();
+        state.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_1_files_are_upgraded_once_and_empty_fields_stay_empty() {
+        let dir = std::env::temp_dir().join(format!("noullama-library-{}", uuid::Uuid::new_v4()));
+        let folder = dir.join("m");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("m.gguf"), b"abc").unwrap();
+        std::fs::write(folder.join("mmproj-m.gguf"), b"p").unwrap();
+        let model = folder.join("m.gguf").to_str().unwrap().to_owned();
+        std::fs::write(file_path(&dir), format!("version: 1\nmodels:\n- name: m\n  path: {model}\n")).unwrap();
+        let mut library = Library::default();
+        refresh_locked(&dir, &mut library, &BTreeMap::new());
+        assert!(library.entries[0].mmproj.ends_with("mmproj-m.gguf"));
+        assert!(std::fs::read_to_string(file_path(&dir)).unwrap().contains("version: 2"));
+        // Cleared by hand in a version 2 file: stays empty, so the folder is searched at load.
+        let cleared = render(&[Entry { mmproj: String::new(), ..library.entries[0].clone() }]).unwrap();
+        std::fs::write(file_path(&dir), cleared).unwrap();
+        library.stamp = None;
+        refresh_locked(&dir, &mut library, &BTreeMap::new());
+        assert_eq!(library.entries[0].mmproj, "");
+        assert!(validate(&[Entry { mtp: "relative.gguf".into(), ..entry("x", "/m/a.gguf") }]).is_err());
+        assert!(validate(&[Entry { mmproj_sha256: "zz".into(), ..entry("x", "/m/a.gguf") }]).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

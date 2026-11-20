@@ -166,7 +166,7 @@ The **Models** list rescans the download directories every few seconds, so files
 
 ### Library and models.yml
 
-`models.yml` in the app-data directory lists every model Noullama knows: one entry per GGUF file, holding the model's **name**, its **aliases**, its **path**, the Hugging Face **account** its avatar comes from (such as `LiquidAI`), and its **sha256**. Every model found on this machine or downloaded gets an entry automatically, named after its file; projector (`mmproj`) files and MTP heads do not get one.
+`models.yml` in the app-data directory lists every model Noullama knows: one entry per GGUF file, holding the model's **name**, its **aliases**, its **path**, the Hugging Face **account** its avatar comes from (such as `LiquidAI`), its **sha256**, and the **MTP head** (`mtp`) and **projector** (`mmproj`) that go with it, each with its own sha256. Every model found on this machine or downloaded gets an entry automatically, named after its file; projector (`mmproj`) files and MTP heads do not get one.
 
 ```yaml
 version: 1
@@ -177,7 +177,13 @@ models:
   path: /home/u/models/LiquidAI--d1-3B-GGUF/d1-3B-Q8_0.gguf
   account: LiquidAI
   sha256: 3b5f…
+  mtp: /home/u/models/LiquidAI--d1-3B-GGUF/mtp-d1-3B.gguf
+  mtp_sha256: 9c01…
+  mmproj: ''
+  mmproj_sha256: ''
 ```
+
+- `mtp` and `mmproj` name the head and projector used when you turn on **MTP** or **Vision** for this model. **Empty means Noullama looks in the model's folder**, as it always has. New entries record what the folder holds; a head or projector downloaded later into a model's folder is recorded for that model if its field is empty. A head must still fit the model; a listed file that no longer exists stops the load with a message pointing to Library.
 
 - **Library** edits each entry with text fields, alias chips, a file browser and an account picker. **Add model** adds a file from anywhere on disk. Changes are kept as a draft until **Save models.yml**.
 - **Edit models.yml** opens the file in your default editor. Noullama rereads it whenever it changes: on every snapshot and API request, and before loading, ejecting, finishing a download, scanning for models and changing Keep context.
@@ -195,7 +201,7 @@ models:
 | **Warn only** | As **Hash once**, but a mismatch only adds a warning to the log. |
 | **Off** | No hashing; recorded values are kept but not checked. |
 
-After a mismatch, **Library** marks the entry **sha256 changed**; **Accept new sha256** records the new value if you replaced the file on purpose. The check catches a wrong, truncated or replaced file; it is not a security boundary. Computed hashes are cached in `sha256-cache.json` by size and modified time.
+The model, its listed MTP head and its listed projector are each checked when a load uses them; a head or projector found by looking in the folder has no recorded sum and is not checked. After a mismatch, **Library** marks the entry **sha256 changed**; **Accept new sha256** records the new value if you replaced the file on purpose. The check catches a wrong, truncated or replaced file; it is not a security boundary. Computed hashes are cached in `sha256-cache.json` by size and modified time.
 
 ### Questions and presets
 
