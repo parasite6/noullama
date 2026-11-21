@@ -32,7 +32,9 @@ import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
 import './styles.css';
 
-const logoUrl = new URL('../logo.png', import.meta.url).href;
+// 96 px stays sharp at 28 CSS px up to 3x scaling; the 960 px original
+// decoded to 3.7 MB of bitmap for the sidebar.
+const logoUrl = new URL('./logo-96.png', import.meta.url).href;
 
 type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean };
 
