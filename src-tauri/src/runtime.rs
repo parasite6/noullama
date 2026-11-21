@@ -83,6 +83,8 @@ pub struct AppState {
     // Loaded models, oldest first. The Playground uses the first ready one
     // until another is picked; API requests always name theirs.
     pub instances: Arc<Mutex<Vec<Arc<Instance>>>>,
+    /// Wakes the supervisor (`start_memory_guard`) when a load registers an instance.
+    pub instances_added: Arc<tokio::sync::Notify>,
     pub startup_warning: Option<String>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
     pub token: Arc<Mutex<Option<String>>>,
@@ -335,6 +337,7 @@ impl AppState {
             mismatches: Default::default(),
             hash_worker: Default::default(),
             hash_cache_lock: Default::default(),
+            instances_added: Default::default(),
             local_client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(120))
@@ -730,27 +733,36 @@ pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Value, String
     state_snapshot(state.inner()).await
 }
 
-pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
-    {
-        // The load task reports its own failures; this catches a runtime
-        // that stopped after it was ready.
-        let _guard = state.lifecycle.lock().await;
-        let list = state.instances.lock().await.clone();
-        for instance in list {
-            let exited = match instance.child.lock().await.as_mut() {
-                Some(child) => child.try_wait().map_err(|e| e.to_string())?,
-                None => None,
+/// The load task reports its own failures; this catches a runtime that
+/// stopped after it was ready. Runs from the UI snapshot and from the
+/// supervisor tick, so a crash is noticed while the window is hidden too.
+async fn reap_exited(state: &AppState) -> Result<(), String> {
+    let _guard = state.lifecycle.lock().await;
+    reap_exited_locked(state).await
+}
+
+/// `reap_exited` for a caller that already holds the lifecycle lock.
+async fn reap_exited_locked(state: &AppState) -> Result<(), String> {
+    let list = state.instances.lock().await.clone();
+    for instance in list {
+        let exited = match instance.child.lock().await.as_mut() {
+            Some(child) => child.try_wait().map_err(|e| e.to_string())?,
+            None => None,
+        };
+        if let (Some(status), true) = (exited, instance.is_ready()) {
+            let message = {
+                let logs = state.logs.lock().await;
+                with_runtime_detail(format!("{} stopped unexpectedly ({status}).", instance.stem()), &logs, &instance.label)
             };
-            if let (Some(status), true) = (exited, instance.is_ready()) {
-                let message = {
-                    let logs = state.logs.lock().await;
-                    with_runtime_detail(format!("{} stopped unexpectedly ({status}).", instance.stem()), &logs, &instance.label)
-                };
-                state.record_load_error(&instance, message).await;
-                state.unload_locked(&instance.id).await;
-            }
+            state.record_load_error(&instance, message).await;
+            state.unload_locked(&instance.id).await;
         }
     }
+    Ok(())
+}
+
+pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
+    reap_exited(state).await?;
     let settings = state.settings.lock().await.clone();
     let logs = state.logs.lock().await.clone();
     let downloads = state.downloads.lock().await.clone();
@@ -1054,6 +1066,7 @@ pub async fn load_model(state: &AppState) -> Result<String, String> {
     });
     state.load_errors.lock().await.retain(|e| e.path != instance.path());
     state.instances.lock().await.push(instance.clone());
+    state.instances_added.notify_one();
     state.log(instance.load_marker()).await;
     let id = instance.id.clone();
     let state = state.clone();
@@ -1536,12 +1549,27 @@ pub async fn crowded_load_warning(state: tauri::State<'_, AppState>) -> Result<O
     })))
 }
 
+/// Supervises loaded models once a second: notices runtimes that exited and
+/// runs OOM prevention. With nothing loaded there is nothing to reap or
+/// eject, so it sleeps until a load registers an instance.
 pub fn start_memory_guard(state: AppState) {
     tauri::async_runtime::spawn(async move {
         let mut pressure = crate::oom::Pressure::default();
         loop {
+            if state.instances.lock().await.is_empty() {
+                pressure = Default::default();
+                // A load that registers between the check and this wait
+                // leaves a stored permit, so it is not missed.
+                state.instances_added.notified().await;
+                continue;
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
             if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) { break; }
+            // Never wait here: a load or unload holding the lock must not
+            // delay OOM sampling. A busy tick leaves the crash to the next.
+            if let Ok(_guard) = state.lifecycle.try_lock() {
+                let _ = reap_exited_locked(&state).await;
+            }
             if state.settings.lock().await.allow_force_fit {
                 pressure = Default::default();
                 continue;
@@ -1653,6 +1681,29 @@ mod tests {
             with_runtime_detail("Plain.".into(), &VecDeque::new(), "foo"),
             "Plain."
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_wakes_on_load_and_reaps_a_crash_without_any_snapshot() {
+        let base = std::env::temp_dir().join(format!("noullama-reap-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base).unwrap();
+        // Parked with nothing loaded; the registration below must wake it.
+        start_memory_guard(state.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let instance = insert_test_instance(&state, "/m/crashed.gguf", true).await;
+        *instance.child.lock().await = Some(Command::new("true").spawn().unwrap());
+        state.instances_added.notify_one();
+        // The UI is hidden: nothing calls state_snapshot.
+        let reaped = tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.instances.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(reaped.is_ok(), "the supervisor did not unload the exited runtime");
+        let errors = state.load_errors.lock().await.clone();
+        assert!(errors.iter().any(|e| e.message.contains("crashed stopped unexpectedly")), "{:?}", errors.iter().map(|e| &e.message).collect::<Vec<_>>());
+        state.app.exiting.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     #[cfg(unix)]
     #[tokio::test]

@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react';
+
 // Ownership rejects duplicate clicks before React commits pending state.
 export class PendingActions {
   private names = new Set<string>();
@@ -20,4 +22,16 @@ export class LatestRequest {
 // Snapshots are JSON values; unchanged polls need not render again.
 export function retainEqual<T>(current: T, next: T): T {
   return JSON.stringify(current) === JSON.stringify(next) ? current : next;
+}
+
+// False while the window is hidden to the tray, so polls that only feed the
+// screen can stop.
+export function usePageVisible(): boolean {
+  const [visible, setVisible] = useState(() => typeof document === 'undefined' || !document.hidden);
+  useEffect(() => {
+    const update = () => setVisible(!document.hidden);
+    document.addEventListener('visibilitychange', update);
+    return () => document.removeEventListener('visibilitychange', update);
+  }, []);
+  return visible;
 }

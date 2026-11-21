@@ -1,4 +1,4 @@
-import { PendingActions, LatestRequest, retainEqual } from './refresh-state';
+import { PendingActions, LatestRequest, retainEqual, usePageVisible } from './refresh-state';
 import { MemoryWarningDialog, type CrowdedWarning } from './MemoryWarningDialog';
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -135,6 +135,7 @@ function App() {
   const [updates, setUpdates] = useState<UpdateView | null>(null);
   const [updatesOpen, setUpdatesOpen] = useState(false);
   const desktop = isTauri();
+  const pageVisible = usePageVisible();
   // Rescan local models when a download finishes.
   const finishedDownloads = (snapshot?.downloads ?? []).map(d => d.path ?? '').filter(Boolean).join('\n');
 
@@ -147,15 +148,15 @@ function App() {
     return () => { window.removeEventListener('dragover', stay); window.removeEventListener('drop', stay); };
   }, []);
   useEffect(() => {
-    if (!detailsOpen || !desktop) return;
+    if (!detailsOpen || !desktop || !pageVisible) return;
     let live = true;
     const read = () => invoke<MemoryUse>('model_memory').then(value => { if (live) setMemory(value); }).catch(() => {});
     read();
     const timer = setInterval(read, 2000);
     return () => { live = false; clearInterval(timer); };
-  }, [detailsOpen]);
+  }, [detailsOpen, pageVisible]);
 
-  useEffect(() => { if (!desktop || tab !== 'models') return; const timer = setInterval(() => setScanTick(t => t + 1), 5000); return () => clearInterval(timer); }, [tab]);
+  useEffect(() => { if (!desktop || tab !== 'models' || !pageVisible) return; const timer = setInterval(() => setScanTick(t => t + 1), 5000); return () => clearInterval(timer); }, [tab, pageVisible]);
   async function refresh() {
     if (!desktop) return;
     const request = refreshRequests.current.begin();
@@ -179,9 +180,15 @@ function App() {
     if (!desktop) return;
     invoke<SavedPreset[]>('list_presets').then(setSavedPresets).catch(e => setNotice({ text: errorText(e), error: true }));
     refresh().catch(e => setNotice({ text: errorText(e), error: true }));
+  }, []);
+  // Hidden in the tray, nothing on screen needs the poll; the backend watches
+  // loaded runtimes on its own. Coming back shows current state at once.
+  useEffect(() => {
+    if (!desktop || !pageVisible) return;
+    refresh().catch(() => {});
     const timer = setInterval(() => { refresh().catch(() => {}); }, 1200);
     return () => clearInterval(timer);
-  }, []);
+  }, [pageVisible]);
   useEffect(() => { if (snapshot && !dirty) setSettings(snapshot.settings); }, [snapshot?.settings.runtime_path, snapshot?.settings.model_path, snapshot?.settings.mmproj_path, snapshot?.settings.mtp, snapshot?.settings.mtp_path, snapshot?.settings.context_size, snapshot?.settings.gpu_layers, snapshot?.settings.api_port, snapshot?.settings.runtime_port, snapshot?.settings.hf_path, snapshot?.settings.download_dir, snapshot?.settings.library_path, dirty]);
   useEffect(() => { if (snapshot) setDownloadDir(snapshot.settings.download_dir); }, [snapshot?.settings.download_dir]);
   useEffect(() => {
