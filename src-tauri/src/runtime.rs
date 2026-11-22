@@ -1008,17 +1008,90 @@ pub fn validate_request(payload: &Value) -> Result<(), String> {
     Ok(())
 }
 
+const SERVER_NAME: &str = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+// Bounds for looking inside a selected folder, so a broad or hostile folder
+// cannot make the search slow or lead it outside that folder.
+const SERVER_SEARCH_DEPTH: usize = 3;
+const SERVER_SEARCH_ENTRIES: usize = 2_000;
+
+/// The executable to run for `path`, or `path` itself when it cannot be
+/// resolved (the launch then reports the problem).
 pub fn server_binary(path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_dir() {
-        path.join(if cfg!(windows) {
-            "llama-server.exe"
-        } else {
-            "llama-server"
-        })
-    } else {
-        path
+    resolve_server(path).unwrap_or_else(|_| PathBuf::from(path.trim()))
+}
+
+/// Finds llama-server for a runtime path: the file itself, `llama-server`
+/// in the folder, or the one llama-server inside the folder or inside the
+/// managed build the folder belongs to (archives may unpack into several
+/// package folders, such as a separate CUDA runtime package).
+pub fn resolve_server(path: &str) -> Result<PathBuf, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("No llama.cpp build is selected. Choose one in Runtime.".into());
     }
+    let given = PathBuf::from(path);
+    let meta = std::fs::metadata(&given)
+        .map_err(|_| format!("The selected llama.cpp build is missing: {path}. Choose an installed build in Runtime."))?;
+    if meta.is_file() {
+        return Ok(given);
+    }
+    if !meta.is_dir() {
+        return Err(format!("{path} is not a file or folder. Choose llama-server or its folder in Runtime."));
+    }
+    let direct = given.join(SERVER_NAME);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    let root = managed_build_root(&given).unwrap_or(given);
+    let found = find_servers(&root);
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("No {SERVER_NAME} was found in {}. Choose llama-server or its folder in Runtime.", root.display())),
+        many => Err(format!(
+            "{} contains several {SERVER_NAME} files ({}). Choose one of them in Runtime.",
+            root.display(),
+            many.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// The managed build folder (holding `noullama-install.json`) that `dir` is
+/// in, checking `dir` and up to three parents.
+fn managed_build_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors().take(4).find(|d| d.join("noullama-install.json").is_file()).map(Path::to_path_buf)
+}
+
+/// Every regular `llama-server` file under `root`, at most
+/// `SERVER_SEARCH_DEPTH` levels down and `SERVER_SEARCH_ENTRIES` entries,
+/// without following symlinked folders or entering hidden ones.
+fn find_servers(root: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![(root.to_path_buf(), 0)];
+    let mut found = Vec::new();
+    let mut seen = 0;
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > SERVER_SEARCH_ENTRIES {
+                found.sort();
+                return found;
+            }
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                if depth < SERVER_SEARCH_DEPTH {
+                    pending.push((entry.path(), depth + 1));
+                }
+            } else if kind.is_file() && name == SERVER_NAME {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 pub fn model_directory(settings: &Settings, data_dir: &Path) -> PathBuf {
@@ -1347,6 +1420,7 @@ pub async fn probe_runtime(path: String, library_path: String) -> Result<String,
         library_path,
         ..Settings::default()
     };
+    let server = resolve_server(&settings.runtime_path)?;
     let output = probe_output(runtime_command(&settings).arg("--version"), Duration::from_secs(10))
     .await
     .map_err(|_| "Runtime version check timed out")?
@@ -1364,7 +1438,8 @@ pub async fn probe_runtime(path: String, library_path: String) -> Result<String,
     .map_err(|_| "Device detection timed out")?
     .map_err(|e| e.to_string())?;
     Ok(format!(
-        "{text}\n{}{}",
+        "Using {}\n{text}\n{}{}",
+        server.display(),
         String::from_utf8_lossy(&devices.stdout),
         String::from_utf8_lossy(&devices.stderr)
     ))
@@ -1616,6 +1691,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
     let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))
         .await
         .map_err(|e| format!("Private runtime port is unavailable: {e}"))?;
+    resolve_server(&settings.runtime_path)?;
     let devices = tokio::time::timeout(
         Duration::from_secs(15),
         runtime_command(settings)
@@ -2389,6 +2465,66 @@ mod tests {
         for (path, stem) in [("éabcd", "éabcd"), ("x.GGUF", "x"), ("é.gguf", "é"), (".gguf", "")] {
             assert_eq!(file_stem(path), stem);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_paths_resolve_to_the_one_llama_server_they_mean() {
+        let base = std::env::temp_dir().join(format!("noullama-resolve-{}", uuid::Uuid::new_v4()));
+        let touch = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        };
+        // The managed CUDA layout: the server in package-0, the CUDA
+        // runtime libraries in a separate package-1 folder.
+        let build = base.join("runtimes/b1-cuda13");
+        let server = build.join("package-0/llama-b1/llama-server");
+        let cudart = build.join("package-1/cudart-llama-b1-bin-ubuntu-cuda-13.5-x64");
+        touch(&server);
+        touch(&cudart.join("libcudart.so.13"));
+        touch(&build.join("noullama-install.json"));
+        for path in [&server, &server.parent().unwrap().to_path_buf(), &cudart, &build.join("package-1"), &build.join("package-0"), &build] {
+            assert_eq!(resolve_server(path.to_str().unwrap()).unwrap(), *server, "{}", path.display());
+        }
+
+        assert_eq!(resolve_server("  ").unwrap_err(), "No llama.cpp build is selected. Choose one in Runtime.");
+        let gone = base.join("runtimes/b0-cuda13/package-0/llama-b0/llama-server");
+        assert_eq!(
+            resolve_server(gone.to_str().unwrap()).unwrap_err(),
+            format!("The selected llama.cpp build is missing: {}. Choose an installed build in Runtime.", gone.display())
+        );
+
+        // Two servers in one folder are never guessed between.
+        let two = base.join("two");
+        touch(&two.join("a/llama-server"));
+        touch(&two.join("b/llama-server"));
+        assert!(resolve_server(two.to_str().unwrap()).unwrap_err().contains("contains several llama-server files"));
+
+        // The search stays inside the folder: no symlinked folders, no hidden
+        // folders, nothing deeper than the limit.
+        let outside = base.join("outside");
+        touch(&outside.join("llama-server"));
+        let linked = base.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join("bin")).unwrap();
+        touch(&linked.join(".hidden/llama-server"));
+        touch(&linked.join("1/2/3/4/llama-server"));
+        assert_eq!(
+            resolve_server(linked.to_str().unwrap()).unwrap_err(),
+            format!("No llama-server was found in {}. Choose llama-server or its folder in Runtime.", linked.display())
+        );
+
+        // The entry limit ends a search of a huge folder.
+        let wide = base.join("wide");
+        for n in 0..SERVER_SEARCH_ENTRIES + 10 {
+            std::fs::create_dir_all(wide.join(format!("d{n:05}"))).unwrap();
+        }
+        touch(&wide.join(format!("d{:05}/llama-server", SERVER_SEARCH_ENTRIES + 5)));
+        let started = std::time::Instant::now();
+        let _ = resolve_server(wide.to_str().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(find_servers(&wide).len() <= 1);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
