@@ -1,5 +1,6 @@
 //! Keep context: earlier decisions ride along in each new request's state, so
-//! the model sees what it decided before. Each loaded model keeps its own
+//! the model sees what it decided before. Each loaded instance has its own
+//! switch (starting from the `keep_context` setting at load) and its own
 //! history, shared by the Playground and every local API caller that reaches
 //! it. When a request no longer fits the context window, the oldest decisions
 //! are flushed until it does.
@@ -112,9 +113,10 @@ pub enum Failure {
     Other(String),
 }
 
-/// Runs one decision, adding earlier decisions when Keep context is on.
+/// Runs one decision, adding earlier decisions when this instance's Keep
+/// context is on.
 pub async fn infer(state: &AppState, instance: &Arc<Instance>, payload: Value) -> Result<Value, String> {
-    if !state.settings.lock().await.keep_context {
+    if !instance.keeps_context() {
         return state.infer_once(instance, payload, false).await.map_err(|failure| match failure {
             Failure::ContextFull(message) | Failure::Other(message) => message,
         });
@@ -131,6 +133,10 @@ pub async fn infer(state: &AppState, instance: &Arc<Instance>, payload: Value) -
         match state.infer_once(instance, request, !carried.is_empty()).await {
             Ok(result) => {
                 let mut history = instance.context.lock().await;
+                // Turned off (and cleared) while this request ran: keep nothing.
+                if !instance.keeps_context() {
+                    return Ok(result);
+                }
                 history.last_flushed = match skipped.checked_sub(1).map(|last| earlier[last].seq) {
                     Some(seq) => history.flush_through(seq),
                     None => 0,
@@ -145,35 +151,27 @@ pub async fn infer(state: &AppState, instance: &Arc<Instance>, payload: Value) -
     }
 }
 
+/// One loaded instance's Keep context switch (instance cards and the
+/// Playground rail). Off empties that instance's history only. Lives until
+/// the instance is unloaded and is never saved; new loads start from the
+/// `keep_context` setting, which the Local API load panel saves.
 #[tauri::command]
-pub async fn set_keep_context(on: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    crate::library::refresh(state.inner()).await;
-    let mut settings = state.settings.lock().await.clone();
-    settings.keep_context = on;
-    crate::runtime::persist_settings(state.inner(), settings).await?;
-    if !on {
-        clear_all(state.inner()).await;
-    }
+pub async fn set_instance_keep_context(id: String, on: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    set_keep(state.inner(), &id, on).await
+}
+
+pub async fn set_keep(state: &AppState, id: &str, on: bool) -> Result<(), String> {
+    crate::library::refresh(state).await;
+    let instance = state.instance(id).await.ok_or("That model is no longer loaded.")?;
+    instance.set_keep_context(on).await;
     Ok(())
 }
 
-async fn clear_all(state: &AppState) {
-    let instances = state.instances.lock().await.clone();
-    for instance in instances {
-        instance.context.lock().await.clear();
-    }
-}
-
-/// Empties one loaded model's history, or every model's when `model` is None.
+/// Empties one loaded instance's history. An unknown id is ignored.
 #[tauri::command]
-pub async fn clear_context(model: Option<String>, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    match model {
-        Some(id) => {
-            if let Some(instance) = state.instance(&id).await {
-                instance.context.lock().await.clear();
-            }
-        }
-        None => clear_all(state.inner()).await,
+pub async fn clear_context(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if let Some(instance) = state.instance(&id).await {
+        instance.context.lock().await.clear();
     }
     Ok(())
 }
@@ -230,6 +228,49 @@ mod tests {
         let oldest = history.entries[0].seq;
         assert_eq!(history.flush_through(oldest), 1);
         assert_eq!(history.entries[0].state, json!(6));
+    }
+
+    fn temp_state() -> (AppState, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("noullama-keep-{}", uuid::Uuid::new_v4()));
+        (AppState::new(path.clone()).unwrap(), path)
+    }
+
+    #[tokio::test]
+    async fn a_new_instance_starts_from_the_keep_context_setting() {
+        let (state, path) = temp_state();
+        let off = crate::runtime::insert_test_instance(&state, "/m/a.gguf", true).await;
+        state.settings.lock().await.keep_context = true;
+        let on = crate::runtime::insert_test_instance(&state, "/m/a.gguf", true).await;
+        assert!(!off.keeps_context(), "a loaded instance keeps its own switch when the setting changes");
+        assert!(on.keeps_context());
+        state.settings.lock().await.keep_context = false;
+        let again = crate::runtime::insert_test_instance(&state, "/m/b.gguf", true).await;
+        assert!(!again.keeps_context());
+        assert!(on.keeps_context());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_instances_of_one_file_have_their_own_switch_and_off_clears_only_that_one() {
+        let (state, path) = temp_state();
+        let first = crate::runtime::insert_test_instance(&state, "/m/a.gguf", true).await;
+        let second = crate::runtime::insert_test_instance(&state, "/m/a.gguf", true).await;
+        assert_eq!(second.slot, 2);
+        set_keep(&state, &first.id, true).await.unwrap();
+        set_keep(&state, &second.id, true).await.unwrap();
+        first.context.lock().await.push(json!("one"), Map::new());
+        second.context.lock().await.push(json!("two"), Map::new());
+        set_keep(&state, &second.id, false).await.unwrap();
+        assert!(first.keeps_context());
+        assert!(!second.keeps_context());
+        assert_eq!(first.context.lock().await.len(), 1, "the other instance keeps its history");
+        assert_eq!(second.context.lock().await.len(), 0);
+        let snapshot = crate::runtime::state_snapshot(&state).await.unwrap();
+        let flags: Vec<_> = snapshot["instances"].as_array().unwrap().iter().map(|i| i["keep_context"].clone()).collect();
+        assert_eq!(flags, [json!(true), json!(false)]);
+        assert!(!state.settings.lock().await.keep_context, "per-instance switches do not change the setting");
+        assert_eq!(set_keep(&state, "gone", true).await.unwrap_err(), "That model is no longer loaded.");
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     /// Decides on a real runtime at a 512-token context with Keep context on:

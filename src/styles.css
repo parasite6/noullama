@@ -148,18 +148,23 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .spin { animation: rotate 1s linear infinite; }
 @keyframes rotate { to { transform: rotate(360deg); } }
 
-/* Model strip: the run bar every page shares */
-.model-strip { display: flex; align-items: center; gap: 14px; padding: 12px 12px 12px 14px; margin-bottom: 22px; border-radius: 20px; background: var(--surface); min-width: 0; }
-.model-strip-icon { display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 12px; background: var(--surface-2); color: var(--muted); flex-shrink: 0; overflow: hidden; }
+/* Local API load panel: the selected model, its load settings and the load buttons */
+.load-identity { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.load-identity-icon { display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 12px; background: var(--surface-2); color: var(--muted); flex-shrink: 0; overflow: hidden; }
 .model-identity { min-width: 0; flex: 1; display: grid; gap: 2px; }
 .model-identity strong { min-width: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-identity small { overflow-wrap: anywhere; }
 .pending-model { color: var(--warn); }
-.model-controls { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.load-build { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.load-build code { font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.load-build .text-button { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.load-bar { margin: 0 0 22px; }
+.load-bar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.settings-panel.load-panel { margin-bottom: 10px; }
 
 /* Playground: content on the left, run settings in a rail on the right */
 .page-content.page-playground { height: 100vh; display: flex; flex-direction: column; }
-.page-playground > .page-heading, .page-playground > .notice, .page-playground > .model-strip { flex-shrink: 0; }
+.page-playground > .page-heading, .page-playground > .notice { flex-shrink: 0; }
 /* The page fills the window: the rail takes the full height and the left column scrolls on its own. */
 .playground { flex: 1; min-height: 520px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(420px, .8fr); gap: 20px; }
 .playground-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; min-height: 0; overflow-y: auto; }
@@ -224,7 +229,7 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .search-input input:focus { border-color: var(--line-strong); }
 .search-input .icon-button { position: absolute; right: 8px; }
 .page-content.page-hub { height: 100vh; display: flex; flex-direction: column; }
-.page-hub > .page-heading, .page-hub > .notice, .page-hub > .model-strip, .page-hub > .hub-search, .page-hub > .load-error { flex-shrink: 0; }
+.page-hub > .page-heading, .page-hub > .notice, .page-hub > .hub-search { flex-shrink: 0; }
 .hub-panes { flex: 1; min-height: 380px; display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: 20px; }
 .hub-list { overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding-right: 4px; }
 .pane-label { font-size: 12px; font-weight: 550; color: var(--muted); padding: 12px 10px 6px; }
@@ -434,7 +439,6 @@ label small { font-weight: 400; line-height: 1.6; }
   :root { --sidebar-w: 72px; }
   .sidebar { padding-left: 10px; padding-right: 10px; }
   .brand > span, .nav-item > span, .runtime-card > span:last-child { display: none; }
-  .sidebar-loaded { display: none; }
   .brand { justify-content: center; margin: 0 0 24px; }
   .nav-item, .runtime-card { justify-content: center; padding: 0; }
   .runtime-card { height: 52px; background: none; }
@@ -442,8 +446,8 @@ label small { font-weight: 400; line-height: 1.6; }
   .page-content.page-hub { height: auto; }
   .hub-panes { grid-template-columns: minmax(0, 1fr); min-height: 0; }
   .hub-list, .hub-detail { overflow: visible; }
-  .model-strip { flex-wrap: wrap; }
-  .model-controls { width: 100%; justify-content: flex-end; }
+  .load-bar { flex-wrap: wrap; border-radius: 18px; }
+  .load-bar-actions { width: 100%; justify-content: flex-end; }
   .form-grid { grid-template-columns: minmax(0, 1fr); }
   .endpoint-list > div { grid-template-columns: 56px minmax(0, 1fr) auto; }
   .endpoint-list > div > span:nth-child(3) { grid-column: 2; grid-row: 2; }
@@ -473,14 +477,13 @@ label small { font-weight: 400; line-height: 1.6; }
 .notice-text { display: flex; gap: 10px; align-items: flex-start; }
 .notice-text > svg { flex-shrink: 0; margin-top: 2px; }
 .notice.error { background: rgba(239, 138, 133, .12); box-shadow: inset 0 0 0 1px rgba(239, 138, 133, .3); }
-.load-error { display: flex; gap: 12px; align-items: flex-start; margin: -10px 0 22px; padding: 14px 12px 14px 16px; border-radius: 14px; background: rgba(239, 138, 133, .12); box-shadow: inset 0 0 0 1px rgba(239, 138, 133, .3); color: #f3c4c1; font-size: 13px; }
+.load-error { display: flex; gap: 12px; align-items: flex-start; margin: 0 0 16px; padding: 14px 12px 14px 16px; border-radius: 14px; background: rgba(239, 138, 133, .12); box-shadow: inset 0 0 0 1px rgba(239, 138, 133, .3); color: #f3c4c1; font-size: 13px; }
 .load-error > svg { flex-shrink: 0; margin-top: 1px; color: var(--bad); }
 .load-error > div:nth-child(2) { flex: 1; min-width: 0; }
 .load-error strong { font-weight: 550; color: var(--text); }
 .load-error pre { margin-top: 8px; padding: 10px 12px; border-radius: 8px; background: rgba(0, 0, 0, .25); font-size: 12px; line-height: 1.6; color: #f3c4c1; max-height: 140px; overflow: auto; }
 .load-error-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .load-error .icon-button { color: inherit; }
-.page-playground > .load-error { flex-shrink: 0; }
 
 /* Images sent with the state when a projector is loaded */
 .image-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 18px; background: var(--field); border-top: 1px solid var(--line); }
@@ -502,6 +505,8 @@ label small { font-weight: 400; line-height: 1.6; }
 .sidebar-loaded-name { flex: 1; min-width: 0; justify-content: flex-start; padding: 6px 0; background: none; font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; text-align: left; }
 .sidebar-loaded-name:hover { color: var(--accent, var(--text)); text-decoration: underline; }
 .sidebar-loaded .icon-button { padding: 6px; flex-shrink: 0; }
+/* After the base rule so the collapsed rail really hides the list. */
+@media (max-width: 1000px) { .sidebar-loaded { display: none; } }
 .model-details { position: absolute; left: calc(100% + 14px); bottom: 0; z-index: 40; width: 340px; padding: 16px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--line-strong); box-shadow: 0 18px 50px rgba(0, 0, 0, .5); font-size: 12.5px; }
 .model-details::before { content: ""; position: absolute; left: -14px; top: 0; bottom: 0; width: 14px; }
 .model-details-head { display: grid; gap: 2px; margin-bottom: 12px; }
@@ -561,7 +566,6 @@ label small { font-weight: 400; line-height: 1.6; }
 .keep-context { display: grid; gap: 4px; }
 .keep-context-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-left: -6px; }
 .keep-context-status { font-size: 12px; color: var(--muted); line-height: 1.5; }
-.keep-context-card { padding: 14px 18px; margin-bottom: 16px; }
 
 /* Model names for the local API */
 .model-names { margin-bottom: 20px; }
@@ -589,8 +593,31 @@ label small { font-weight: 400; line-height: 1.6; }
 .loaded-name strong { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .loaded-name small { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .loaded-model .model-aliases { padding-left: 46px; }
+/* Local API instance cards: load-time settings and API names under the head */
+.instance-settings { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 16px; margin: 0; padding-left: 46px; }
+.instance-settings > div { min-width: 0; }
+.instance-settings dt { font-size: 11.5px; color: var(--muted); }
+.instance-settings dd { margin: 2px 0 0; font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-stale { margin-left: 46px; font-size: 12px; line-height: 1.6; color: var(--warn); }
+.instance-names { display: grid; gap: 8px; }
+.instance-names-label { padding-left: 46px; font-size: 11.5px; color: var(--muted); }
+.instance-suffix { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.instance-suffix .instance-names-label { flex-basis: 100%; }
+.instance-suffix input { width: 180px; max-width: 100%; padding: 6px 14px; margin-left: 46px; }
+.instance-suffix small { flex-basis: 100%; padding-left: 46px; color: var(--muted); }
+.load-instance { min-width: 200px; margin-left: auto; }
+.instance-card .model-aliases { padding-left: 46px; }
+/* An instance's own Keep context switch, Clear and status */
+.instance-keep { padding-left: 46px; }
+.instance-keep .keep-context-row { justify-content: flex-start; }
+/* Sidebar: stored load errors, linking to the Local API tab */
+.nav-item.load-error-nav, .nav-item.load-error-nav svg { color: var(--bad); }
 @media (max-width: 640px) {
-  .row-aliases, .loaded-model .model-aliases { padding-left: 4px; }
+  .row-aliases, .loaded-model .model-aliases, .instance-settings, .instance-names-label { padding-left: 4px; }
+  .instance-suffix input { margin-left: 4px; }
+  .instance-suffix small { padding-left: 4px; }
+  .instance-stale { margin-left: 4px; }
+  .instance-keep { padding-left: 4px; }
   .loaded-head { flex-wrap: wrap; }
 }
 

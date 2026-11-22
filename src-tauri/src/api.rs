@@ -560,6 +560,95 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    async fn listed(app: &Router) -> Vec<String> {
+        let request = Request::builder().uri("/v1/models").header("host", "127.0.0.1:11435").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        body["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn several_instances_of_one_file_answer_to_suffixed_names() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let file = "/models/acme/qwen.gguf";
+        let first = crate::runtime::insert_test_instance(&state, file, true).await;
+        let other = crate::runtime::insert_test_instance(&state, "/models/acme/other.gguf", true).await;
+        let second = crate::runtime::insert_test_instance(&state, file, true).await;
+        crate::runtime::set_aliases(&state, file.into(), vec!["triage".into()]).await.unwrap();
+        assert_eq!((first.slot, second.slot, other.slot), (1, 2, 1));
+        assert_eq!((first.label.as_str(), second.label.as_str()), ("qwen", "qwen#2"));
+        assert_eq!(second.suffix(), "-i-2");
+        let app = router(state.clone());
+        // Two instances of one file are not a conflict: each identifier has one target.
+        assert_eq!(listed(&app).await, ["qwen", "triage", "other", "qwen-i-2", "triage-i-2"]);
+        for (name, expected) in [("qwen", &first), ("triage", &first), ("qwen-i-2", &second), ("triage-i-2", &second), ("other", &other)] {
+            assert_eq!(state.route(Some(name)).await.ok().map(|i| i.id.clone()), Some(expected.id.clone()), "{name}");
+        }
+        assert_eq!(status_and_message(&app, "qwen-i-3").await.0, StatusCode::NOT_FOUND);
+        // A custom suffix takes effect on the next request; the old one stops working.
+        assert_eq!(crate::runtime::change_suffix(&state, &second.id, " -fast ").await.unwrap(), "-fast");
+        assert_eq!(state.route(Some("triage-fast")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(status_and_message(&app, "triage-i-2").await.0, StatusCode::NOT_FOUND);
+        assert!(crate::runtime::change_suffix(&state, &first.id, "-x").await.unwrap_err().contains("cannot be changed"));
+        assert!(crate::runtime::change_suffix(&state, &second.id, "").await.unwrap_err().starts_with("Enter a suffix"));
+        // `other` is a models.yml name; `qwen-other` is free, but `-i-2` style names of others are not.
+        let third = crate::runtime::insert_test_instance(&state, file, true).await;
+        assert_eq!(third.slot, 3);
+        assert_eq!(crate::runtime::change_suffix(&state, &third.id, "-fast").await.unwrap_err(), "\"qwen-fast\" already reaches instance 2 of qwen. Choose another suffix.");
+        crate::runtime::set_aliases(&state, "/models/acme/later.gguf".into(), vec!["qwen-later".into()]).await.unwrap();
+        assert!(crate::runtime::change_suffix(&state, &third.id, "-LATER").await.unwrap_err().contains("in models.yml"));
+        // Unloading an instance frees its slot and forgets its suffix.
+        crate::runtime::unload(&state, &second.id).await.unwrap();
+        let again = crate::runtime::insert_test_instance(&state, file, true).await;
+        assert_eq!((again.slot, again.suffix().as_str()), (2, "-i-2"));
+        assert_eq!(state.route(Some("triage-i-2")).await.ok().map(|i| i.id.clone()), Some(again.id.clone()));
+        assert_eq!(status_and_message(&app, "triage-fast").await.0, StatusCode::NOT_FOUND);
+        // A loading instance answers 503 by its own names only.
+        crate::runtime::set_test_ready(&third, false);
+        let (status, message) = status_and_message(&app, "qwen-i-3").await;
+        assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "qwen instance 3 is still loading."));
+        assert!(!listed(&app).await.contains(&"qwen-i-3".to_owned()));
+        state.shutdown().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_bare_name_falls_through_only_when_the_setting_is_on() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let file = "/models/acme/qwen.gguf";
+        let first = crate::runtime::insert_test_instance(&state, file, true).await;
+        let second = crate::runtime::insert_test_instance(&state, file, false).await;
+        let third = crate::runtime::insert_test_instance(&state, file, true).await;
+        crate::runtime::set_aliases(&state, file.into(), vec!["triage".into()]).await.unwrap();
+        crate::runtime::unload(&state, &first.id).await.unwrap();
+        let app = router(state.clone());
+        // Off (default): 503 naming the suffixed ids that work.
+        let (status, message) = status_and_message(&app, "triage").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(message, "'triage' is instance 1 of qwen, which is not loaded. Other loaded instances answer to: triage-i-2, triage-i-3. Load it again, or turn on Fall through to another instance in Settings.");
+        assert_eq!(listed(&app).await, ["qwen-i-3", "triage-i-3"]);
+        // On: the lowest slot (2), which is still loading.
+        state.settings.lock().await.fall_through_to_other_instances = true;
+        let (status, message) = status_and_message(&app, "triage").await;
+        assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "qwen instance 2 is still loading."));
+        crate::runtime::set_test_ready(&second, true);
+        assert_eq!(state.route(Some("triage")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(state.route(Some("qwen")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(listed(&app).await, ["qwen", "triage", "qwen-i-2", "triage-i-2", "qwen-i-3", "triage-i-3"]);
+        // Suffixed names never fall through.
+        crate::runtime::unload(&state, &second.id).await.unwrap();
+        assert_eq!(status_and_message(&app, "triage-i-2").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(state.route(Some("triage")).await.ok().map(|i| i.id.clone()), Some(third.id.clone()));
+        // With slot 1 loaded again, the bare name goes to it, not the lowest other slot.
+        let back = crate::runtime::insert_test_instance(&state, file, true).await;
+        assert_eq!(back.slot, 1);
+        assert_eq!(state.route(Some("triage")).await.ok().map(|i| i.id.clone()), Some(back.id.clone()));
+        state.shutdown().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn aliases_are_trimmed_checked_and_deduplicated() {
         let names = crate::runtime::normalize_aliases(&[" triage ".into(), "Triage".into(), "".into(), "noullama".into(), "acme/d1:q8".into()]).unwrap();
@@ -568,22 +657,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_form_cannot_overwrite_aliases_or_keep_context() {
+    async fn settings_form_cannot_overwrite_aliases_but_saves_the_keep_context_default() {
         let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(path.clone()).unwrap();
         let stale = state.settings.lock().await.clone();
-        {
-            let mut settings = state.settings.lock().await;
-            settings.model_routes.insert("/m/a.gguf".into(), vec!["triage".into()]);
-            settings.keep_context = true;
-        }
+        state.settings.lock().await.model_routes.insert("/m/a.gguf".into(), vec!["triage".into()]);
         let mut edited = stale;
         edited.context_size = 4096;
+        edited.keep_context = true;
         crate::runtime::save_from_editor(&state, edited).await.unwrap();
         let settings = state.settings.lock().await.clone();
         assert_eq!(settings.context_size, 4096);
         assert_eq!(settings.model_routes["/m/a.gguf"], ["triage"]);
-        assert!(settings.keep_context);
+        assert!(settings.keep_context, "the load panel saves the Keep context default");
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// A stand-in native runtime that answers every /v1/systemone request and
+    /// records each body it saw.
+    async fn fake_native_runtime() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::routing::post;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let log = seen.clone();
+        let app = Router::new().route("/v1/systemone", post(move |Json(body): Json<Value>| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(body);
+                Json(json!({"answers":{"route":{"type":"choice","choice":"billing","probabilities":{"billing":0.9,"technical":0.1}}},"usage":{"input_tokens":10,"output_tokens":1}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, seen)
+    }
+
+    /// API requests apply Keep context by the switch of the instance they are
+    /// routed to: two instances of one file, one on and one off.
+    #[tokio::test]
+    async fn api_requests_follow_the_routed_instance_keep_context_switch() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let (port, seen) = fake_native_runtime().await;
+        let file = "/models/acme/sorter.gguf";
+        let first = crate::runtime::insert_test_instance_on(&state, file, true, port).await;
+        let second = crate::runtime::insert_test_instance_on(&state, file, true, port).await;
+        crate::context::set_keep(&state, &second.id, true).await.unwrap();
+        let app = router(state.clone());
+        let ask = |model: &'static str, text: &'static str| {
+            let app = app.clone();
+            async move {
+                let mut body = request();
+                body["model"] = json!(model);
+                body["state"] = json!(text);
+                let request = Request::builder().method("POST").uri("/v1/systemone").header("host", "127.0.0.1:11435").header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        };
+        ask("sorter", "first ticket").await;
+        ask("sorter", "second ticket").await;
+        ask("sorter-i-2", "first ticket").await;
+        ask("sorter-i-2", "second ticket").await;
+        let states: Vec<Value> = seen.lock().unwrap().iter().map(|b| b["state"].clone()).collect();
+        assert_eq!(states[0], json!("first ticket"));
+        assert_eq!(states[1], json!("second ticket"), "instance 1 is off: its state is sent unchanged");
+        assert_eq!(states[2], json!("first ticket"), "instance 2 has no history yet");
+        let carried = states[3].as_str().unwrap();
+        assert!(carried.starts_with("Earlier decisions, oldest first:\n1. State: first ticket\n   Decisions: route = billing"), "{carried}");
+        assert!(carried.ends_with("Current state:\nsecond ticket"), "{carried}");
+        assert_eq!(first.context.lock().await.len(), 0);
+        assert_eq!(second.context.lock().await.len(), 2);
+        // The Playground's decide path uses the same switch.
+        crate::context::set_keep(&state, &second.id, false).await.unwrap();
+        assert_eq!(second.context.lock().await.len(), 0);
+        state.infer_on(&second, json!({"state":"third","questions":request()["questions"]})).await.unwrap();
+        assert_eq!(seen.lock().unwrap().last().unwrap()["state"], json!("third"));
+        assert_eq!(second.context.lock().await.len(), 0);
         std::fs::remove_dir_all(path).unwrap();
     }
 

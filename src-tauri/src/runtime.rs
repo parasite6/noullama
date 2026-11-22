@@ -28,6 +28,7 @@ pub struct Settings {
     pub mtp_path: String,
     // How decisions are read: "auto" (from the GGUF's metadata), "native"
     // (llama.cpp's /v1/systemone) or "winnow" (Winnow's prompt layout).
+    // The UI labels them "Auto", "Built-in" and "Prompt layout".
     pub decision_mode: String,
     pub context_size: u32,
     pub gpu_layers: i32,
@@ -43,11 +44,17 @@ pub struct Settings {
     // sha256 checks before a load: "off", "once", "every_load" or "warn".
     // Changed only by set_sha256_check.
     pub sha256_check: String,
-    // Carry earlier decisions into each request's state (see context.rs).
-    // Changed only by set_keep_context.
+    // Keep context for new loads: whether a new instance starts carrying
+    // earlier decisions into each request's state (see context.rs). Each
+    // loaded instance then has its own switch (Instance::keeps_context).
+    // Saved by the Local API load panel.
     pub keep_context: bool,
     pub allow_force_fit: bool,
     pub hide_crowded_load_warning: bool,
+    // When slot 1 of a file is not loaded, its unsuffixed names reach the
+    // loaded instance with the lowest slot instead of answering 503.
+    // Changed only by set_fall_through.
+    pub fall_through_to_other_instances: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -70,6 +77,7 @@ impl Default for Settings {
             keep_context: false,
             allow_force_fit: false,
             hide_crowded_load_warning: false,
+            fall_through_to_other_instances: false,
         }
     }
 }
@@ -183,9 +191,75 @@ pub struct LoadedModel {
 
 #[derive(Clone, Serialize)]
 pub struct LoadError {
+    /// The instance that failed or stopped; errors are dismissed by it.
+    pub id: String,
     pub path: String,
+    pub slot: u32,
     pub name: String,
     pub message: String,
+}
+
+/// The suffix a new instance in `slot` starts with: none for slot 1, `-i-N` after.
+pub fn default_suffix(slot: u32) -> String {
+    if slot <= 1 { String::new() } else { format!("-i-{slot}") }
+}
+
+/// The lowest slot no loaded instance of the file holds.
+pub fn free_slot(taken: &[u32]) -> u32 {
+    (1..).find(|slot| !taken.contains(slot)).unwrap_or(1)
+}
+
+/// `preferred` (a reload's old slot) when it is free, else the lowest free slot.
+pub fn pick_slot(taken: &[u32], preferred: Option<u32>) -> u32 {
+    preferred.filter(|s| *s >= 1 && !taken.contains(s)).unwrap_or_else(|| free_slot(taken))
+}
+
+/// A log label unique among loaded models: the file name for slot 1, else
+/// `name#N`, starting at the slot number.
+pub fn instance_label(stem: &str, slot: u32, taken: &[String]) -> String {
+    (slot.max(1)..)
+        .map(|n| if n == 1 { stem.to_owned() } else { format!("{stem}#{n}") })
+        .find(|label| !taken.contains(label))
+        .unwrap_or_else(|| stem.to_owned())
+}
+
+/// The identifiers one instance answers to: each of the file's names with the
+/// suffix added, names first. Each is `(identifier, kind, base name)`.
+pub fn identifiers(name: &str, aliases: &[String], suffix: &str) -> Vec<(String, &'static str, String)> {
+    std::iter::once((name, "name"))
+        .chain(aliases.iter().map(|a| (a.as_str(), "alias")))
+        .map(|(base, kind)| (format!("{base}{suffix}"), kind, base.to_owned()))
+        .collect()
+}
+
+/// Checks a new suffix for the instance in `slot` whose file answers to
+/// `name` and `aliases`. `taken` holds every other name a loaded instance
+/// answers to, with a description of who; `library` every models.yml name
+/// and alias with its entry's name. Returns the trimmed suffix.
+pub fn check_suffix(slot: u32, suffix: &str, name: &str, aliases: &[String], taken: &[(String, String)], library: &[(String, String)]) -> Result<String, String> {
+    if slot <= 1 {
+        return Err("Instance 1 answers to the plain names; its suffix cannot be changed.".into());
+    }
+    let suffix = suffix.trim();
+    if suffix.is_empty() {
+        return Err(format!("Enter a suffix for instance {slot}, such as {}.", default_suffix(slot)));
+    }
+    // The slot's own default is always accepted, as when it was loaded.
+    if suffix == default_suffix(slot) {
+        return Ok(suffix.to_owned());
+    }
+    for (identifier, _, _) in identifiers(name, aliases, suffix) {
+        if !crate::library::valid_name(&identifier) {
+            return Err(format!("Model name \"{identifier}\" can use letters, digits and . _ : / - only, up to 64 characters."));
+        }
+        if let Some((_, entry)) = library.iter().find(|(other, _)| other.eq_ignore_ascii_case(&identifier)) {
+            return Err(format!("\"{identifier}\" is already a name or alias of {entry} in models.yml. Choose another suffix."));
+        }
+        if let Some((_, owner)) = taken.iter().find(|(other, _)| other.eq_ignore_ascii_case(&identifier)) {
+            return Err(format!("\"{identifier}\" already reaches {owner}. Choose another suffix."));
+        }
+    }
+    Ok(suffix.to_owned())
 }
 
 /// A model file's name without `.gguf`, which the local API also accepts.
@@ -205,6 +279,11 @@ pub struct Instance {
     pub id: String,
     /// Unique among loaded models; prefixes this model's log lines.
     pub label: String,
+    /// Which instance of its file this is: 1, 2, 3… (lowest free at load).
+    pub slot: u32,
+    /// Added to each of the file's names to make this instance's API
+    /// identifiers. Empty for slot 1; held only while it is loaded.
+    suffix: std::sync::Mutex<String>,
     /// The settings it was loaded with. Later edits only apply to new loads.
     pub settings: Settings,
     session: Arc<RuntimeSession>,
@@ -213,6 +292,9 @@ pub struct Instance {
     model: std::sync::Mutex<LoadedModel>,
     /// Earlier decisions for Keep context, kept per model.
     pub context: Mutex<crate::context::History>,
+    /// This instance's Keep context switch. Starts from the `keep_context`
+    /// setting at load; held only while it is loaded, never saved.
+    keep_context: AtomicBool,
 }
 
 impl Instance {
@@ -224,6 +306,23 @@ impl Instance {
     }
     pub fn stem(&self) -> String {
         file_stem(&self.settings.model_path)
+    }
+    pub fn suffix(&self) -> String {
+        self.suffix.lock().map(|s| s.clone()).unwrap_or_else(|e| e.into_inner().clone())
+    }
+    fn set_suffix(&self, suffix: String) {
+        *self.suffix.lock().unwrap_or_else(|e| e.into_inner()) = suffix;
+    }
+    pub fn keeps_context(&self) -> bool {
+        self.keep_context.load(Ordering::SeqCst)
+    }
+    /// Turns this instance's Keep context on or off; off empties its history.
+    pub async fn set_keep_context(&self, on: bool) {
+        let mut history = self.context.lock().await;
+        self.keep_context.store(on, Ordering::SeqCst);
+        if !on {
+            history.clear();
+        }
     }
     pub fn model(&self) -> LoadedModel {
         self.model.lock().map(|m| m.clone()).unwrap_or_else(|e| e.into_inner().clone())
@@ -253,22 +352,95 @@ pub enum RouteError {
     /// The named model is not loaded or still loading.
     Unavailable(String),
     Unknown(String),
-    /// A file name shared by more than one loaded model.
+    /// An identifier that reaches more than one model.
     Ambiguous(String),
 }
 
 /// One name the local API knows, and where it goes.
 #[derive(Clone, Serialize)]
 pub struct Route {
+    /// The identifier a request sends: a name or alias plus the instance suffix.
     pub name: String,
     /// "name" (its name in models.yml) or "alias".
     pub kind: &'static str,
+    /// The name or alias without the suffix.
+    pub base: String,
     pub path: String,
     /// The loaded model it reaches, if any.
     pub instance: Option<String>,
+    /// That instance's slot, or the slot this name belongs to (1 when unsuffixed).
+    pub slot: u32,
+    pub suffix: String,
     pub ready: bool,
-    /// Shared with another loaded model or shadowed by an alias, so unusable.
+    /// An unsuffixed name whose slot 1 is not loaded: it reaches the
+    /// lowest-slot instance (setting on) or nothing (setting off).
+    pub fallthrough: bool,
+    /// Reaches more than one model, so unusable.
     pub conflict: bool,
+}
+
+/// One loaded instance, as the route table needs it.
+pub struct RouteInstance<'a> {
+    pub id: &'a str,
+    pub path: &'a str,
+    pub slot: u32,
+    pub suffix: String,
+    pub ready: bool,
+}
+
+/// Every identifier the local API knows, in load order: each loaded
+/// instance's names then aliases (suffixed), the unsuffixed names of a file
+/// whose slot 1 is not loaded, then models.yml entries that are not loaded.
+/// `names` gives a path's (name, aliases); `entries` lists models.yml paths.
+pub fn route_table(instances: &[RouteInstance], entries: &[String], names: impl Fn(&str) -> (String, Vec<String>), fall_through: bool) -> Vec<Route> {
+    let mut routes = Vec::new();
+    for instance in instances {
+        let (name, aliases) = names(instance.path);
+        let siblings: Vec<&RouteInstance> = instances.iter().filter(|i| i.path == instance.path).collect();
+        let lowest = siblings.iter().min_by_key(|i| i.slot).map(|i| i.id);
+        if !siblings.iter().any(|i| i.slot == 1) && lowest == Some(instance.id) {
+            for (identifier, kind, base) in identifiers(&name, &aliases, "") {
+                routes.push(Route {
+                    name: identifier, kind, base, path: instance.path.to_owned(),
+                    instance: fall_through.then(|| instance.id.to_owned()), slot: 1, suffix: String::new(),
+                    ready: fall_through && instance.ready, fallthrough: true, conflict: false,
+                });
+            }
+        }
+        for (identifier, kind, base) in identifiers(&name, &aliases, &instance.suffix) {
+            routes.push(Route {
+                name: identifier, kind, base, path: instance.path.to_owned(), instance: Some(instance.id.to_owned()),
+                slot: instance.slot, suffix: instance.suffix.clone(), ready: instance.ready, fallthrough: false, conflict: false,
+            });
+        }
+    }
+    for path in entries {
+        if instances.iter().any(|i| i.path == path) {
+            continue;
+        }
+        let (name, aliases) = names(path);
+        for (identifier, kind, base) in identifiers(&name, &aliases, "") {
+            routes.push(Route { name: identifier, kind, base, path: path.clone(), instance: None, slot: 1, suffix: String::new(), ready: false, fallthrough: false, conflict: false });
+        }
+    }
+    // An identifier listed twice reaches two models (two files sharing a
+    // name, or a suffix that matches another model's name): unusable.
+    let counts: Vec<usize> = routes.iter().map(|r| routes.iter().filter(|o| o.name == r.name).count()).collect();
+    for (route, count) in routes.iter_mut().zip(counts) {
+        route.conflict = count > 1;
+    }
+    routes
+}
+
+/// The identifiers `/v1/models` lists: those that reach a ready model without conflict.
+pub fn listed_names(routes: &[Route]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for route in routes {
+        if route.ready && !route.conflict && !names.contains(&route.name) {
+            names.push(route.name.clone());
+        }
+    }
+    names
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -388,8 +560,8 @@ impl AppState {
     }
     async fn record_load_error(&self, instance: &Instance, message: String) {
         let mut errors = self.load_errors.lock().await;
-        errors.retain(|e| e.path != instance.path());
-        errors.push(LoadError { path: instance.path().to_owned(), name: instance.stem(), message });
+        errors.retain(|e| !(e.path == instance.path() && e.slot == instance.slot));
+        errors.push(LoadError { id: instance.id.clone(), path: instance.path().to_owned(), slot: instance.slot, name: instance.label.clone(), message });
         let extra = errors.len().saturating_sub(8);
         errors.drain(..extra);
     }
@@ -409,51 +581,31 @@ impl AppState {
         }
     }
 
-    /// Every name the local API knows: each loaded model's name and aliases,
-    /// then those of models in models.yml that are not loaded.
+    /// Every identifier the local API knows (see `route_table`).
     pub async fn routes(&self) -> Vec<Route> {
         crate::library::refresh(self).await;
+        let fall_through = self.settings.lock().await.fall_through_to_other_instances;
         let instances = self.instances.lock().await.clone();
         let library = self.library.lock().await;
         let names = |path: &str| match library.entry(path) {
             Some(entry) => (entry.name.clone(), entry.aliases.clone()),
             None => (file_stem(path), Vec::new()),
         };
-        let mut routes = Vec::new();
-        let loaded: Vec<(String, Vec<String>)> = instances.iter().map(|i| names(i.path())).collect();
-        for (instance, (name, aliases)) in instances.iter().zip(&loaded) {
-            // Entries keep names unique; a file with no entry can still clash.
-            let shared = loaded.iter().filter(|(other, _)| other == name).count() > 1;
-            let shadowed = library.named(name).is_some_and(|entry| entry.path != instance.path());
-            routes.push(Route { name: name.clone(), kind: "name", path: instance.path().to_owned(), instance: Some(instance.id.clone()), ready: instance.is_ready(), conflict: shared || shadowed });
-            for alias in aliases {
-                routes.push(Route { name: alias.clone(), kind: "alias", path: instance.path().to_owned(), instance: Some(instance.id.clone()), ready: instance.is_ready(), conflict: false });
-            }
-        }
-        for entry in &library.entries {
-            if instances.iter().any(|i| i.path() == entry.path) {
-                continue;
-            }
-            routes.push(Route { name: entry.name.clone(), kind: "name", path: entry.path.clone(), instance: None, ready: false, conflict: false });
-            for alias in &entry.aliases {
-                routes.push(Route { name: alias.clone(), kind: "alias", path: entry.path.clone(), instance: None, ready: false, conflict: false });
-            }
-        }
-        routes
+        let table: Vec<RouteInstance> = instances
+            .iter()
+            .map(|i| RouteInstance { id: &i.id, path: i.path(), slot: i.slot, suffix: i.suffix(), ready: i.is_ready() })
+            .collect();
+        let entries: Vec<String> = library.entries.iter().map(|e| e.path.clone()).collect();
+        route_table(&table, &entries, names, fall_through)
     }
     /// Names that reach a ready model right now, as `/v1/models` lists them.
     pub async fn model_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = Vec::new();
-        for route in self.routes().await {
-            if route.ready && !route.conflict && !names.contains(&route.name) {
-                names.push(route.name);
-            }
-        }
-        names
+        listed_names(&self.routes().await)
     }
-    /// The loaded model a request's `model` field names: its name or an alias
-    /// in models.yml (a loaded file with no entry answers to its file name).
-    /// Every request must name one, exactly as written.
+    /// The loaded model a request's `model` field names: one of its file's
+    /// names or aliases in models.yml plus the instance's suffix (a loaded
+    /// file with no entry answers to its file name). Every request must name
+    /// one, exactly as written.
     pub async fn route(&self, requested: Option<&str>) -> Result<Arc<Instance>, RouteError> {
         use RouteError::*;
         let Some(name) = requested.filter(|n| !n.is_empty()) else {
@@ -467,7 +619,11 @@ impl AppState {
         let routes = self.routes().await;
         let instances = self.instances.lock().await.clone();
         let matches: Vec<&Route> = routes.iter().filter(|r| r.name == name).collect();
-        let still_loading = |path: &str| Unavailable(format!("{} is still loading.", file_stem(path)));
+        let still_loading = |instance: &Instance| Unavailable(if instance.slot <= 1 {
+            format!("{} is still loading.", instance.stem())
+        } else {
+            format!("{} instance {} is still loading.", instance.stem(), instance.slot)
+        });
         match matches.as_slice() {
             [] => {
                 let hint = routes
@@ -475,7 +631,7 @@ impl AppState {
                     .find(|r| r.name.eq_ignore_ascii_case(name))
                     .map(|r| format!(" Names are case-sensitive; did you mean '{}'?", r.name))
                     .unwrap_or_default();
-                let names = self.model_names().await;
+                let names = listed_names(&routes);
                 Err(Unknown(if names.is_empty() {
                     format!("Unknown model '{name}'.{hint} No model is ready; load one in noullama.")
                 } else {
@@ -484,14 +640,31 @@ impl AppState {
             }
             [one] => match one.instance.as_deref().and_then(|id| instances.iter().find(|i| i.id == id)) {
                 Some(instance) if instance.is_ready() => Ok(instance.clone()),
-                Some(instance) => Err(still_loading(instance.path())),
+                Some(instance) => Err(still_loading(instance)),
+                None if one.fallthrough => {
+                    // Suffixed names never fall through; name the ones that work.
+                    let others: Vec<&str> = routes
+                        .iter()
+                        .filter(|r| r.path == one.path && r.base == one.base && r.kind == one.kind && r.instance.is_some() && !r.fallthrough)
+                        .map(|r| r.name.as_str())
+                        .collect();
+                    Err(Unavailable(format!(
+                        "'{name}' is instance 1 of {}, which is not loaded. Other loaded instances answer to: {}. Load it again, or turn on Fall through to another instance in Settings.",
+                        file_stem(&one.path),
+                        others.join(", ")
+                    )))
+                }
                 None => Err(Unavailable(format!("'{name}' is {}, which is not loaded. Load it in noullama.", file_stem(&one.path)))),
             },
-            many => Err(Ambiguous(format!(
-                "'{name}' is the name of {} loaded models ({}). Give them different names in Library.",
-                many.len(),
-                many.iter().map(|r| r.path.as_str()).collect::<Vec<_>>().join(", ")
-            ))),
+            many => {
+                let suffixed = many.iter().any(|r| r.slot > 1);
+                Err(Ambiguous(format!(
+                    "'{name}' is the name of {} loaded models ({}). {}",
+                    many.len(),
+                    many.iter().map(|r| if r.slot > 1 { format!("{} instance {}", r.path, r.slot) } else { r.path.clone() }).collect::<Vec<_>>().join(", "),
+                    if suffixed { "Give them different names in Library, or change the instance suffix in Local API." } else { "Give them different names in Library." }
+                )))
+            }
         }
     }
     /// Runs a decision on one loaded model, with earlier decisions added when
@@ -511,7 +684,7 @@ impl AppState {
         let session = instance.session.clone();
         if let Some(readout) = session.readout.get() {
             if has_images(&payload) {
-                return Err(Other("Images are not supported for this model yet: it is read through Winnow's text prompt layout.".into()));
+                return Err(Other("Images are not supported for this model yet: it is read through the Prompt layout (Winnow), which is text only.".into()));
             }
             let _one_at_a_time = session.readout_lock.lock().await;
             let server = crate::decision::Server { client: &self.local_client, port: session.port, key: &session.key };
@@ -771,25 +944,29 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let library = crate::library::snapshot(state).await;
     let mut loaded = Vec::new();
     let mut taken = Vec::new();
+    // The fit leaves out one instance of the selected file: the one a reload replaces.
+    let replaced = instances.iter().find(|i| i.path() == settings.model_path).map(|i| i.id.clone());
     for instance in &instances {
         let model = instance.model();
         let history = instance.context.lock().await;
         let extras = instance_extras(&instance.settings);
         let required = crate::hardware::estimate_bytes(instance.path(), &extras, instance.settings.context_size);
-        if instance.path() != settings.model_path {
+        if Some(&instance.id) != replaced.as_ref() {
             if let Some(bytes) = required {
                 taken.push((bytes, instance.settings.gpu_layers != 0));
             }
         }
         let (name, _) = state.api_names(instance.path()).await;
+        let api_names: Vec<&str> = routes.iter().filter(|r| r.instance.as_deref() == Some(&instance.id) && !r.fallthrough).map(|r| r.name.as_str()).collect();
         loaded.push(json!({
             "id": instance.id, "name": name, "label": instance.label,
+            "slot": instance.slot, "suffix": instance.suffix(), "default_suffix": default_suffix(instance.slot), "api_names": api_names,
             "path": model.path, "device": model.device, "runtime_path": model.runtime_path,
             "projector": model.projector, "mmproj_path": instance.settings.mmproj_path,
             "mtp": model.mtp, "mtp_path": instance.settings.mtp_path, "layout": model.layout,
             "ready": instance.is_ready(), "context_size": instance.settings.context_size,
             "gpu_layers": instance.settings.gpu_layers, "required_bytes": required,
-            "context": {"entries": history.len(), "last_flushed": history.last_flushed},
+            "context": {"entries": history.len(), "last_flushed": history.last_flushed}, "keep_context": instance.keeps_context(),
             "settings": instance.settings,
         }));
     }
@@ -839,17 +1016,18 @@ pub async fn save_settings(
     save_from_editor(state.inner(), settings).await
 }
 
-/// The settings form sends every field, but its copy of the alias list and the
-/// keep-context switch can be stale; those have their own commands, so keep
-/// the server's values here.
+/// The settings form sends every field, but its copies of the alias list and
+/// the Settings tab switches can be stale; those have their own commands, so
+/// keep the server's values here. `keep_context` (the default for new loads)
+/// is a load panel field and is saved from the form.
 pub async fn save_from_editor(state: &AppState, mut settings: Settings) -> Result<(), String> {
     {
         let current = state.settings.lock().await;
         settings.model_routes = current.model_routes.clone();
-        settings.keep_context = current.keep_context;
         settings.sha256_check = current.sha256_check.clone();
         settings.allow_force_fit = current.allow_force_fit;
         settings.hide_crowded_load_warning = current.hide_crowded_load_warning;
+        settings.fall_through_to_other_instances = current.fall_through_to_other_instances;
     }
     persist_settings(state, settings).await
 }
@@ -858,11 +1036,7 @@ pub async fn save_from_editor(state: &AppState, mut settings: Settings) -> Resul
 pub fn normalize_aliases(aliases: &[String]) -> Result<Vec<String>, String> {
     let mut names: Vec<String> = Vec::new();
     for alias in aliases.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
-        if alias.len() > 64
-            || !alias
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
-        {
+        if !crate::library::valid_name(alias) {
             return Err(format!("Model name \"{alias}\" can use letters, digits and . _ : / - only, up to 64 characters."));
         }
         if !names.iter().any(|n| n.eq_ignore_ascii_case(alias)) {
@@ -993,11 +1167,19 @@ pub async fn probe_runtime(path: String, library_path: String) -> Result<String,
 
 /// Loads the selected model beside any already loaded; returns its id.
 #[tauri::command]
-pub async fn start_runtime(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    load_model(state.inner()).await
+pub async fn start_runtime(slot: Option<u32>, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    load_model_in(state.inner(), slot).await
 }
 
+#[cfg(test)]
 pub async fn load_model(state: &AppState) -> Result<String, String> {
+    load_model_in(state, None).await
+}
+
+/// `slot` is the slot of the instance a reload replaced: the new instance
+/// keeps it when it is free, so its suffixed names stay the same. Otherwise
+/// (and for fresh loads) it takes the lowest free slot.
+pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String, String> {
     let selected = state.settings.lock().await.model_path.clone();
     if Path::new(&selected).is_file() {
         crate::library::ensure(state, &[selected]).await;
@@ -1030,26 +1212,21 @@ pub async fn load_model(state: &AppState) -> Result<String, String> {
                 _ => return Err("The chosen MTP file is not an MTP head. Choose a head file made only of MTP layers, or turn MTP off.".into()),
             }
         } else if !crate::gguf::info(&settings.model_path).is_some_and(|i| i.has_built_in_mtp()) {
-            return Err("This model has no built-in MTP layers. Choose an mtp- head file in Runtime, or turn MTP off.".into());
+            return Err("This model has no built-in MTP layers. Choose an mtp- head file in Local API, or turn MTP off.".into());
         }
     }
     let loaded = state.instances.lock().await.clone();
-    if loaded.iter().any(|i| i.path() == settings.model_path) {
-        return Err(format!("{} is already loaded. Eject it first to load it again with other settings.", file_stem(&settings.model_path)));
-    }
-    if let Some(reason) = load_memory_risk(&settings).await {
+    if let Some(reason) = load_memory_risk(&settings, 0, 0).await {
         return Err(format!("OOM prevention: {reason} Eject another model, reduce context or GPU offload, or enable Allow force fit in Settings."));
     }
     let port = free_runtime_port(state, &settings, &loaded)?;
-    let stem = file_stem(&settings.model_path);
-    let label = (1..)
-        .map(|n| if n == 1 { stem.clone() } else { format!("{stem}#{n}") })
-        .find(|label| !loaded.iter().any(|i| i.label == *label))
-        .unwrap_or(stem);
+    let (slot, label) = slot_and_label(&loaded, &settings.model_path, slot);
     let session = RuntimeSession::new(&state.data_dir, port)?;
     let instance = Arc::new(Instance {
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
         label,
+        slot,
+        suffix: std::sync::Mutex::new(default_suffix(slot)),
         model: std::sync::Mutex::new(LoadedModel {
             path: settings.model_path.clone(),
             device: String::new(),
@@ -1058,13 +1235,14 @@ pub async fn load_model(state: &AppState) -> Result<String, String> {
             mtp: settings.mtp,
             layout: None,
         }),
+        keep_context: AtomicBool::new(settings.keep_context),
         settings,
         session,
         child: Default::default(),
         ready: AtomicBool::new(false),
         context: Default::default(),
     });
-    state.load_errors.lock().await.retain(|e| e.path != instance.path());
+    state.load_errors.lock().await.retain(|e| !(e.path == instance.path() && e.slot == instance.slot));
     state.instances.lock().await.push(instance.clone());
     state.instances_added.notify_one();
     state.log(instance.load_marker()).await;
@@ -1093,6 +1271,15 @@ pub async fn load_model(state: &AppState) -> Result<String, String> {
         }
     });
     Ok(id)
+}
+
+/// The slot and log label a new instance of `path` gets beside `loaded`:
+/// `preferred` when it is given and free, else the lowest free slot.
+fn slot_and_label(loaded: &[Arc<Instance>], path: &str, preferred: Option<u32>) -> (u32, String) {
+    let slots: Vec<u32> = loaded.iter().filter(|i| i.path() == path).map(|i| i.slot).collect();
+    let slot = pick_slot(&slots, preferred);
+    let labels: Vec<String> = loaded.iter().map(|i| i.label.clone()).collect();
+    (slot, instance_label(&file_stem(path), slot, &labels))
 }
 
 /// The first private port at or above the configured one that no loaded
@@ -1265,7 +1452,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
         }
         let mut live_settings = settings.clone();
         live_settings.allow_force_fit = state.settings.lock().await.allow_force_fit;
-        if let Some(reason) = load_memory_risk(&live_settings).await {
+        if let Some(reason) = load_memory_risk(&live_settings, 0, 0).await {
             return Err(format!("OOM prevention: {reason}"));
         }
         drop(reservation);
@@ -1369,10 +1556,10 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
                     Some(crate::decision::Layout::Winnow) => crate::decision::Layout::Winnow,
                     _ if native => crate::decision::Layout::Native,
                     Some(crate::decision::Layout::Native) => {
-                        return Err("Runtime did not advertise native decision support. Use a decision GGUF and a compatible llama.cpp build, or set Decision mode to Auto in Runtime.".into());
+                        return Err("Runtime did not advertise built-in decision support. Use a decision GGUF and a compatible llama.cpp build, or set Decision mode to Auto in Local API.".into());
                     }
                     None => {
-                        return Err("This model has no native decision support, and Noullama has no prompt layout for it. Winnow GGUFs are read through Winnow's own layout; if this is a Winnow model under another name, set Decision mode to Winnow in Runtime.".into());
+                        return Err("This model has no built-in decision support, and Noullama has no prompt layout for it. Winnow GGUFs are read through the Prompt layout (Winnow); if this is a Winnow model under another name, set Decision mode to Prompt layout in Local API.".into());
                     }
                 };
                 if layout == crate::decision::Layout::Winnow && session.readout.get().is_none() {
@@ -1456,9 +1643,54 @@ pub async fn unload(state: &AppState, id: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn dismiss_load_error(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.load_errors.lock().await.retain(|e| e.path != path);
+pub async fn dismiss_load_error(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.load_errors.lock().await.retain(|e| e.id != id);
     Ok(())
+}
+
+/// Changes a loaded instance's suffix (slot 2 and up). It lives only until
+/// the instance is unloaded and is never saved.
+#[tauri::command]
+pub async fn set_instance_suffix(id: String, suffix: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    change_suffix(state.inner(), &id, &suffix).await
+}
+
+pub async fn change_suffix(state: &AppState, id: &str, suffix: &str) -> Result<String, String> {
+    crate::library::refresh(state).await;
+    // Held so a load or another suffix change cannot slip in between the check and the write.
+    let _guard = state.lifecycle.lock().await;
+    let instance = state.instance(id).await.ok_or("That model is no longer loaded.")?;
+    let routes = state.routes().await;
+    let (name, aliases) = state.api_names(instance.path()).await;
+    let instances = state.instances.lock().await.clone();
+    let taken: Vec<(String, String)> = routes
+        .iter()
+        .filter(|r| r.instance.as_deref().is_some_and(|other| other != id))
+        .map(|r| {
+            let owner = instances.iter().find(|i| Some(i.id.as_str()) == r.instance.as_deref());
+            (r.name.clone(), owner.map_or_else(|| "another loaded model".to_owned(), |o| format!("instance {} of {}", o.slot, o.stem())))
+        })
+        .collect();
+    let library: Vec<(String, String)> = state
+        .library
+        .lock()
+        .await
+        .entries
+        .iter()
+        .flat_map(|e| std::iter::once(&e.name).chain(&e.aliases).map(move |n| (n.clone(), e.name.clone())))
+        .collect();
+    let suffix = check_suffix(instance.slot, suffix, &name, &aliases, &taken, &library)?;
+    instance.set_suffix(suffix.clone());
+    state.log(format!("{}API suffix set to {suffix}.", instance.prefix())).await;
+    Ok(suffix)
+}
+
+/// The Settings tab's "Fall through to another instance".
+#[tauri::command]
+pub async fn set_fall_through(on: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut settings = state.settings.lock().await.clone();
+    settings.fall_through_to_other_instances = on;
+    persist_settings(state.inner(), settings).await
 }
 
 /// Graphics memory in use, overall and per loaded model.
@@ -1510,7 +1742,9 @@ pub async fn set_memory_preference(key: String, value: bool, state: tauri::State
     persist_memory_settings(state.inner(), settings, Some((&key, value))).await
 }
 
-async fn load_memory_risk(settings: &Settings) -> Option<String> {
+/// `freed_vram` and `freed_ram`: memory a loaded instance being replaced
+/// holds now, counted as available because it is unloaded before the load.
+async fn load_memory_risk(settings: &Settings, freed_vram: u64, freed_ram: u64) -> Option<String> {
     if settings.allow_force_fit { return None; }
     let required = crate::hardware::estimate_bytes(&settings.model_path, &instance_extras(settings), settings.context_size)?;
     let gpu_layers = settings.gpu_layers;
@@ -1518,8 +1752,9 @@ async fn load_memory_risk(settings: &Settings) -> Option<String> {
         if gpu_layers != 0 {
             let gpu = crate::hardware::memory_use(&[]);
             if let (Some(total), Some(used)) = (gpu.total_bytes, gpu.used_bytes) {
-                if (gpu_layers == -1 || gpu_layers >= 99) && crate::oom::clearly_exceeds(required, total.saturating_sub(used)) {
-                    return Some(format!("Estimated GPU allocation {:.1} GiB clearly exceeds {:.1} GiB available VRAM.", required as f64 / 1073741824., total.saturating_sub(used) as f64 / 1073741824.));
+                let available = total.saturating_sub(used).saturating_add(freed_vram).min(total);
+                if (gpu_layers == -1 || gpu_layers >= 99) && crate::oom::clearly_exceeds(required, available) {
+                    return Some(format!("Estimated GPU allocation {:.1} GiB clearly exceeds {:.1} GiB available VRAM.", required as f64 / 1073741824., available as f64 / 1073741824.));
                 }
             }
         }
@@ -1527,8 +1762,9 @@ async fn load_memory_risk(settings: &Settings) -> Option<String> {
         // Do not pretend the entire file must be resident in system RAM.
         if gpu_layers == 0 {
             if let Some(m) = crate::oom::memory() {
-                if crate::oom::clearly_exceeds(required, m.available) {
-                    return Some(format!("Estimated allocation {:.1} GiB clearly exceeds {:.1} GiB available RAM.", required as f64 / 1073741824., m.available as f64 / 1073741824.));
+                let available = m.available.saturating_add(freed_ram);
+                if crate::oom::clearly_exceeds(required, available) {
+                    return Some(format!("Estimated allocation {:.1} GiB clearly exceeds {:.1} GiB available RAM.", required as f64 / 1073741824., available as f64 / 1073741824.));
                 }
             }
         }
@@ -1537,16 +1773,36 @@ async fn load_memory_risk(settings: &Settings) -> Option<String> {
 }
 
 #[tauri::command]
-pub async fn crowded_load_warning(state: tauri::State<'_, AppState>) -> Result<Option<Value>, String> {
+pub async fn crowded_load_warning(replace: Option<String>, state: tauri::State<'_, AppState>) -> Result<Option<Value>, String> {
     let settings = state.settings.lock().await.clone();
     if settings.hide_crowded_load_warning || settings.allow_force_fit { return Ok(None); }
     let loaded = state.instances.lock().await.clone();
-    let others: Vec<_> = loaded.iter().filter(|i| i.path() != settings.model_path).collect();
+    // A reload unloads `replace` first, so it is neither another model nor
+    // memory in use.
+    let replaced = replace.as_deref().and_then(|id| loaded.iter().find(|i| i.id == id));
+    let others: Vec<_> = loaded.iter().filter(|i| Some(i.id.as_str()) != replace.as_deref()).collect();
     if others.is_empty() { return Ok(None); }
-    Ok(load_memory_risk(&settings).await.map(|reason| json!({
-        "reason": reason,
-        "models": others.iter().map(|i| json!({"id": i.id, "name": i.label})).collect::<Vec<_>>()
-    })))
+    let (mut freed_vram, mut freed_ram) = (0, 0);
+    if let Some(instance) = replaced {
+        let pid = instance.child.lock().await.as_ref().and_then(Child::id);
+        let estimate = crate::hardware::estimate_bytes(instance.path(), &instance_extras(&instance.settings), instance.settings.context_size).unwrap_or(0);
+        if instance.settings.gpu_layers != 0 {
+            // Per-process readings exist on NVIDIA only; otherwise use the estimate.
+            let measured = match pid {
+                Some(pid) => tokio::task::spawn_blocking(move || crate::hardware::memory_use(&[pid])).await.ok().and_then(|u| u.processes.first().copied().flatten()),
+                None => None,
+            };
+            freed_vram = measured.unwrap_or(estimate);
+        } else {
+            freed_ram = pid.and_then(crate::oom::resident_bytes).unwrap_or(estimate);
+        }
+    }
+    let mut names = Vec::new();
+    for instance in &others {
+        let (name, _) = state.api_names(instance.path()).await;
+        names.push(json!({"id": instance.id, "name": format!("{name}{}", instance.suffix())}));
+    }
+    Ok(load_memory_risk(&settings, freed_vram, freed_ram).await.map(|reason| json!({ "reason": reason, "models": names })))
 }
 
 /// Supervises loaded models once a second: notices runtimes that exited and
@@ -1605,13 +1861,24 @@ pub fn start_memory_guard(state: AppState) {
 
 #[cfg(test)]
 pub async fn insert_test_instance(state: &AppState, path: &str, ready: bool) -> Arc<Instance> {
-    let settings = Settings { model_path: path.into(), ..state.settings.lock().await.clone() };
     let port = 1 + state.instances.lock().await.len() as u16;
+    insert_test_instance_on(state, path, ready, port).await
+}
+
+/// Like `insert_test_instance`, with requests going to a fake runtime on `port`.
+#[cfg(test)]
+pub async fn insert_test_instance_on(state: &AppState, path: &str, ready: bool, port: u16) -> Arc<Instance> {
+    let settings = Settings { model_path: path.into(), ..state.settings.lock().await.clone() };
+    let loaded = state.instances.lock().await.clone();
+    let (slot, label) = slot_and_label(&loaded, path, None);
     let instance = Arc::new(Instance {
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
-        label: file_stem(path),
+        label,
+        slot,
+        suffix: std::sync::Mutex::new(default_suffix(slot)),
         model: std::sync::Mutex::new(LoadedModel { path: path.into(), device: "CPU".into(), runtime_path: String::new(), projector: false, mtp: false, layout: Some("native".into()) }),
         session: RuntimeSession::new(&state.data_dir, port).unwrap(),
+        keep_context: AtomicBool::new(settings.keep_context),
         settings,
         child: Default::default(),
         ready: AtomicBool::new(ready),
@@ -1619,6 +1886,12 @@ pub async fn insert_test_instance(state: &AppState, path: &str, ready: bool) -> 
     });
     state.instances.lock().await.push(instance.clone());
     instance
+}
+
+/// Marks a test instance ready or loading.
+#[cfg(test)]
+pub fn set_test_ready(instance: &Instance, ready: bool) {
+    instance.ready.store(ready, Ordering::SeqCst);
 }
 
 /// Waits for a load to finish; panics with the log if it fails.
@@ -1640,6 +1913,93 @@ pub async fn wait_until_ready(state: &AppState, id: &str, seconds: u64) -> Arc<I
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_instance_takes_the_lowest_free_slot() {
+        assert_eq!(free_slot(&[]), 1);
+        assert_eq!(free_slot(&[1]), 2);
+        assert_eq!(free_slot(&[1, 2, 3]), 4);
+        assert_eq!(free_slot(&[2, 3]), 1);
+        assert_eq!(free_slot(&[1, 3]), 2);
+        // A reload asks for its old slot and keeps it even with a lower one free.
+        assert_eq!(pick_slot(&[1], Some(3)), 3);
+        assert_eq!(pick_slot(&[1, 3], Some(3)), 2);
+        assert_eq!(pick_slot(&[1], Some(0)), 2);
+        assert_eq!(pick_slot(&[1], None), 2);
+        assert_eq!(default_suffix(1), "");
+        assert_eq!(default_suffix(2), "-i-2");
+        assert_eq!(default_suffix(12), "-i-12");
+        // Labels follow the slot and stay unique across files sharing a stem.
+        assert_eq!(instance_label("qwen", 1, &[]), "qwen");
+        assert_eq!(instance_label("qwen", 2, &["qwen".into()]), "qwen#2");
+        assert_eq!(instance_label("qwen", 1, &["qwen".into()]), "qwen#2");
+        assert_eq!(instance_label("qwen", 2, &["qwen#2".into()]), "qwen#3");
+    }
+
+    #[test]
+    fn identifiers_add_the_suffix_to_every_name_and_alias() {
+        let aliases = vec!["triage".to_owned(), "sorter".to_owned()];
+        let ids: Vec<(String, &str, String)> = identifiers("qwen", &aliases, "-i-2");
+        assert_eq!(ids, [
+            ("qwen-i-2".to_owned(), "name", "qwen".to_owned()),
+            ("triage-i-2".to_owned(), "alias", "triage".to_owned()),
+            ("sorter-i-2".to_owned(), "alias", "sorter".to_owned()),
+        ]);
+        let plain: Vec<String> = identifiers("qwen", &aliases, "").into_iter().map(|(id, _, _)| id).collect();
+        assert_eq!(plain, ["qwen", "triage", "sorter"]);
+    }
+
+    #[test]
+    fn suffixes_are_checked_like_aliases_and_must_not_collide() {
+        let aliases = vec!["triage".to_owned()];
+        let library = vec![("qwen".to_owned(), "qwen".to_owned()), ("triage".to_owned(), "qwen".to_owned()), ("qwen-b".to_owned(), "other".to_owned())];
+        let taken = vec![("qwen-i-3".to_owned(), "instance 3 of qwen".to_owned()), ("triage-i-3".to_owned(), "instance 3 of qwen".to_owned())];
+        let check = |slot, suffix: &str| check_suffix(slot, suffix, "qwen", &aliases, &taken, &library);
+        assert_eq!(check(2, " -fast ").unwrap(), "-fast");
+        assert_eq!(check(1, "-x").unwrap_err(), "Instance 1 answers to the plain names; its suffix cannot be changed.");
+        assert_eq!(check(2, "  ").unwrap_err(), "Enter a suffix for instance 2, such as -i-2.");
+        assert_eq!(check(2, " x y").unwrap_err(), "Model name \"qwenx y\" can use letters, digits and . _ : / - only, up to 64 characters.");
+        assert_eq!(check(2, &"x".repeat(60)).unwrap_err(), format!("Model name \"triage{}\" can use letters, digits and . _ : / - only, up to 64 characters.", "x".repeat(60)));
+        assert_eq!(check(2, "-B").unwrap_err(), "\"qwen-B\" is already a name or alias of other in models.yml. Choose another suffix.");
+        assert_eq!(check(2, "-i-3").unwrap_err(), "\"qwen-i-3\" already reaches instance 3 of qwen. Choose another suffix.");
+        // The slot's own default is always accepted, even when it would not pass.
+        let long = "q".repeat(62);
+        assert_eq!(check_suffix(2, "-i-2", &long, &[], &[], &[]).unwrap(), "-i-2");
+        assert!(check_suffix(2, "-xyz", &long, &[], &[], &[]).is_err());
+    }
+
+    fn table(instances: &[(&str, &str, u32, &str, bool)], entries: &[&str], fall_through: bool) -> Vec<Route> {
+        let list: Vec<RouteInstance> = instances.iter().map(|(id, path, slot, suffix, ready)| RouteInstance { id, path, slot: *slot, suffix: suffix.to_string(), ready: *ready }).collect();
+        let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+        route_table(&list, &entries, |path| match path {
+            "/m/qwen.gguf" => ("qwen".into(), vec!["triage".into()]),
+            "/m/other.gguf" => ("other".into(), vec![]),
+            _ => (file_stem(path), vec![]),
+        }, fall_through)
+    }
+
+    #[test]
+    fn the_route_table_lists_suffixed_instances_in_load_order() {
+        let routes = table(&[("a", "/m/qwen.gguf", 1, "", true), ("b", "/m/other.gguf", 1, "", true), ("c", "/m/qwen.gguf", 2, "-i-2", true)], &["/m/qwen.gguf", "/m/other.gguf", "/m/later.gguf"], false);
+        let names: Vec<&str> = routes.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["qwen", "triage", "other", "qwen-i-2", "triage-i-2", "later"]);
+        assert!(routes.iter().all(|r| !r.conflict));
+        assert_eq!(listed_names(&routes), ["qwen", "triage", "other", "qwen-i-2", "triage-i-2"]);
+        // Without slot 1, the bare names reach nothing unless fall-through is on.
+        let routes = table(&[("c", "/m/qwen.gguf", 2, "-i-2", true), ("d", "/m/qwen.gguf", 3, "-i-3", true)], &["/m/qwen.gguf"], false);
+        let bare: Vec<(&str, Option<&str>)> = routes.iter().filter(|r| r.fallthrough).map(|r| (r.name.as_str(), r.instance.as_deref())).collect();
+        assert_eq!(bare, [("qwen", None), ("triage", None)]);
+        assert_eq!(listed_names(&routes), ["qwen-i-2", "triage-i-2", "qwen-i-3", "triage-i-3"]);
+        let routes = table(&[("d", "/m/qwen.gguf", 3, "-i-3", true), ("c", "/m/qwen.gguf", 2, "-i-2", false)], &["/m/qwen.gguf"], true);
+        let bare: Vec<(&str, Option<&str>, bool)> = routes.iter().filter(|r| r.fallthrough).map(|r| (r.name.as_str(), r.instance.as_deref(), r.ready)).collect();
+        // The lowest slot is 2, which is still loading, so the bare name is not listed.
+        assert_eq!(bare, [("qwen", Some("c"), false), ("triage", Some("c"), false)]);
+        assert_eq!(listed_names(&routes), ["qwen-i-3", "triage-i-3"]);
+        // A suffix that matches another model's name conflicts on both sides.
+        let routes = table(&[("a", "/m/qwen.gguf", 2, "-i-2", true)], &["/m/qwen.gguf", "/m/qwen-i-2.gguf"], false);
+        assert!(routes.iter().filter(|r| r.name == "qwen-i-2").all(|r| r.conflict));
+        assert_eq!(routes.iter().filter(|r| r.name == "qwen-i-2").count(), 2);
+    }
     #[test]
     fn images_must_be_inline_data_urls() {
         let question = json!({"q": {"type": "noul", "instructions": "Is there a table?"}});
@@ -2027,7 +2387,7 @@ mod tests {
         let settings = loaded.settings.lock().await;
         assert!(settings.allow_force_fit && settings.hide_crowded_load_warning);
         drop(settings);
-        assert!(load_memory_risk(&loaded.settings.lock().await.clone()).await.is_none());
+        assert!(load_memory_risk(&loaded.settings.lock().await.clone(), 0, 0).await.is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 

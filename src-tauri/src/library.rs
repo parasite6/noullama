@@ -127,10 +127,6 @@ impl Library {
     pub fn entry(&self, path: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| e.path == path)
     }
-    /// The entry a request's model name reaches: its name or an alias, exact case.
-    pub fn named(&self, name: &str) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.name == name || e.aliases.iter().any(|a| a == name))
-    }
 }
 
 /// sha256 checks before a load, chosen in Settings.
@@ -184,6 +180,12 @@ fn valid_account_char(c: char) -> bool {
 
 fn valid_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "._:/-".contains(c)
+}
+
+/// A model name, alias or instance identifier: 1 to 64 characters of
+/// letters, digits and `. _ : / -`.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.chars().all(valid_name_char)
 }
 
 /// A free name for a new entry, made from the file name.
