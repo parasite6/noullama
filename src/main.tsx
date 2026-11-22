@@ -219,6 +219,13 @@ function App() {
     if (!savedSettings) return;
     setSettings(current => ({ ...savedSettings, ...(runtimeFormDirty ? pick(current, RUNTIME_FIELDS) : {}), ...(loadDirty ? pick(current, LOAD_FIELDS) : {}) }));
   }, [savedKey, runtimeFormDirty, loadDirty]);
+  // Editing a group back to its saved values leaves nothing to save.
+  useEffect(() => {
+    if (!savedSettings) return;
+    const unchanged = (keys: readonly (keyof Settings)[]) => keys.every(key => settings[key] === savedSettings[key]);
+    if (loadDirty && unchanged(LOAD_FIELDS)) setLoadDirty(false);
+    if (runtimeFormDirty && unchanged(RUNTIME_FIELDS)) setRuntimeFormDirty(false);
+  }, [settings, savedKey, loadDirty, runtimeFormDirty]);
   useEffect(() => { if (snapshot) setDownloadDir(snapshot.settings.download_dir); }, [snapshot?.settings.download_dir]);
   useEffect(() => {
     const none = { path: settings.model_path, built_in: false, head: null };
