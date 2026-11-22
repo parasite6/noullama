@@ -85,6 +85,8 @@ fn main() {
             runtime::dismiss_load_error,
             runtime::set_instance_suffix,
             runtime::set_fall_through,
+            runtime::set_instance_aliases,
+            runtime::set_any_available_when_busy,
             context::set_instance_keep_context,
             context::clear_context,
             hub::hf_session,

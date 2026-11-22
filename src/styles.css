@@ -605,6 +605,10 @@ label small { font-weight: 400; line-height: 1.6; }
 .instance-suffix .instance-names-label { flex-basis: 100%; }
 .instance-suffix input { width: 180px; max-width: 100%; padding: 6px 14px; margin-left: 46px; }
 .instance-suffix small { flex-basis: 100%; padding-left: 46px; color: var(--muted); }
+/* An instance's own aliases, below its suffix */
+.instance-aliases { display: grid; gap: 8px; }
+.instance-aliases .model-name-list, .instance-aliases .alias-form, .instance-aliases > small { margin-left: 46px; }
+.instance-aliases > small { font-size: 12px; color: var(--muted); }
 .load-instance { min-width: 200px; margin-left: auto; }
 .instance-card .model-aliases { padding-left: 46px; }
 /* An instance's own Keep context switch, Clear and status */
@@ -616,6 +620,7 @@ label small { font-weight: 400; line-height: 1.6; }
   .row-aliases, .loaded-model .model-aliases, .instance-settings, .instance-names-label { padding-left: 4px; }
   .instance-suffix input { margin-left: 4px; }
   .instance-suffix small { padding-left: 4px; }
+  .instance-aliases .model-name-list, .instance-aliases .alias-form, .instance-aliases > small { margin-left: 4px; }
   .instance-stale { margin-left: 4px; }
   .instance-keep { padding-left: 4px; }
   .loaded-head { flex-wrap: wrap; }

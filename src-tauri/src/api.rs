@@ -1,4 +1,4 @@
-use crate::runtime::{validate_request, AppState, RouteError};
+use crate::runtime::{validate_request, AnyError, AppState, RouteError, ANY_AVAILABLE};
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
@@ -174,17 +174,24 @@ async fn infer(state: &AppState, payload: Value) -> Result<(Value, String), ApiE
         Some(Value::String(model)) => Some(model.clone()),
         Some(_) => return Err(ApiError(StatusCode::BAD_REQUEST, "model must be a string.".into())),
     };
-    let instance = state.route(requested.as_deref()).await.map_err(|error| match error {
-        RouteError::Missing(m) => ApiError(StatusCode::BAD_REQUEST, m),
-        RouteError::Unavailable(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
-        RouteError::Unknown(m) => ApiError(StatusCode::NOT_FOUND, m),
-        RouteError::Ambiguous(m) => ApiError(StatusCode::CONFLICT, m),
-    })?;
+    // `any-available` (exact) claims an idle instance of any model, waiting
+    // for one when the setting says so; every other name routes as usual.
+    let result = if requested.as_deref() == Some(ANY_AVAILABLE) {
+        let claim = state.claim_any().await.map_err(|error| match error {
+            AnyError::NoneReady(m) | AnyError::Busy(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
+        })?;
+        state.infer_claimed(&claim, payload).await
+    } else {
+        let instance = state.route(requested.as_deref()).await.map_err(|error| match error {
+            RouteError::Missing(m) => ApiError(StatusCode::BAD_REQUEST, m),
+            RouteError::Unavailable(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
+            RouteError::Unknown(m) => ApiError(StatusCode::NOT_FOUND, m),
+            RouteError::Ambiguous(m) => ApiError(StatusCode::CONFLICT, m),
+        })?;
+        state.infer_on(&instance, payload).await
+    };
     let requested = requested.unwrap_or_default();
-    let mut result = state
-        .infer_on(&instance, payload)
-        .await
-        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e))?;
+    let mut result = result.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e))?;
     if let Some(model) = result.get_mut("model") {
         *model = json!(requested);
     }
@@ -499,7 +506,7 @@ mod tests {
         let response = app.clone().oneshot(get("/v1/models")).await.unwrap();
         let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         let ids: Vec<&str> = body["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["d1-3B-Q8_0", "triage", "Winnow-E4B-Q8_0", "sorter"]);
+        assert_eq!(ids, ["d1-3B-Q8_0", "triage", "Winnow-E4B-Q8_0", "sorter", "any-available"]);
         for (name, expected) in [("triage", &d1), ("d1-3B-Q8_0", &d1), ("sorter", &winnow), ("Winnow-E4B-Q8_0", &winnow)] {
             assert_eq!(state.route(Some(name)).await.ok().map(|i| i.id.clone()), Some(expected.id.clone()), "{name}");
         }
@@ -581,7 +588,7 @@ mod tests {
         assert_eq!(second.suffix(), "-i-2");
         let app = router(state.clone());
         // Two instances of one file are not a conflict: each identifier has one target.
-        assert_eq!(listed(&app).await, ["qwen", "triage", "other", "qwen-i-2", "triage-i-2"]);
+        assert_eq!(listed(&app).await, ["qwen", "triage", "other", "qwen-i-2", "triage-i-2", "any-available"]);
         for (name, expected) in [("qwen", &first), ("triage", &first), ("qwen-i-2", &second), ("triage-i-2", &second), ("other", &other)] {
             assert_eq!(state.route(Some(name)).await.ok().map(|i| i.id.clone()), Some(expected.id.clone()), "{name}");
         }
@@ -628,7 +635,7 @@ mod tests {
         let (status, message) = status_and_message(&app, "triage").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(message, "'triage' is instance 1 of qwen, which is not loaded. Other loaded instances answer to: triage-i-2, triage-i-3. Load it again, or turn on Fall through to another instance in Settings.");
-        assert_eq!(listed(&app).await, ["qwen-i-3", "triage-i-3"]);
+        assert_eq!(listed(&app).await, ["qwen-i-3", "triage-i-3", "any-available"]);
         // On: the lowest slot (2), which is still loading.
         state.settings.lock().await.fall_through_to_other_instances = true;
         let (status, message) = status_and_message(&app, "triage").await;
@@ -636,7 +643,7 @@ mod tests {
         crate::runtime::set_test_ready(&second, true);
         assert_eq!(state.route(Some("triage")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
         assert_eq!(state.route(Some("qwen")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
-        assert_eq!(listed(&app).await, ["qwen", "triage", "qwen-i-2", "triage-i-2", "qwen-i-3", "triage-i-3"]);
+        assert_eq!(listed(&app).await, ["qwen", "triage", "qwen-i-2", "triage-i-2", "qwen-i-3", "triage-i-3", "any-available"]);
         // Suffixed names never fall through.
         crate::runtime::unload(&state, &second.id).await.unwrap();
         assert_eq!(status_and_message(&app, "triage-i-2").await.0, StatusCode::NOT_FOUND);
@@ -676,6 +683,11 @@ mod tests {
     /// A stand-in native runtime that answers every /v1/systemone request and
     /// records each body it saw.
     async fn fake_native_runtime() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        fake_native_runtime_after(0).await
+    }
+
+    /// `fake_native_runtime` that takes `delay_ms` to answer each request.
+    async fn fake_native_runtime_after(delay_ms: u64) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
         use axum::routing::post;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let log = seen.clone();
@@ -683,7 +695,8 @@ mod tests {
             let log = log.clone();
             async move {
                 log.lock().unwrap().push(body);
-                Json(json!({"answers":{"route":{"type":"choice","choice":"billing","probabilities":{"billing":0.9,"technical":0.1}}},"usage":{"input_tokens":10,"output_tokens":1}}))
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                Json(json!({"model":"runtime-alias","answers":{"route":{"type":"choice","choice":"billing","probabilities":{"billing":0.9,"technical":0.1}}},"usage":{"input_tokens":10,"output_tokens":1}}))
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -734,6 +747,276 @@ mod tests {
         state.infer_on(&second, json!({"state":"third","questions":request()["questions"]})).await.unwrap();
         assert_eq!(seen.lock().unwrap().last().unwrap()["state"], json!("third"));
         assert_eq!(second.context.lock().await.len(), 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// POSTs a decision request for `model` and returns the status, error
+    /// message and the `model` the response echoes.
+    async fn ask_for(app: &Router, model: &str) -> (StatusCode, String, Value) {
+        let mut body = request();
+        body["model"] = json!(model);
+        let request = Request::builder().method("POST").uri("/v1/systemone").header("host", "127.0.0.1:11435").header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        (status, body["error"]["message"].as_str().unwrap_or_default().to_owned(), body["model"].clone())
+    }
+
+    #[tokio::test]
+    async fn instance_aliases_reach_one_instance_and_never_collide() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let file = "/models/acme/qwen.gguf";
+        let first = crate::runtime::insert_test_instance(&state, file, true).await;
+        let second = crate::runtime::insert_test_instance(&state, file, true).await;
+        let other = crate::runtime::insert_test_instance(&state, "/models/acme/other.gguf", true).await;
+        crate::runtime::set_aliases(&state, file.into(), vec!["triage".into()]).await.unwrap();
+        crate::runtime::set_aliases(&state, other.path().into(), vec![]).await.unwrap();
+        let set = |id: String, aliases: &[&str]| {
+            let state = state.clone();
+            let aliases: Vec<String> = aliases.iter().map(|a| a.to_string()).collect();
+            async move { crate::runtime::change_instance_aliases(&state, &id, aliases).await }
+        };
+        assert_eq!(set(second.id.clone(), &[" billing ", "Billing", "refunds"]).await.unwrap(), ["billing", "refunds"]);
+        let app = router(state.clone());
+        // Listed right after that instance's own identifiers, exact and unsuffixed.
+        assert_eq!(listed(&app).await, ["qwen", "triage", "qwen-i-2", "triage-i-2", "billing", "refunds", "other", "any-available"]);
+        assert_eq!(state.route(Some("billing")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(status_and_message(&app, "billing-i-2").await.0, StatusCode::NOT_FOUND);
+        let snapshot = crate::runtime::state_snapshot(&state).await.unwrap();
+        let card = snapshot["instances"].as_array().unwrap().iter().find(|i| i["id"] == second.id.as_str()).unwrap().clone();
+        assert_eq!(card["instance_aliases"], json!(["billing", "refunds"]));
+        assert_eq!(card["api_names"], json!(["qwen-i-2", "triage-i-2", "billing", "refunds"]));
+        // Collisions, ignoring case: models.yml names and aliases, other instances' identifiers and instance aliases, its own identifiers.
+        assert_eq!(set(first.id.clone(), &["OTHER"]).await.unwrap_err(), "\"OTHER\" is already a name or alias of other in models.yml. Choose another alias.");
+        assert_eq!(set(first.id.clone(), &["Triage-i-2"]).await.unwrap_err(), "\"Triage-i-2\" already reaches instance 2 of qwen. Choose another alias.");
+        assert_eq!(set(first.id.clone(), &["BILLING"]).await.unwrap_err(), "\"BILLING\" already reaches instance 2 of qwen. Choose another alias.");
+        assert_eq!(set(second.id.clone(), &["qwen-i-2"]).await.unwrap_err(), "\"qwen-i-2\" already reaches instance 2 of qwen. Choose another alias.");
+        assert!(set(first.id.clone(), &["any-available"]).await.unwrap_err().starts_with("\"any-available\" is reserved"));
+        assert!(set(first.id.clone(), &["has space"]).await.unwrap_err().contains("letters, digits"));
+        // An instance may keep its own aliases when it saves them again.
+        assert_eq!(set(second.id.clone(), &["refunds", "billing"]).await.unwrap(), ["refunds", "billing"]);
+        // Suffixes and models.yml edits must not take an instance alias either.
+        let third = crate::runtime::insert_test_instance(&state, file, true).await;
+        set(second.id.clone(), &["qwen-fast", "billing"]).await.unwrap();
+        assert_eq!(crate::runtime::change_suffix(&state, &third.id, "-fast").await.unwrap_err(), "\"qwen-fast\" already reaches instance 2 of qwen. Choose another suffix.");
+        assert_eq!(crate::runtime::change_suffix(&state, &second.id, "-fast").await.unwrap_err(), "\"qwen-fast\" already reaches instance 2 of qwen. Choose another suffix.");
+        assert_eq!(crate::runtime::set_aliases(&state, other.path().into(), vec!["Billing".into()]).await.unwrap_err(), "\"Billing\" is an instance alias of instance 2 of qwen (\"billing\"). Remove it from that instance in Local API, or choose another name.");
+        let revision = state.library.lock().await.revision;
+        let mut entries = state.library.lock().await.entries.clone();
+        entries.iter_mut().find(|e| e.path == other.path()).unwrap().name = "qwen-fast".into();
+        assert!(crate::library::save(&state, entries, revision).await.unwrap_err().starts_with("\"qwen-fast\" is an instance alias of instance 2 of qwen"));
+        // A clash made outside these checks (a new instance's default suffix) is a 409.
+        crate::runtime::unload(&state, &third.id).await.unwrap();
+        set(second.id.clone(), &["qwen-i-3"]).await.unwrap();
+        let again = crate::runtime::insert_test_instance(&state, file, true).await;
+        assert_eq!(again.slot, 3);
+        let (status, message) = status_and_message(&app, "qwen-i-3").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.ends_with("Remove the instance alias in Local API, or give them different names in Library."), "{message}");
+        assert!(!listed(&app).await.contains(&"qwen-i-3".to_owned()));
+        // Ejecting forgets them.
+        crate::runtime::unload(&state, &second.id).await.unwrap();
+        assert_eq!(status_and_message(&app, "qwen-i-3").await.0, StatusCode::BAD_GATEWAY);
+        let back = crate::runtime::insert_test_instance(&state, file, true).await;
+        assert_eq!(back.slot, 2);
+        assert!(back.aliases().is_empty());
+        assert_eq!(status_and_message(&app, "billing").await.0, StatusCode::NOT_FOUND);
+        state.shutdown().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn any_available_is_a_reserved_name_everywhere() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let reserved = "\"any-available\" is reserved: a request that sends it goes to any free loaded instance.";
+        // Library save, the alias editors and a reread of models.yml.
+        let entry = |name: &str| crate::library::Entry { name: name.into(), path: "/models/a.gguf".into(), ..Default::default() };
+        assert_eq!(crate::library::validate(&[entry("any-available")]).unwrap_err(), format!("any-available: {reserved} Choose another name."));
+        let mut aliased = entry("a");
+        aliased.aliases = vec!["Any-Available".into()];
+        assert_eq!(crate::library::validate(&[aliased]).unwrap_err(), format!("a: {reserved} Choose another alias."));
+        assert_eq!(crate::runtime::set_aliases(&state, "/models/a.gguf".into(), vec!["any-available".into()]).await.unwrap_err(), format!("{reserved} Choose another alias."));
+        crate::library::refresh(&state).await;
+        std::fs::write(crate::library::file_path(&path), "version: 2\nmodels:\n- name: any-available\n  path: /models/b.gguf\n").unwrap();
+        crate::library::refresh(&state).await;
+        let error = state.library.lock().await.error.clone().unwrap();
+        assert!(error.starts_with(&format!("models.yml: any-available: {reserved}")), "{error}");
+        assert!(error.ends_with("Noullama keeps using the last valid version until it is fixed."), "{error}");
+        // A new entry for a file named any-available.gguf takes the next free name instead.
+        std::fs::write(crate::library::file_path(&path), "version: 2\nmodels: []\n").unwrap();
+        let model = path.join("any-available.gguf");
+        std::fs::write(&model, "test").unwrap();
+        let model = model.to_string_lossy().into_owned();
+        crate::library::ensure(&state, &[model.clone()]).await;
+        assert_eq!(state.api_names(&model).await.0, "any-available-2");
+        // With models.yml unreadable the file answers to its file name, so it cannot be loaded.
+        std::fs::write(crate::library::file_path(&path), "models: [").unwrap();
+        let other = path.join("Any-Available.gguf");
+        std::fs::write(&other, "test").unwrap();
+        state.settings.lock().await.model_path = other.to_string_lossy().into_owned();
+        assert_eq!(crate::runtime::load_model(&state).await.unwrap_err(), "This model's API name would be \"any-available\", which is reserved for sending a request to any free loaded instance. Give it another name in Library, or rename the file.");
+        assert!(state.instances.lock().await.is_empty());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn any_available_picks_the_idle_instance_that_waited_longest() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let (port_a, seen_a) = fake_native_runtime().await;
+        let (port_b, seen_b) = fake_native_runtime().await;
+        let a = crate::runtime::insert_test_instance_on(&state, "/models/acme/qwen.gguf", true, port_a).await;
+        let b = crate::runtime::insert_test_instance_on(&state, "/models/acme/other.gguf", true, port_b).await;
+        crate::runtime::insert_test_instance(&state, "/models/acme/slow.gguf", false).await;
+        let app = router(state.clone());
+        let counts = || (seen_a.lock().unwrap().len(), seen_b.lock().unwrap().len());
+        // A is busy (a Playground or API request holds it): B answers.
+        let held = crate::runtime::hold_test_claim(&state, &a);
+        let (status, message, model) = ask_for(&app, "any-available").await;
+        assert_eq!((status, model), (StatusCode::OK, json!("any-available")), "{message}");
+        assert_eq!(counts(), (0, 1));
+        drop(held);
+        assert!(!a.is_busy() && !b.is_busy());
+        // Both idle: A started its last request before B did, so A answers, then B.
+        ask_for(&app, "any-available").await;
+        assert_eq!(counts(), (1, 1));
+        ask_for(&app, "any-available").await;
+        assert_eq!(counts(), (1, 2));
+        // A named request counts as a start too: B was used last, then A by name, so B is next.
+        ask_for(&app, "qwen").await;
+        assert_eq!(counts(), (2, 2));
+        ask_for(&app, "any-available").await;
+        assert_eq!(counts(), (2, 3));
+        // The chat adapter, with model only inside the content JSON.
+        let mut content = request();
+        content["model"] = json!("any-available");
+        let chat = Request::builder().method("POST").uri("/v1/chat/completions").header("host", "127.0.0.1:11435").header("content-type", "application/json")
+            .body(Body::from(json!({"messages":[{"role":"user","content":content.to_string()}]}).to_string())).unwrap();
+        let response = app.clone().oneshot(chat).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(body["model"], "any-available");
+        assert_eq!(counts(), (3, 3));
+        // Exact and case-sensitive like every name; listed once, last.
+        let (status, message, _) = ask_for(&app, "Any-Available").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(message.contains("did you mean 'any-available'"), "{message}");
+        assert_eq!(listed(&app).await.iter().filter(|n| *n == "any-available").count(), 1);
+        assert_eq!(listed(&app).await.last().map(String::as_str), Some("any-available"));
+        // The runtime log names the instance that took each one.
+        assert!(state.logs.lock().await.iter().any(|l| l == "[other] Took a request for any-available."));
+        state.shutdown().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn any_available_rejects_when_all_are_busy_and_when_none_is_ready() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let app = router(state.clone());
+        let none = "No loaded instance is ready for \"any-available\". Load a model in noullama, or wait for one to finish loading.";
+        assert_eq!(ask_for(&app, "any-available").await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ask_for(&app, "any-available").await.1, none);
+        let loading = crate::runtime::insert_test_instance(&state, "/models/acme/slow.gguf", false).await;
+        assert_eq!(ask_for(&app, "any-available").await.1, none);
+        assert!(!listed(&app).await.contains(&"any-available".to_owned()));
+        // Wait mode does not wait when nothing is ready.
+        crate::runtime::set_when_busy(&state, "wait").await.unwrap();
+        assert_eq!(ask_for(&app, "any-available").await.1, none);
+        crate::runtime::set_when_busy(&state, "reject").await.unwrap();
+        assert!(crate::runtime::set_when_busy(&state, "queue").await.is_err());
+        crate::runtime::set_test_ready(&loading, true);
+        let held = crate::runtime::hold_test_claim(&state, &loading);
+        let (status, message, _) = ask_for(&app, "any-available").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(message, "Every loaded instance is busy with another request, so \"any-available\" has none to send this one to. Try again, or set \"When every instance is busy\" to Wait in Settings.");
+        drop(held);
+        state.shutdown().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn any_available_waits_for_the_first_free_instance_and_frees_on_disconnect() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let (port_a, seen_a) = fake_native_runtime().await;
+        let (port_b, seen_b) = fake_native_runtime_after(400).await;
+        let a = crate::runtime::insert_test_instance_on(&state, "/models/acme/qwen.gguf", true, port_a).await;
+        let b = crate::runtime::insert_test_instance_on(&state, "/models/acme/other.gguf", true, port_b).await;
+        crate::runtime::set_when_busy(&state, "wait").await.unwrap();
+        assert_eq!(state.settings.lock().await.any_available_when_busy, "wait");
+        let app = router(state.clone());
+        let held_a = crate::runtime::hold_test_claim(&state, &a);
+        let held_b = crate::runtime::hold_test_claim(&state, &b);
+        let waiting = tokio::spawn({ let app = app.clone(); async move { ask_for(&app, "any-available").await } });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!waiting.is_finished(), "it waits while every instance is busy");
+        drop(held_a);
+        let (status, message, _) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK, "{message}");
+        assert_eq!((seen_a.lock().unwrap().len(), seen_b.lock().unwrap().len()), (1, 0));
+        drop(held_b);
+        // A caller that gives up while waiting, or while its request runs, leaves no claim behind.
+        let held_a = crate::runtime::hold_test_claim(&state, &a);
+        let held_b = crate::runtime::hold_test_claim(&state, &b);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), ask_for(&app, "any-available")).await.is_err());
+        drop(held_a);
+        drop(held_b);
+        assert!(!a.is_busy() && !b.is_busy());
+        let held_a = crate::runtime::hold_test_claim(&state, &a);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), ask_for(&app, "any-available")).await.is_err());
+        assert_eq!(seen_b.lock().unwrap().len(), 1, "the request reached B before the caller left");
+        assert!(!b.is_busy());
+        drop(held_a);
+        // A Playground decision holds its instance too: B is running one, so A answers.
+        let playground = tokio::spawn({ let state = state.clone(); let b = b.clone(); async move { state.infer_on(&b, request()).await } });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(b.is_busy());
+        assert_eq!(ask_for(&app, "any-available").await.0, StatusCode::OK);
+        assert_eq!(seen_a.lock().unwrap().len(), 2);
+        playground.await.unwrap().unwrap();
+        // Ejecting the last ready instance ends the wait with the not-ready 503.
+        let held_a = crate::runtime::hold_test_claim(&state, &a);
+        let held_b = crate::runtime::hold_test_claim(&state, &b);
+        let waiting = tokio::spawn({ let app = app.clone(); async move { ask_for(&app, "any-available").await } });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::runtime::unload(&state, &a.id).await.unwrap();
+        crate::runtime::unload(&state, &b.id).await.unwrap();
+        let (status, message, _) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(message.starts_with("No loaded instance is ready"), "{message}");
+        drop((held_a, held_b));
+        state.shutdown().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// A real HTTP client that gives up mid-request frees its instance.
+    #[tokio::test]
+    async fn a_client_that_disconnects_frees_its_instance() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let mut state = AppState::new(path.clone()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        state.api_port = listener.local_addr().unwrap().port();
+        let (port, seen) = fake_native_runtime_after(1500).await;
+        let instance = crate::runtime::insert_test_instance_on(&state, "/models/acme/qwen.gguf", true, port).await;
+        let server = tokio::spawn(serve(listener, state.clone()));
+        let mut body = request();
+        body["model"] = json!("any-available");
+        let url = format!("http://127.0.0.1:{}/v1/systemone", state.api_port);
+        let sent = state.local_client.post(&url).timeout(std::time::Duration::from_millis(300)).json(&body).send().await;
+        assert!(sent.is_err(), "the client times out before the runtime answers");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while instance.is_busy() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the instance is freed once the client is gone, before the runtime answers");
+        server.abort();
+        state.shutdown().await;
         std::fs::remove_dir_all(path).unwrap();
     }
 

@@ -4,7 +4,7 @@
 //! Noullama rereads it whenever it changes on disk and backs it up before
 //! every change it makes.
 
-use crate::runtime::{file_stem, normalize_aliases, AppState};
+use crate::runtime::{file_stem, is_reserved, normalize_aliases, reserved_message, AppState};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -194,7 +194,7 @@ fn unique_name(path: &str, taken: &BTreeSet<String>) -> String {
     let base = if base.is_empty() { "model".to_owned() } else { base };
     (1..)
         .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
-        .find(|name| !taken.contains(&name.to_lowercase()))
+        .find(|name| !taken.contains(&name.to_lowercase()) && !is_reserved(name))
         .unwrap_or(base)
 }
 
@@ -235,6 +235,13 @@ fn taken_names(entries: &[Entry]) -> BTreeSet<String> {
     entries.iter().flat_map(|e| std::iter::once(&e.name).chain(&e.aliases)).map(|n| n.to_lowercase()).collect()
 }
 
+/// `taken_names` plus loaded instances' own aliases, so a new entry's name never takes one.
+fn taken_with(entries: &[Entry], owners: &[(String, String)]) -> BTreeSet<String> {
+    let mut taken = taken_names(entries);
+    taken.extend(owners.iter().map(|(alias, _)| alias.to_lowercase()));
+    taken
+}
+
 /// Checks every entry and returns them tidied (trimmed, lower-case sha256).
 /// Names and aliases are matched exactly, but no two may differ only by case.
 pub fn validate(entries: &[Entry]) -> Result<Vec<Entry>, String> {
@@ -245,6 +252,9 @@ pub fn validate(entries: &[Entry]) -> Result<Vec<Entry>, String> {
         let name = raw.name.trim().to_owned();
         if name.is_empty() || name.len() > 64 || !name.chars().all(valid_name_char) {
             return Err(format!("{label}: the name needs letters, digits and . _ : / - only, up to 64 characters."));
+        }
+        if is_reserved(&name) {
+            return Err(format!("{label}: {}", reserved_message("name")));
         }
         let path = raw.path.trim().to_owned();
         if !Path::new(&path).is_absolute() || !path.to_lowercase().ends_with(".gguf") {
@@ -446,12 +456,13 @@ fn refresh_locked(data_dir: &Path, library: &mut Library, legacy: &BTreeMap<Stri
 /// Adds an entry for each model file that has none.
 pub async fn ensure(state: &AppState, paths: &[String]) {
     refresh(state).await;
+    let owners = crate::runtime::instance_alias_owners(state).await;
     let added = {
         let mut library = state.library.lock().await;
         let mut entries = library.entries.clone();
         for path in paths {
             if !path.is_empty() && entries.iter().all(|e| e.path != *path) {
-                let entry = new_entry(path, &taken_names(&entries));
+                let entry = new_entry(path, &taken_with(&entries, &owners));
                 entries.push(entry);
             }
         }
@@ -485,18 +496,37 @@ async fn update(state: &AppState, kind: Change, change: impl FnOnce(&mut Vec<Ent
     write(&state.data_dir, &mut library, entries, kind)
 }
 
+/// A name or alias that `next` adds (compared with `before`, ignoring case)
+/// and that a loaded instance already has as its own instance alias. Names
+/// already in models.yml are left alone, so a clash made by editing the file
+/// stays a 409 conflict instead of blocking every later save.
+fn instance_alias_clash(before: &[Entry], next: &[Entry], owners: &[(String, String)]) -> Result<(), String> {
+    let old = taken_names(before);
+    for value in next.iter().flat_map(|e| std::iter::once(&e.name).chain(&e.aliases)) {
+        if old.contains(&value.to_lowercase()) {
+            continue;
+        }
+        if let Some((alias, owner)) = owners.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(value)) {
+            return Err(format!("\"{value}\" is an instance alias of {owner} (\"{alias}\"). Remove it from that instance in Local API, or choose another name."));
+        }
+    }
+    Ok(())
+}
+
 pub async fn set_aliases(state: &AppState, path: &str, aliases: Vec<String>) -> Result<Vec<String>, String> {
     let path = path.to_owned();
     let mut saved = Vec::new();
+    let owners = crate::runtime::instance_alias_owners(state).await;
     update(state, Change::Edit, |entries| {
+        let before = entries.clone();
         if entries.iter().all(|e| e.path != path) {
-            let entry = new_entry(&path, &taken_names(entries));
+            let entry = new_entry(&path, &taken_with(entries, &owners));
             entries.push(entry);
         }
         let entry = entries.iter_mut().find(|e| e.path == path).expect("entry exists");
         entry.aliases = normalize_aliases(&aliases)?.into_iter().filter(|a| *a != entry.name).collect();
         saved = entry.aliases.clone();
-        Ok(())
+        instance_alias_clash(&before, entries, &owners)
     })
     .await?;
     Ok(saved)
@@ -737,11 +767,13 @@ pub async fn save_library(entries: Vec<Entry>, revision: u64, state: tauri::Stat
 pub async fn save(state: &AppState, entries: Vec<Entry>, revision: u64) -> Result<(), String> {
     refresh(state).await;
     let entries = validate(&entries)?;
+    let owners = crate::runtime::instance_alias_owners(state).await;
     {
         let mut library = state.library.lock().await;
         if library.revision != revision {
             return Err("models.yml changed since you started editing. Discard your changes to see the new version, then edit again.".into());
         }
+        instance_alias_clash(&library.entries, &entries, &owners)?;
         write(&state.data_dir, &mut library, entries, Change::Edit)?;
     }
     hash_missing(state.clone());

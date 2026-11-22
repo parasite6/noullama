@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Play, RefreshCw, RotateCcw, Square, Unplug } from 'lucide-react';
+import { Check, Play, Plus, RefreshCw, RotateCcw, Square, Unplug } from 'lucide-react';
 import { AuthorLogo } from './AuthorLogo';
 import { CopyButton } from './CopyButton';
-import { ModelAliases, type Route } from './ModelNames';
+import { ModelAliases, Name, type Route } from './ModelNames';
 import { KeepContext } from './KeepContext';
 
 // What a card needs from one loaded instance. Everything shown is what the
@@ -10,6 +10,8 @@ import { KeepContext } from './KeepContext';
 export type CardInstance = {
   id: string; name: string; path: string; device: string; ready: boolean;
   slot: number; suffix: string; default_suffix: string;
+  // Exact extra names for this instance only, held while it is loaded.
+  instance_aliases: string[];
   projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null;
   context_size: number; gpu_layers: number; settings: { decision_mode: string };
   // This instance's own Keep context switch and history counts.
@@ -47,11 +49,33 @@ function SuffixEditor({ instance, disabled, onSave, onError }: { instance: CardI
   </form>;
 }
 
-export function InstanceCard({ instance, account, runtime, aliases, routes, displayName, stale, canReload, starting, ejecting, reloadDisabled, namesDisabled, keepContext, onEject, onReload, onSaveAliases, onSaveSuffix, onKeepContext, onClearContext, onError }: {
+// This instance's own aliases: exact names (no suffix) that reach only it.
+// They are kept apart from the file's models.yml aliases above and are never saved.
+function InstanceAliasEditor({ instance, disabled, onSave, onError }: { instance: CardInstance; disabled: boolean; onSave: (aliases: string[]) => Promise<void>; onError: (message: string) => void }) {
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const aliases = instance.instance_aliases;
+  async function save(next: string[], clear: boolean) {
+    setSaving(true);
+    try { await onSave(next); if (clear) setDraft(''); } catch (e) { onError(errorText(e)); } finally { setSaving(false); }
+  }
+  return <div className="instance-aliases">
+    <span className="instance-names-label">Instance aliases</span>
+    {aliases.length > 0 ? <div className="model-name-list">{aliases.map(alias => <Name key={alias} value={alias} note="This instance only" removeTitle="Remove instance alias" disabled={disabled || saving} onRemove={() => void save(aliases.filter(other => other !== alias), false)} onError={onError}/>)}</div> : <small>None.</small>}
+    <form className="alias-form" onSubmit={event => { event.preventDefault(); if (draft.trim()) void save([...aliases, draft.trim()], true); }}>
+      <input aria-label={`New instance alias for instance ${instance.slot} of ${instance.name}`} placeholder="Add a name for this instance only, such as billing" maxLength={64} value={draft} disabled={disabled || saving} onChange={event => setDraft(event.target.value)}/>
+      <button className="secondary compact" disabled={disabled || saving || !draft.trim()}><Plus size={13}/>Add instance alias</button>
+    </form>
+    <small>Exact names that reach only this instance; no suffix is added. Kept only until this instance is ejected or reloaded, and never saved.</small>
+  </div>;
+}
+
+export function InstanceCard({ instance, account, runtime, aliases, routes, displayName, stale, canReload, starting, ejecting, reloadDisabled, namesDisabled, keepContext, onEject, onReload, onSaveAliases, onSaveSuffix, onSaveInstanceAliases, onKeepContext, onClearContext, onError }: {
   instance: CardInstance; account: string | null; runtime: string; aliases: string[]; routes: Route[];
   // The instance's first API identifier, such as qwen-i-2.
   displayName: string;
   onSaveSuffix: (suffix: string) => Promise<void>;
+  onSaveInstanceAliases: (aliases: string[]) => Promise<void>;
   // The switch as shown: the snapshot's value, or the one just chosen while it saves.
   keepContext: boolean; onKeepContext: (on: boolean) => void; onClearContext: () => void;
   // The load panel's settings differ from this instance's (same file selected there).
@@ -85,6 +109,7 @@ export function InstanceCard({ instance, account, runtime, aliases, routes, disp
       <ModelAliases path={instance.path} instance={instance.id} aliases={aliases} routes={routes} disabled={namesDisabled} onSave={onSaveAliases} onError={onError}/>
     </div>
     <SuffixEditor instance={instance} disabled={namesDisabled} onSave={onSaveSuffix} onError={onError}/>
+    <InstanceAliasEditor instance={instance} disabled={namesDisabled} onSave={onSaveInstanceAliases} onError={onError}/>
     <div className="instance-keep"><KeepContext on={keepContext} entries={instance.context.entries} lastFlushed={instance.context.last_flushed} disabled={namesDisabled} onToggle={onKeepContext} onClear={onClearContext}/></div>
   </section>;
 }

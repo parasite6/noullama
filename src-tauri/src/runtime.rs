@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -55,6 +55,10 @@ pub struct Settings {
     // loaded instance with the lowest slot instead of answering 503.
     // Changed only by set_fall_through.
     pub fall_through_to_other_instances: bool,
+    // What a request for `any-available` does when every ready instance is
+    // running a request: "reject" (503) or "wait" (up to ANY_AVAILABLE_WAIT).
+    // Changed only by set_any_available_when_busy.
+    pub any_available_when_busy: String,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -78,6 +82,7 @@ impl Default for Settings {
             allow_force_fit: false,
             hide_crowded_load_warning: false,
             fall_through_to_other_instances: false,
+            any_available_when_busy: "reject".into(),
         }
     }
 }
@@ -114,6 +119,12 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub api_port: u16,
     pub client: reqwest::Client,
+    /// Stamps each request an instance starts, so `any-available` can pick
+    /// the instance idle the longest.
+    pub request_seq: Arc<AtomicU64>,
+    /// Wakes `any-available` requests waiting for an instance: one when a
+    /// request finishes or an instance becomes ready, all when one unloads.
+    pub instance_freed: Arc<tokio::sync::Notify>,
 }
 
 // A launch owns its credentials until all its requests and polling tasks finish.
@@ -199,6 +210,23 @@ pub struct LoadError {
     pub message: String,
 }
 
+/// The model identifier that reaches any ready instance not running a request.
+pub const ANY_AVAILABLE: &str = "any-available";
+
+/// How long a request for `any-available` waits for a free instance when
+/// `any_available_when_busy` is "wait".
+pub const ANY_AVAILABLE_WAIT: Duration = Duration::from_secs(120);
+
+/// Whether a name is `any-available`, ignoring case like every other name collision.
+pub fn is_reserved(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ANY_AVAILABLE)
+}
+
+/// Why a name, alias or identifier cannot be `any-available`.
+pub fn reserved_message(what: &str) -> String {
+    format!("\"{ANY_AVAILABLE}\" is reserved: a request that sends it goes to any free loaded instance. Choose another {what}.")
+}
+
 /// The suffix a new instance in `slot` starts with: none for slot 1, `-i-N` after.
 pub fn default_suffix(slot: u32) -> String {
     if slot <= 1 { String::new() } else { format!("-i-{slot}") }
@@ -252,6 +280,9 @@ pub fn check_suffix(slot: u32, suffix: &str, name: &str, aliases: &[String], tak
         if !crate::library::valid_name(&identifier) {
             return Err(format!("Model name \"{identifier}\" can use letters, digits and . _ : / - only, up to 64 characters."));
         }
+        if is_reserved(&identifier) {
+            return Err(reserved_message("suffix"));
+        }
         if let Some((_, entry)) = library.iter().find(|(other, _)| other.eq_ignore_ascii_case(&identifier)) {
             return Err(format!("\"{identifier}\" is already a name or alias of {entry} in models.yml. Choose another suffix."));
         }
@@ -295,6 +326,13 @@ pub struct Instance {
     /// This instance's Keep context switch. Starts from the `keep_context`
     /// setting at load; held only while it is loaded, never saved.
     keep_context: AtomicBool,
+    /// Extra exact names for this instance only (no suffix added). Held only
+    /// while it is loaded, never saved; a reload starts with none.
+    aliases: std::sync::Mutex<Vec<String>>,
+    /// Requests running on this instance right now (API and Playground).
+    in_flight: AtomicUsize,
+    /// `request_seq` when it last started a request; 0 when it never has.
+    last_started: AtomicU64,
 }
 
 impl Instance {
@@ -316,6 +354,17 @@ impl Instance {
     pub fn keeps_context(&self) -> bool {
         self.keep_context.load(Ordering::SeqCst)
     }
+    /// This instance's own aliases, in the order they were added.
+    pub fn aliases(&self) -> Vec<String> {
+        self.aliases.lock().map(|a| a.clone()).unwrap_or_else(|e| e.into_inner().clone())
+    }
+    fn set_aliases(&self, aliases: Vec<String>) {
+        *self.aliases.lock().unwrap_or_else(|e| e.into_inner()) = aliases;
+    }
+    /// Whether a request is running on it right now.
+    pub fn is_busy(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) > 0
+    }
     /// Turns this instance's Keep context on or off; off empties its history.
     pub async fn set_keep_context(&self, on: bool) {
         let mut history = self.context.lock().await;
@@ -327,7 +376,7 @@ impl Instance {
     pub fn model(&self) -> LoadedModel {
         self.model.lock().map(|m| m.clone()).unwrap_or_else(|e| e.into_inner().clone())
     }
-    fn prefix(&self) -> String {
+    pub fn prefix(&self) -> String {
         format!("[{}] ", self.label)
     }
     fn load_marker(&self) -> String {
@@ -343,6 +392,54 @@ impl Instance {
         }
         self.context.lock().await.clear();
     }
+}
+
+/// A request running on one instance. It counts toward the instance's
+/// `in_flight` from creation until it is dropped, including when the caller
+/// goes away mid-request, and then wakes one waiting `any-available` request.
+pub struct Claim {
+    pub instance: Arc<Instance>,
+    freed: Arc<tokio::sync::Notify>,
+}
+
+impl Claim {
+    /// Counts a request on `instance` whether or not it is busy already.
+    fn take(state: &AppState, instance: &Arc<Instance>) -> Self {
+        instance.in_flight.fetch_add(1, Ordering::SeqCst);
+        Self::stamped(state, instance)
+    }
+    /// Claims `instance` only when no request is running on it.
+    fn take_idle(state: &AppState, instance: &Arc<Instance>) -> Option<Self> {
+        instance.in_flight.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).ok()?;
+        Some(Self::stamped(state, instance))
+    }
+    fn stamped(state: &AppState, instance: &Arc<Instance>) -> Self {
+        instance.last_started.store(state.request_seq.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        Self { instance: instance.clone(), freed: state.instance_freed.clone() }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.instance.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.freed.notify_one();
+    }
+}
+
+/// Why `any-available` found no instance.
+pub enum AnyError {
+    /// No loaded instance is ready.
+    NoneReady(String),
+    /// Every ready instance is running a request (setting "reject", or the wait ran out).
+    Busy(String),
+}
+
+/// The idle, ready instance that started a request least recently (one that
+/// never has comes first, then load order).
+fn pick_idle(instances: &[Arc<Instance>]) -> Vec<&Arc<Instance>> {
+    let mut idle: Vec<&Arc<Instance>> = instances.iter().filter(|i| i.is_ready() && !i.is_busy()).collect();
+    idle.sort_by_key(|i| i.last_started.load(Ordering::SeqCst));
+    idle
 }
 
 /// Why a model name could not be routed to a loaded model.
@@ -361,7 +458,8 @@ pub enum RouteError {
 pub struct Route {
     /// The identifier a request sends: a name or alias plus the instance suffix.
     pub name: String,
-    /// "name" (its name in models.yml) or "alias".
+    /// "name" (its name in models.yml), "alias" (a models.yml alias) or
+    /// "instance_alias" (one instance's own alias, never suffixed).
     pub kind: &'static str,
     /// The name or alias without the suffix.
     pub base: String,
@@ -386,10 +484,12 @@ pub struct RouteInstance<'a> {
     pub slot: u32,
     pub suffix: String,
     pub ready: bool,
+    /// The instance's own aliases, exact.
+    pub aliases: Vec<String>,
 }
 
 /// Every identifier the local API knows, in load order: each loaded
-/// instance's names then aliases (suffixed), the unsuffixed names of a file
+/// instance's names then aliases (suffixed) then its instance aliases, the unsuffixed names of a file
 /// whose slot 1 is not loaded, then models.yml entries that are not loaded.
 /// `names` gives a path's (name, aliases); `entries` lists models.yml paths.
 pub fn route_table(instances: &[RouteInstance], entries: &[String], names: impl Fn(&str) -> (String, Vec<String>), fall_through: bool) -> Vec<Route> {
@@ -413,6 +513,12 @@ pub fn route_table(instances: &[RouteInstance], entries: &[String], names: impl 
                 slot: instance.slot, suffix: instance.suffix.clone(), ready: instance.ready, fallthrough: false, conflict: false,
             });
         }
+        for alias in &instance.aliases {
+            routes.push(Route {
+                name: alias.clone(), kind: "instance_alias", base: alias.clone(), path: instance.path.to_owned(), instance: Some(instance.id.to_owned()),
+                slot: instance.slot, suffix: instance.suffix.clone(), ready: instance.ready, fallthrough: false, conflict: false,
+            });
+        }
     }
     for path in entries {
         if instances.iter().any(|i| i.path == path) {
@@ -423,6 +529,9 @@ pub fn route_table(instances: &[RouteInstance], entries: &[String], names: impl 
             routes.push(Route { name: identifier, kind, base, path: path.clone(), instance: None, slot: 1, suffix: String::new(), ready: false, fallthrough: false, conflict: false });
         }
     }
+    // `any-available` is answered before the table is consulted; a file
+    // named that (with models.yml unusable) must not list it a second time.
+    routes.retain(|r| !is_reserved(&r.name));
     // An identifier listed twice reaches two models (two files sharing a
     // name, or a suffix that matches another model's name): unusable.
     let counts: Vec<usize> = routes.iter().map(|r| routes.iter().filter(|o| o.name == r.name).count()).collect();
@@ -510,6 +619,8 @@ impl AppState {
             hash_worker: Default::default(),
             hash_cache_lock: Default::default(),
             instances_added: Default::default(),
+            request_seq: Default::default(),
+            instance_freed: Default::default(),
             local_client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(120))
@@ -547,6 +658,7 @@ impl AppState {
         for instance in all {
             instance.stop().await;
         }
+        self.instance_freed.notify_waiters();
     }
     /// Removes one loaded model and stops its runtime. Hold the lifecycle lock.
     async fn unload_locked(&self, id: &str) -> Option<Arc<Instance>> {
@@ -556,6 +668,8 @@ impl AppState {
             list.remove(index)
         };
         removed.stop().await;
+        // Waiting `any-available` requests recheck whether any instance is still ready.
+        self.instance_freed.notify_waiters();
         Some(removed)
     }
     async fn record_load_error(&self, instance: &Instance, message: String) {
@@ -593,14 +707,50 @@ impl AppState {
         };
         let table: Vec<RouteInstance> = instances
             .iter()
-            .map(|i| RouteInstance { id: &i.id, path: i.path(), slot: i.slot, suffix: i.suffix(), ready: i.is_ready() })
+            .map(|i| RouteInstance { id: &i.id, path: i.path(), slot: i.slot, suffix: i.suffix(), ready: i.is_ready(), aliases: i.aliases() })
             .collect();
         let entries: Vec<String> = library.entries.iter().map(|e| e.path.clone()).collect();
         route_table(&table, &entries, names, fall_through)
     }
-    /// Names that reach a ready model right now, as `/v1/models` lists them.
+    /// Names that reach a ready model right now, as `/v1/models` lists them:
+    /// the route table's, then `any-available` when any instance is ready.
     pub async fn model_names(&self) -> Vec<String> {
-        listed_names(&self.routes().await)
+        let routes = self.routes().await;
+        self.with_any_available(listed_names(&routes)).await
+    }
+    async fn with_any_available(&self, mut names: Vec<String>) -> Vec<String> {
+        if self.any_ready().await {
+            names.push(ANY_AVAILABLE.to_owned());
+        }
+        names
+    }
+    /// A request for `any-available`: claims the ready instance that has been
+    /// idle the longest. When every ready instance is busy, answers at once
+    /// (setting "reject") or waits for the first to free up (setting "wait",
+    /// up to ANY_AVAILABLE_WAIT). The claim is held until the request ends.
+    pub async fn claim_any(&self) -> Result<Claim, AnyError> {
+        let wait = self.settings.lock().await.any_available_when_busy == "wait";
+        let deadline = tokio::time::Instant::now() + ANY_AVAILABLE_WAIT;
+        loop {
+            // Registered before looking, so a request that finishes in between still wakes it.
+            let freed = self.instance_freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            let instances = self.instances.lock().await.clone();
+            if !instances.iter().any(|i| i.is_ready()) {
+                return Err(AnyError::NoneReady(format!("No loaded instance is ready for \"{ANY_AVAILABLE}\". Load a model in noullama, or wait for one to finish loading.")));
+            }
+            if let Some(claim) = pick_idle(&instances).into_iter().find_map(|i| Claim::take_idle(self, i)) {
+                self.log(format!("{}Took a request for {ANY_AVAILABLE}.", claim.instance.prefix())).await;
+                return Ok(claim);
+            }
+            if !wait {
+                return Err(AnyError::Busy(format!("Every loaded instance is busy with another request, so \"{ANY_AVAILABLE}\" has none to send this one to. Try again, or set \"When every instance is busy\" to Wait in Settings.")));
+            }
+            if tokio::time::timeout_at(deadline, freed).await.is_err() {
+                return Err(AnyError::Busy(format!("Every loaded instance stayed busy for {} seconds, so \"{ANY_AVAILABLE}\" gave up on this request. Try again.", ANY_AVAILABLE_WAIT.as_secs())));
+            }
+        }
     }
     /// The loaded model a request's `model` field names: one of its file's
     /// names or aliases in models.yml plus the instance's suffix (a loaded
@@ -629,9 +779,11 @@ impl AppState {
                 let hint = routes
                     .iter()
                     .find(|r| r.name.eq_ignore_ascii_case(name))
-                    .map(|r| format!(" Names are case-sensitive; did you mean '{}'?", r.name))
+                    .map(|r| r.name.as_str())
+                    .or_else(|| is_reserved(name).then_some(ANY_AVAILABLE))
+                    .map(|n| format!(" Names are case-sensitive; did you mean '{n}'?"))
                     .unwrap_or_default();
-                let names = listed_names(&routes);
+                let names = self.with_any_available(listed_names(&routes)).await;
                 Err(Unknown(if names.is_empty() {
                     format!("Unknown model '{name}'.{hint} No model is ready; load one in noullama.")
                 } else {
@@ -658,19 +810,26 @@ impl AppState {
             },
             many => {
                 let suffixed = many.iter().any(|r| r.slot > 1);
+                let instance_alias = many.iter().any(|r| r.kind == "instance_alias");
                 Err(Ambiguous(format!(
                     "'{name}' is the name of {} loaded models ({}). {}",
                     many.len(),
                     many.iter().map(|r| if r.slot > 1 { format!("{} instance {}", r.path, r.slot) } else { r.path.clone() }).collect::<Vec<_>>().join(", "),
-                    if suffixed { "Give them different names in Library, or change the instance suffix in Local API." } else { "Give them different names in Library." }
+                    if instance_alias { "Remove the instance alias in Local API, or give them different names in Library." } else if suffixed { "Give them different names in Library, or change the instance suffix in Local API." } else { "Give them different names in Library." }
                 )))
             }
         }
     }
     /// Runs a decision on one loaded model, with earlier decisions added when
     /// Keep context is on.
+    /// The request counts as running on it (see `Claim`) until it ends.
     pub async fn infer_on(&self, instance: &Arc<Instance>, payload: Value) -> Result<Value, String> {
-        crate::context::infer(self, instance, payload).await
+        let claim = Claim::take(self, instance);
+        self.infer_claimed(&claim, payload).await
+    }
+    /// `infer_on` for a request that already holds its instance's claim.
+    pub async fn infer_claimed(&self, claim: &Claim, payload: Value) -> Result<Value, String> {
+        crate::context::infer(self, &claim.instance, payload).await
     }
 
     /// One request to the runtime. `with_history` marks a state that carries
@@ -961,6 +1120,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
         loaded.push(json!({
             "id": instance.id, "name": name, "label": instance.label,
             "slot": instance.slot, "suffix": instance.suffix(), "default_suffix": default_suffix(instance.slot), "api_names": api_names,
+            "instance_aliases": instance.aliases(),
             "path": model.path, "device": model.device, "runtime_path": model.runtime_path,
             "projector": model.projector, "mmproj_path": instance.settings.mmproj_path,
             "mtp": model.mtp, "mtp_path": instance.settings.mtp_path, "layout": model.layout,
@@ -1028,6 +1188,7 @@ pub async fn save_from_editor(state: &AppState, mut settings: Settings) -> Resul
         settings.allow_force_fit = current.allow_force_fit;
         settings.hide_crowded_load_warning = current.hide_crowded_load_warning;
         settings.fall_through_to_other_instances = current.fall_through_to_other_instances;
+        settings.any_available_when_busy = current.any_available_when_busy.clone();
     }
     persist_settings(state, settings).await
 }
@@ -1038,6 +1199,9 @@ pub fn normalize_aliases(aliases: &[String]) -> Result<Vec<String>, String> {
     for alias in aliases.iter().map(|a| a.trim()).filter(|a| !a.is_empty()) {
         if !crate::library::valid_name(alias) {
             return Err(format!("Model name \"{alias}\" can use letters, digits and . _ : / - only, up to 64 characters."));
+        }
+        if is_reserved(alias) {
+            return Err(reserved_message("alias"));
         }
         if !names.iter().any(|n| n.eq_ignore_ascii_case(alias)) {
             names.push(alias.to_owned());
@@ -1194,6 +1358,10 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
     {
         return Err("Select a downloaded or local .gguf decision model first.".into());
     }
+    // Its plain name answers for slot 1 and for fall-through, so no slot may use it.
+    if is_reserved(&state.api_names(&settings.model_path).await.0) {
+        return Err(format!("This model's API name would be \"{ANY_AVAILABLE}\", which is reserved for sending a request to any free loaded instance. Give it another name in Library, or rename the file."));
+    }
     if !settings.mmproj_path.is_empty() && !Path::new(&settings.mmproj_path).is_file() {
         return Err(format!("The multimodal projector {} does not exist. If models.yml lists it for this model, fix the path in Library.", settings.mmproj_path));
     }
@@ -1241,6 +1409,9 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
         child: Default::default(),
         ready: AtomicBool::new(false),
         context: Default::default(),
+        aliases: Default::default(),
+        in_flight: Default::default(),
+        last_started: Default::default(),
     });
     state.load_errors.lock().await.retain(|e| !(e.path == instance.path() && e.slot == instance.slot));
     state.instances.lock().await.push(instance.clone());
@@ -1597,6 +1768,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
                     model.layout = Some(layout.name().into());
                 }
                 instance.ready.store(true, Ordering::SeqCst);
+                state.instance_freed.notify_one();
                 state
                     .log(format!("{prefix}Decision model is ready. Local API is accepting requests."))
                     .await;
@@ -1665,7 +1837,8 @@ pub async fn change_suffix(state: &AppState, id: &str, suffix: &str) -> Result<S
     let instances = state.instances.lock().await.clone();
     let taken: Vec<(String, String)> = routes
         .iter()
-        .filter(|r| r.instance.as_deref().is_some_and(|other| other != id))
+        // Every other instance's identifiers, and this one's own instance aliases.
+        .filter(|r| r.instance.as_deref().is_some_and(|other| other != id || r.kind == "instance_alias"))
         .map(|r| {
             let owner = instances.iter().find(|i| Some(i.id.as_str()) == r.instance.as_deref());
             (r.name.clone(), owner.map_or_else(|| "another loaded model".to_owned(), |o| format!("instance {} of {}", o.slot, o.stem())))
@@ -1683,6 +1856,76 @@ pub async fn change_suffix(state: &AppState, id: &str, suffix: &str) -> Result<S
     instance.set_suffix(suffix.clone());
     state.log(format!("{}API suffix set to {suffix}.", instance.prefix())).await;
     Ok(suffix)
+}
+
+/// Sets one loaded instance's own aliases: exact names (no suffix) that
+/// reach only it. They live until the instance is unloaded and are never saved.
+#[tauri::command]
+pub async fn set_instance_aliases(id: String, aliases: Vec<String>, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    change_instance_aliases(state.inner(), &id, aliases).await
+}
+
+pub async fn change_instance_aliases(state: &AppState, id: &str, aliases: Vec<String>) -> Result<Vec<String>, String> {
+    crate::library::refresh(state).await;
+    // Held so a load, a suffix change or another alias change cannot slip in between the check and the write.
+    let _guard = state.lifecycle.lock().await;
+    let instance = state.instance(id).await.ok_or("That model is no longer loaded.")?;
+    let aliases = normalize_aliases(&aliases)?;
+    let library: Vec<(String, String)> = state.library.lock().await.entries.iter()
+        .flat_map(|e| std::iter::once(&e.name).chain(&e.aliases).map(move |n| (n.clone(), e.name.clone())))
+        .collect();
+    let instances = state.instances.lock().await.clone();
+    // Every identifier in the route table but this instance's own aliases.
+    let taken: Vec<(String, String)> = state.routes().await.into_iter()
+        .filter(|r| !(r.kind == "instance_alias" && r.instance.as_deref() == Some(id)))
+        .map(|r| {
+            let owner = r.instance.as_deref().and_then(|o| instances.iter().find(|i| i.id == o));
+            (r.name, owner.map_or_else(|| file_stem(&r.path), |o| format!("instance {} of {}", o.slot, o.stem())))
+        })
+        .collect();
+    let aliases = check_instance_aliases(aliases, &taken, &library)?;
+    instance.set_aliases(aliases.clone());
+    let text = if aliases.is_empty() { "none".to_owned() } else { aliases.join(", ") };
+    state.log(format!("{}Instance aliases set to {text}.", instance.prefix())).await;
+    Ok(aliases)
+}
+
+/// Checks one instance's aliases (already trimmed, checked and de-duplicated
+/// by `normalize_aliases`) against every models.yml name and alias and every
+/// other identifier a loaded instance answers to, ignoring case.
+pub fn check_instance_aliases(aliases: Vec<String>, taken: &[(String, String)], library: &[(String, String)]) -> Result<Vec<String>, String> {
+    for alias in &aliases {
+        if let Some((_, entry)) = library.iter().find(|(other, _)| other.eq_ignore_ascii_case(alias)) {
+            return Err(format!("\"{alias}\" is already a name or alias of {entry} in models.yml. Choose another alias."));
+        }
+        if let Some((_, owner)) = taken.iter().find(|(other, _)| other.eq_ignore_ascii_case(alias)) {
+            return Err(format!("\"{alias}\" already reaches {owner}. Choose another alias."));
+        }
+    }
+    Ok(aliases)
+}
+
+/// Every instance alias of a loaded instance, with who holds it, for checks
+/// that must not hand one of them to a models.yml entry.
+pub async fn instance_alias_owners(state: &AppState) -> Vec<(String, String)> {
+    state.instances.lock().await.iter()
+        .flat_map(|i| i.aliases().into_iter().map(move |a| (a, format!("instance {} of {}", i.slot, i.stem()))))
+        .collect()
+}
+
+/// The Settings tab's "When every instance is busy" for `any-available`.
+#[tauri::command]
+pub async fn set_any_available_when_busy(mode: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    set_when_busy(state.inner(), &mode).await
+}
+
+pub async fn set_when_busy(state: &AppState, mode: &str) -> Result<(), String> {
+    if !["reject", "wait"].contains(&mode) {
+        return Err("Unknown choice for when every instance is busy.".into());
+    }
+    let mut settings = state.settings.lock().await.clone();
+    settings.any_available_when_busy = mode.to_owned();
+    persist_settings(state, settings).await
 }
 
 /// The Settings tab's "Fall through to another instance".
@@ -1883,9 +2126,18 @@ pub async fn insert_test_instance_on(state: &AppState, path: &str, ready: bool, 
         child: Default::default(),
         ready: AtomicBool::new(ready),
         context: Default::default(),
+        aliases: Default::default(),
+        in_flight: Default::default(),
+        last_started: Default::default(),
     });
     state.instances.lock().await.push(instance.clone());
     instance
+}
+
+/// Counts a request as running on a test instance until the claim is dropped.
+#[cfg(test)]
+pub fn hold_test_claim(state: &AppState, instance: &Arc<Instance>) -> Claim {
+    Claim::take(state, instance)
 }
 
 /// Marks a test instance ready or loading.
@@ -1969,7 +2221,7 @@ mod tests {
     }
 
     fn table(instances: &[(&str, &str, u32, &str, bool)], entries: &[&str], fall_through: bool) -> Vec<Route> {
-        let list: Vec<RouteInstance> = instances.iter().map(|(id, path, slot, suffix, ready)| RouteInstance { id, path, slot: *slot, suffix: suffix.to_string(), ready: *ready }).collect();
+        let list: Vec<RouteInstance> = instances.iter().map(|(id, path, slot, suffix, ready)| RouteInstance { id, path, slot: *slot, suffix: suffix.to_string(), ready: *ready, aliases: vec![] }).collect();
         let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
         route_table(&list, &entries, |path| match path {
             "/m/qwen.gguf" => ("qwen".into(), vec!["triage".into()]),
@@ -2437,5 +2689,50 @@ mod tests {
             serde_json::from_slice(&std::fs::read(base.join("settings.json")).unwrap()).unwrap();
         assert_eq!(stored.download_dir, settings.download_dir);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn any_available_is_reserved_in_aliases_suffixes_and_instance_aliases() {
+        let reserved = "\"any-available\" is reserved: a request that sends it goes to any free loaded instance.";
+        // Ignoring case, like every other name collision.
+        for alias in ["any-available", "Any-Available"] {
+            assert_eq!(normalize_aliases(&[alias.into()]).unwrap_err(), format!("{reserved} Choose another alias."));
+        }
+        // A suffix that turns "any" into the reserved name.
+        assert_eq!(check_suffix(2, "-available", "any", &[], &[], &[]).unwrap_err(), format!("{reserved} Choose another suffix."));
+        assert_eq!(check_suffix(2, "-available", "qwen", &["any".into()], &[], &[]).unwrap_err(), format!("{reserved} Choose another suffix."));
+        assert_eq!(check_suffix(2, "-available-2", "any", &[], &[], &[]).unwrap(), "-available-2");
+        assert!(is_reserved("ANY-available") && !is_reserved("any-available-2"));
+    }
+
+    #[test]
+    fn instance_aliases_must_not_collide_with_models_yml_or_loaded_identifiers() {
+        let library = vec![("qwen".to_owned(), "qwen".to_owned()), ("triage".to_owned(), "qwen".to_owned())];
+        let taken = vec![("qwen-i-2".to_owned(), "instance 2 of qwen".to_owned()), ("sorter".to_owned(), "instance 1 of other".to_owned())];
+        let check = |aliases: &[&str]| check_instance_aliases(aliases.iter().map(|a| a.to_string()).collect(), &taken, &library);
+        assert_eq!(check(&["billing", "refunds"]).unwrap(), ["billing", "refunds"]);
+        assert_eq!(check(&["TRIAGE"]).unwrap_err(), "\"TRIAGE\" is already a name or alias of qwen in models.yml. Choose another alias.");
+        assert_eq!(check(&["Qwen-I-2"]).unwrap_err(), "\"Qwen-I-2\" already reaches instance 2 of qwen. Choose another alias.");
+        assert_eq!(check(&["billing", "sorter"]).unwrap_err(), "\"sorter\" already reaches instance 1 of other. Choose another alias.");
+    }
+
+    #[test]
+    fn instance_aliases_follow_their_instance_in_the_route_table_unsuffixed() {
+        let list = vec![
+            RouteInstance { id: "a", path: "/m/qwen.gguf", slot: 1, suffix: String::new(), ready: true, aliases: vec![] },
+            RouteInstance { id: "b", path: "/m/qwen.gguf", slot: 2, suffix: "-i-2".into(), ready: true, aliases: vec!["billing".into()] },
+            RouteInstance { id: "c", path: "/m/other.gguf", slot: 1, suffix: String::new(), ready: true, aliases: vec!["billing".into(), "spare".into()] },
+        ];
+        let routes = route_table(&list, &[], |path| (file_stem(path), vec![]), false);
+        let names: Vec<(&str, &str, Option<&str>, bool)> = routes.iter().map(|r| (r.name.as_str(), r.kind, r.instance.as_deref(), r.conflict)).collect();
+        assert_eq!(names, [
+            ("qwen", "name", Some("a"), false),
+            ("qwen-i-2", "name", Some("b"), false),
+            ("billing", "instance_alias", Some("b"), true),
+            ("other", "name", Some("c"), false),
+            ("billing", "instance_alias", Some("c"), true),
+            ("spare", "instance_alias", Some("c"), false),
+        ]);
+        assert_eq!(listed_names(&routes), ["qwen", "qwen-i-2", "other", "spare"]);
     }
 }
