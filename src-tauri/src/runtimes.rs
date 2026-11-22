@@ -828,7 +828,7 @@ mod tests {
         };
         *state.runtimes.plan.lock().await = Some(plan.clone());
         assert!(!state.data_dir.join("runtimes").exists());
-        assert!(begin_runtime_download(&state, "unapproved").await.is_err());
+        assert_eq!(begin_runtime_download(&state, "unapproved").await.unwrap_err(), "Check releases again before approving this download");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         for _ in 0..2 {
             begin_runtime_download(&state, "approved").await.unwrap();
@@ -952,7 +952,7 @@ mod tests {
             "x64",
             "cpu"
         ));
-        assert!(platform_arch("riscv64").is_err());
+        assert_eq!(platform_arch("riscv64").unwrap_err(), "No automatic runtime package is available for architecture riscv64. Use a custom build.");
     }
     #[test]
     fn release_assets_require_official_urls_and_hashes() {
@@ -960,12 +960,12 @@ mod tests {
         let mut release = json!({"tag_name":"b11968","assets":[{"name":name,"size":123,"digest":format!("sha256:{}","a".repeat(64)),"browser_download_url":format!("https://github.com/ggml-org/llama.cpp/releases/download/b11968/{name}")}]});
         assert!(release_build(&release, "linux", "x64", "cpu", "Nightly".into()).is_ok());
         release["assets"][0]["browser_download_url"] = json!("https://evil.example/build.tar.gz");
-        assert!(release_build(&release, "linux", "x64", "cpu", "Nightly".into()).is_err());
+        assert_eq!(release_build(&release, "linux", "x64", "cpu", "Nightly".into()).err().as_deref(), Some("Release asset does not belong to the official llama.cpp repository"));
         release["assets"][0]["browser_download_url"] = json!(format!(
             "https://github.com/ggml-org/llama.cpp/releases/download/b11968/{name}"
         ));
         release["assets"][0]["digest"] = Value::Null;
-        assert!(release_build(&release, "linux", "x64", "cpu", "Nightly".into()).is_err());
+        assert_eq!(release_build(&release, "linux", "x64", "cpu", "Nightly".into()).err().as_deref(), Some("GitHub did not provide a SHA-256 digest for this asset; installation requires a verified archive"));
     }
     #[test]
     fn tar_libraries_are_materialized_without_creating_symlinks() {

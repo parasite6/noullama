@@ -119,14 +119,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), shutdown_app(&state))
             .await
             .unwrap();
-        assert!(
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, state.api_port))
-                .await
-                .is_ok()
-        );
+        assert!(crate::api::tests::nothing_listens_on(state.api_port).await);
         assert!(state.app.api_task.lock().await.is_none());
         assert!(state.app.exit_ready.load(Ordering::SeqCst));
-        assert!(crate::runtime::load_model(&state)
+        assert!(crate::runtime::load_model_in(&state, None)
             .await
             .unwrap_err()
             .contains("shutting down"));
@@ -158,7 +154,7 @@ mod tests {
         }
         drop(runtime_reservation);
         crate::api::start_with_listener(state.clone(), api_reservation).await;
-        let id = crate::runtime::load_model(&state).await.unwrap();
+        let id = crate::runtime::load_model_in(&state, None).await.unwrap();
         crate::runtime::wait_until_ready(&state, &id, 90).await;
         for port in [state.api_port, runtime_port] {
             assert!(

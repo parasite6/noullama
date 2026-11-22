@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as stateHelpers from './presets.ts';
 import { modelStatus } from './model-state.ts';
-import { visibleBanner } from './ui-state.ts';
+import { visibleBanner, waitText } from './ui-state.ts';
 import { runtimeStatus } from './runtime-state.ts';
 import { authorImageSources } from './author-image.ts';
 const { buildRequest, presets } = stateHelpers;
@@ -33,7 +33,7 @@ test('runtime selection keeps the running custom build distinct from a pending d
 test('persistent API banners can be dismissed and new errors are still shown', () => {
   assert.equal(visibleBanner(null, 'port occupied', null, true, false)?.error, true);
   assert.equal(visibleBanner(null, 'port occupied', 'port occupied', true, false), null);
-  assert.ok(visibleBanner(null, 'new failure', 'port occupied', true, false));
+  assert.equal(visibleBanner(null, 'new failure', 'port occupied', true, false)?.text, 'Local API unavailable: new failure. Change its port in Runtime and restart the app.');
   assert.equal(visibleBanner(null, null, null, false, true), null);
 });
 
@@ -84,9 +84,9 @@ test('structured JSON survives a round trip through text without changing its ty
 test('text is kept verbatim while JSON state is parsed explicitly', () => {
   assert.equal(buildRequest('{"a":{}}', '{"x":1}', 'text').state, '{"x":1}');
   assert.deepEqual(buildRequest('{"a":{}}', '{"x":1}', 'json').state, { x: 1 });
-  assert.throws(() => buildRequest('{}', '', 'text'));
-  assert.throws(() => buildRequest('[]', '', 'text'));
-  assert.throws(() => buildRequest('{"a":{}}', 'broken', 'json'));
+  assert.throws(() => buildRequest('{}', '', 'text'), /at least one named question/);
+  assert.throws(() => buildRequest('[]', '', 'text'), /at least one named question/);
+  assert.throws(() => buildRequest('{"a":{}}', 'broken', 'json'), SyntaxError);
 });
 
 test('pending actions isolate unrelated controls and reject duplicate submissions', async () => {
@@ -112,4 +112,8 @@ test('unchanged polling retains displayed state and stale replies cannot overwri
   const fresh = requests.begin();
   assert.equal(requests.isLatest(slow), false);
   assert.equal(requests.isLatest(fresh), true);
+});
+
+test('the any-available wait reads as seconds when whole, as the 503 message does', () => {
+  assert.deepEqual([1, 999, 1000, 1500, 60000, 120000, 600000].map(waitText), ['1 ms', '999 ms', '1 second', '1500 ms', '60 seconds', '120 seconds', '600 seconds']);
 });

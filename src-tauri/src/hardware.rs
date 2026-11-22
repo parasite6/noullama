@@ -33,13 +33,6 @@ pub fn cached() -> Option<&'static Hardware> {
     CACHE.get()
 }
 
-/// `extras` are files loaded alongside the model, such as a multimodal
-/// projector or an MTP head; they sit in the same memory as the weights, so
-/// they count toward the estimate. Empty paths are skipped.
-pub fn fit(path: &str, extras: &[&str], context_size: u32, gpu_layers: i32) -> Option<Fit> {
-    fit_beside(path, extras, context_size, gpu_layers, &[])
-}
-
 fn file_bytes<S: AsRef<str>>(path: &str, extras: &[S]) -> Option<u64> {
     let file = std::fs::metadata(path).ok()?;
     if !file.is_file() || file.len() == 0 {
@@ -66,8 +59,12 @@ fn required_bytes(model_bytes: u64, context_size: u32) -> u64 {
     model_bytes + (model_bytes as f64 * 0.12) as u64 + context_size as u64 * 24 * 1024
 }
 
-/// As `fit`, with the memory other loaded models are estimated to hold set
-/// aside: each `(bytes, on_gpu)` comes out of graphics or system memory.
+/// How a model file fits this machine, with the memory other loaded models
+/// are estimated to hold set aside: each `(bytes, on_gpu)` in `taken` comes
+/// out of graphics or system memory. `extras` are files loaded alongside the
+/// model, such as a multimodal projector or an MTP head; they sit in the
+/// same memory as the weights, so they count toward the estimate. Empty
+/// paths are skipped.
 pub fn fit_beside(path: &str, extras: &[&str], context_size: u32, gpu_layers: i32, taken: &[(u64, bool)]) -> Option<Fit> {
     let bytes = file_bytes(path, extras)?;
     let mut hardware = cached()?.clone();
@@ -491,7 +488,11 @@ mod tests {
 
     #[test]
     fn missing_or_empty_files_have_no_rating() {
-        assert!(fit("/definitely/not/a/model.gguf", &[], 8192, 99).is_none());
+        assert!(estimate_bytes::<&str>("/definitely/not/a/model.gguf", &[], 8192).is_none());
+        let empty = std::env::temp_dir().join(format!("noullama-empty-{}.gguf", uuid::Uuid::new_v4()));
+        std::fs::write(&empty, b"").unwrap();
+        assert!(estimate_bytes::<&str>(empty.to_str().unwrap(), &[], 8192).is_none());
+        std::fs::remove_file(empty).unwrap();
     }
 
     #[test]

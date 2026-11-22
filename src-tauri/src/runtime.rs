@@ -56,9 +56,13 @@ pub struct Settings {
     // Changed only by set_fall_through.
     pub fall_through_to_other_instances: bool,
     // What a request for `any-available` does when every ready instance is
-    // running a request: "reject" (503) or "wait" (up to ANY_AVAILABLE_WAIT).
-    // Changed only by set_any_available_when_busy.
+    // running a request: "reject" (503) or "wait" (up to
+    // `any_available_wait_ms`). Changed only by set_any_available_when_busy.
     pub any_available_when_busy: String,
+    // How long "wait" waits, in milliseconds (WAIT_MS_MIN..=WAIT_MS_MAX; a
+    // value outside it in settings.json counts as the nearest bound).
+    // Changed only by set_any_available_wait_ms.
+    pub any_available_wait_ms: u64,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -83,6 +87,7 @@ impl Default for Settings {
             hide_crowded_load_warning: false,
             fall_through_to_other_instances: false,
             any_available_when_busy: "reject".into(),
+            any_available_wait_ms: WAIT_MS_DEFAULT,
         }
     }
 }
@@ -214,8 +219,21 @@ pub struct LoadError {
 pub const ANY_AVAILABLE: &str = "any-available";
 
 /// How long a request for `any-available` waits for a free instance when
-/// `any_available_when_busy` is "wait".
-pub const ANY_AVAILABLE_WAIT: Duration = Duration::from_secs(120);
+/// `any_available_when_busy` is "wait", in milliseconds: the default and the
+/// range Settings accepts.
+pub const WAIT_MS_DEFAULT: u64 = 120_000;
+pub const WAIT_MS_MIN: u64 = 1;
+pub const WAIT_MS_MAX: u64 = 600_000;
+
+/// A wait as the Settings tab and the 503 message state it: whole seconds as
+/// seconds, anything else in milliseconds.
+pub fn wait_text(ms: u64) -> String {
+    match ms {
+        1000 => "1 second".into(),
+        _ if ms % 1000 == 0 => format!("{} seconds", ms / 1000),
+        _ => format!("{ms} ms"),
+    }
+}
 
 /// Whether a name is `any-available`, ignoring case like every other name collision.
 pub fn is_reserved(name: &str) -> bool {
@@ -727,10 +745,13 @@ impl AppState {
     /// A request for `any-available`: claims the ready instance that has been
     /// idle the longest. When every ready instance is busy, answers at once
     /// (setting "reject") or waits for the first to free up (setting "wait",
-    /// up to ANY_AVAILABLE_WAIT). The claim is held until the request ends.
+    /// up to `any_available_wait_ms`). The claim is held until the request ends.
     pub async fn claim_any(&self) -> Result<Claim, AnyError> {
-        let wait = self.settings.lock().await.any_available_when_busy == "wait";
-        let deadline = tokio::time::Instant::now() + ANY_AVAILABLE_WAIT;
+        let (wait, wait_ms) = {
+            let settings = self.settings.lock().await;
+            (settings.any_available_when_busy == "wait", settings.any_available_wait_ms.clamp(WAIT_MS_MIN, WAIT_MS_MAX))
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         loop {
             // Registered before looking, so a request that finishes in between still wakes it.
             let freed = self.instance_freed.notified();
@@ -748,7 +769,7 @@ impl AppState {
                 return Err(AnyError::Busy(format!("Every loaded instance is busy with another request, so \"{ANY_AVAILABLE}\" has none to send this one to. Try again, or set \"When every instance is busy\" to Wait in Settings.")));
             }
             if tokio::time::timeout_at(deadline, freed).await.is_err() {
-                return Err(AnyError::Busy(format!("Every loaded instance stayed busy for {} seconds, so \"{ANY_AVAILABLE}\" gave up on this request. Try again.", ANY_AVAILABLE_WAIT.as_secs())));
+                return Err(AnyError::Busy(format!("Every loaded instance stayed busy for {}, so \"{ANY_AVAILABLE}\" gave up on this request. Try again.", wait_text(wait_ms))));
             }
         }
     }
@@ -1168,29 +1189,53 @@ fn instance_extras(settings: &Settings) -> Vec<String> {
     extras
 }
 
+/// Saves the Local API load panel, the Runtime tab or the download
+/// directory. `settings` holds only the fields that form changes; the rest
+/// stay as they are saved now.
 #[tauri::command]
 pub async fn save_settings(
-    settings: Settings,
+    settings: serde_json::Map<String, Value>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     save_from_editor(state.inner(), settings).await
 }
 
-/// The settings form sends every field, but its copies of the alias list and
-/// the Settings tab switches can be stale; those have their own commands, so
-/// keep the server's values here. `keep_context` (the default for new loads)
-/// is a load panel field and is saved from the form.
-pub async fn save_from_editor(state: &AppState, mut settings: Settings) -> Result<(), String> {
-    {
-        let current = state.settings.lock().await;
-        settings.model_routes = current.model_routes.clone();
-        settings.sha256_check = current.sha256_check.clone();
-        settings.allow_force_fit = current.allow_force_fit;
-        settings.hide_crowded_load_warning = current.hide_crowded_load_warning;
-        settings.fall_through_to_other_instances = current.fall_through_to_other_instances;
-        settings.any_available_when_busy = current.any_available_when_busy.clone();
-    }
-    persist_settings(state, settings).await
+/// Fields the settings forms never save: the alias list and the Settings tab
+/// switches have their own commands, so a form's copy of them (which can be
+/// stale) is ignored. `keep_context` (the default for new loads) is a load
+/// panel field and is saved from the form.
+const SERVER_OWNED: [&str; 7] = [
+    "model_routes",
+    "sha256_check",
+    "allow_force_fit",
+    "hide_crowded_load_warning",
+    "fall_through_to_other_instances",
+    "any_available_when_busy",
+    "any_available_wait_ms",
+];
+
+/// Applies a form's changed fields over the saved settings.
+pub async fn save_from_editor(state: &AppState, changes: serde_json::Map<String, Value>) -> Result<(), String> {
+    update_settings(state, |settings| {
+        let Value::Object(mut merged) = serde_json::to_value(&*settings).map_err(|e| e.to_string())? else {
+            return Err("Settings are not an object.".into());
+        };
+        let known: Vec<String> = merged.keys().cloned().collect();
+        for (key, value) in changes {
+            if SERVER_OWNED.contains(&key.as_str()) {
+                continue;
+            }
+            if !known.contains(&key) {
+                return Err(format!("Unknown setting \"{key}\"."));
+            }
+            merged.insert(key, value);
+        }
+        let routes = std::mem::take(&mut settings.model_routes);
+        *settings = serde_json::from_value(Value::Object(merged)).map_err(|e| format!("Invalid settings: {e}"))?;
+        settings.model_routes = routes;
+        Ok(())
+    })
+    .await
 }
 
 /// Trims, checks and de-duplicates one model's aliases for the local API.
@@ -1226,15 +1271,21 @@ pub async fn set_aliases(state: &AppState, path: String, aliases: Vec<String>) -
     crate::library::set_aliases(state, &path, aliases).await
 }
 
-pub async fn persist_settings(state: &AppState, settings: Settings) -> Result<(), String> {
-    persist_memory_settings(state, settings, None).await
-}
-
-async fn persist_memory_settings(state: &AppState, mut settings: Settings, update: Option<(&str, bool)>) -> Result<(), String> {
-    // Loaded models keep the settings they started with, so these can change
-    // at any time; they apply to the next load.
+/// The one way settings change. It holds the lifecycle lock from reading the
+/// saved settings, through `change` and the write of settings.json, to
+/// replacing them in memory, so two changes close together both apply
+/// instead of one writing back the other's old values. Loaded models keep
+/// the settings they started with, so settings can change at any time; they
+/// apply to the next load.
+///
+/// Lock order: the lifecycle lock first, then the short `settings` and
+/// `downloads` locks. Never call this while holding the lifecycle lock: tokio's
+/// Mutex is not reentrant, so that would hang.
+pub async fn update_settings(state: &AppState, change: impl FnOnce(&mut Settings) -> Result<(), String>) -> Result<(), String> {
     let _guard = state.lifecycle.lock().await;
-    if update.is_some() { settings = state.settings.lock().await.clone(); }
+    let current = state.settings.lock().await.clone();
+    let mut settings = current.clone();
+    change(&mut settings)?;
     if settings.api_port == 0
         || settings.runtime_port == 0
         || settings.api_port == settings.runtime_port
@@ -1258,8 +1309,8 @@ async fn persist_memory_settings(state: &AppState, mut settings: Settings, updat
     {
         return Err("Choose an absolute path for the download directory.".into());
     }
-    if state.downloads.lock().await.iter().any(|d| d.active)
-        && state.settings.lock().await.download_dir != settings.download_dir
+    if current.download_dir != settings.download_dir
+        && state.downloads.lock().await.iter().any(|d| d.active)
     {
         return Err(
             "Wait for downloads to finish before changing their directory.".into(),
@@ -1269,17 +1320,6 @@ async fn persist_memory_settings(state: &AppState, mut settings: Settings, updat
         tokio::fs::create_dir_all(settings.download_dir.trim())
             .await
             .map_err(|e| format!("Cannot create download directory: {e}"))?;
-    }
-    {
-        let current = state.settings.lock().await;
-        settings.allow_force_fit = current.allow_force_fit;
-        settings.hide_crowded_load_warning = current.hide_crowded_load_warning;
-    }
-    match update {
-        Some(("allow_force_fit", value)) => settings.allow_force_fit = value,
-        Some(("hide_crowded_load_warning", value)) => settings.hide_crowded_load_warning = value,
-        Some(_) => return Err("Unknown memory preference".into()),
-        None => {},
     }
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     let temp = state.data_dir.join("settings.json.tmp");
@@ -1335,11 +1375,6 @@ pub async fn start_runtime(slot: Option<u32>, state: tauri::State<'_, AppState>)
     load_model_in(state.inner(), slot).await
 }
 
-#[cfg(test)]
-pub async fn load_model(state: &AppState) -> Result<String, String> {
-    load_model_in(state, None).await
-}
-
 /// `slot` is the slot of the instance a reload replaced: the new instance
 /// keeps it when it is free, so its suffixed names stay the same. Otherwise
 /// (and for fresh loads) it takes the lowest free slot.
@@ -1390,29 +1425,7 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
     let port = free_runtime_port(state, &settings, &loaded)?;
     let (slot, label) = slot_and_label(&loaded, &settings.model_path, slot);
     let session = RuntimeSession::new(&state.data_dir, port)?;
-    let instance = Arc::new(Instance {
-        id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
-        label,
-        slot,
-        suffix: std::sync::Mutex::new(default_suffix(slot)),
-        model: std::sync::Mutex::new(LoadedModel {
-            path: settings.model_path.clone(),
-            device: String::new(),
-            runtime_path: settings.runtime_path.clone(),
-            projector: !settings.mmproj_path.is_empty(),
-            mtp: settings.mtp,
-            layout: None,
-        }),
-        keep_context: AtomicBool::new(settings.keep_context),
-        settings,
-        session,
-        child: Default::default(),
-        ready: AtomicBool::new(false),
-        context: Default::default(),
-        aliases: Default::default(),
-        in_flight: Default::default(),
-        last_started: Default::default(),
-    });
+    let instance = Arc::new(new_instance(settings, slot, label, session));
     state.load_errors.lock().await.retain(|e| !(e.path == instance.path() && e.slot == instance.slot));
     state.instances.lock().await.push(instance.clone());
     state.instances_added.notify_one();
@@ -1442,6 +1455,34 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
         }
     });
     Ok(id)
+}
+
+/// A new, still loading instance in `slot`: the slot's default suffix, no
+/// instance aliases, and Keep context from the `keep_context` setting.
+fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<RuntimeSession>) -> Instance {
+    Instance {
+        id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
+        label,
+        slot,
+        suffix: std::sync::Mutex::new(default_suffix(slot)),
+        model: std::sync::Mutex::new(LoadedModel {
+            path: settings.model_path.clone(),
+            device: String::new(),
+            runtime_path: settings.runtime_path.clone(),
+            projector: !settings.mmproj_path.is_empty(),
+            mtp: settings.mtp,
+            layout: None,
+        }),
+        keep_context: AtomicBool::new(settings.keep_context),
+        settings,
+        session,
+        child: Default::default(),
+        ready: AtomicBool::new(false),
+        context: Default::default(),
+        aliases: Default::default(),
+        in_flight: Default::default(),
+        last_started: Default::default(),
+    }
 }
 
 /// The slot and log label a new instance of `path` gets beside `loaded`:
@@ -1923,17 +1964,30 @@ pub async fn set_when_busy(state: &AppState, mode: &str) -> Result<(), String> {
     if !["reject", "wait"].contains(&mode) {
         return Err("Unknown choice for when every instance is busy.".into());
     }
-    let mut settings = state.settings.lock().await.clone();
-    settings.any_available_when_busy = mode.to_owned();
-    persist_settings(state, settings).await
+    update_settings(state, |s| { s.any_available_when_busy = mode.to_owned(); Ok(()) }).await
+}
+
+/// The Settings tab's "Wait up to (ms)" for `any-available`.
+#[tauri::command]
+pub async fn set_any_available_wait_ms(ms: u64, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    set_wait_ms(state.inner(), ms).await
+}
+
+pub async fn set_wait_ms(state: &AppState, ms: u64) -> Result<(), String> {
+    if !(WAIT_MS_MIN..=WAIT_MS_MAX).contains(&ms) {
+        return Err(format!("Use a wait of {WAIT_MS_MIN}–{WAIT_MS_MAX} ms."));
+    }
+    update_settings(state, |s| { s.any_available_wait_ms = ms; Ok(()) }).await
 }
 
 /// The Settings tab's "Fall through to another instance".
 #[tauri::command]
 pub async fn set_fall_through(on: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut settings = state.settings.lock().await.clone();
-    settings.fall_through_to_other_instances = on;
-    persist_settings(state.inner(), settings).await
+    change_fall_through(state.inner(), on).await
+}
+
+pub async fn change_fall_through(state: &AppState, on: bool) -> Result<(), String> {
+    update_settings(state, |s| { s.fall_through_to_other_instances = on; Ok(()) }).await
 }
 
 /// Graphics memory in use, overall and per loaded model.
@@ -1978,11 +2032,22 @@ pub async fn decide(payload: Value, model: Option<String>, state: tauri::State<'
     state.infer_on(&instance, payload).await
 }
 
-/// Registers a loaded model with no runtime behind it, for routing tests.
+/// Settings' "Allow force fit" and the crowded-load dialog's "Don't show again".
 #[tauri::command]
 pub async fn set_memory_preference(key: String, value: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let settings = state.settings.lock().await.clone();
-    persist_memory_settings(state.inner(), settings, Some((&key, value))).await
+    set_memory_pref(state.inner(), &key, value).await
+}
+
+pub async fn set_memory_pref(state: &AppState, key: &str, value: bool) -> Result<(), String> {
+    update_settings(state, |s| {
+        match key {
+            "allow_force_fit" => s.allow_force_fit = value,
+            "hide_crowded_load_warning" => s.hide_crowded_load_warning = value,
+            _ => return Err("Unknown memory preference".into()),
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// `freed_vram` and `freed_ram`: memory a loaded instance being replaced
@@ -2109,27 +2174,21 @@ pub async fn insert_test_instance(state: &AppState, path: &str, ready: bool) -> 
 }
 
 /// Like `insert_test_instance`, with requests going to a fake runtime on `port`.
+/// It skips the file and runtime checks of `load_model_in` but builds the
+/// instance the same way (`slot_and_label`, `new_instance`), then marks it as a
+/// built-in decision model on the CPU, as a finished load would.
 #[cfg(test)]
 pub async fn insert_test_instance_on(state: &AppState, path: &str, ready: bool, port: u16) -> Arc<Instance> {
     let settings = Settings { model_path: path.into(), ..state.settings.lock().await.clone() };
     let loaded = state.instances.lock().await.clone();
     let (slot, label) = slot_and_label(&loaded, path, None);
-    let instance = Arc::new(Instance {
-        id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
-        label,
-        slot,
-        suffix: std::sync::Mutex::new(default_suffix(slot)),
-        model: std::sync::Mutex::new(LoadedModel { path: path.into(), device: "CPU".into(), runtime_path: String::new(), projector: false, mtp: false, layout: Some("native".into()) }),
-        session: RuntimeSession::new(&state.data_dir, port).unwrap(),
-        keep_context: AtomicBool::new(settings.keep_context),
-        settings,
-        child: Default::default(),
-        ready: AtomicBool::new(ready),
-        context: Default::default(),
-        aliases: Default::default(),
-        in_flight: Default::default(),
-        last_started: Default::default(),
-    });
+    let instance = Arc::new(new_instance(settings, slot, label, RuntimeSession::new(&state.data_dir, port).unwrap()));
+    {
+        let mut model = instance.model.lock().unwrap();
+        model.device = "CPU".into();
+        model.layout = Some("native".into());
+    }
+    instance.ready.store(ready, Ordering::SeqCst);
     state.instances.lock().await.push(instance.clone());
     instance
 }
@@ -2178,27 +2237,12 @@ mod tests {
         assert_eq!(pick_slot(&[1, 3], Some(3)), 2);
         assert_eq!(pick_slot(&[1], Some(0)), 2);
         assert_eq!(pick_slot(&[1], None), 2);
-        assert_eq!(default_suffix(1), "");
-        assert_eq!(default_suffix(2), "-i-2");
-        assert_eq!(default_suffix(12), "-i-12");
-        // Labels follow the slot and stay unique across files sharing a stem.
+        // Labels follow the slot and stay unique across different files
+        // sharing a stem (the load test covers one file's instances).
         assert_eq!(instance_label("qwen", 1, &[]), "qwen");
         assert_eq!(instance_label("qwen", 2, &["qwen".into()]), "qwen#2");
         assert_eq!(instance_label("qwen", 1, &["qwen".into()]), "qwen#2");
         assert_eq!(instance_label("qwen", 2, &["qwen#2".into()]), "qwen#3");
-    }
-
-    #[test]
-    fn identifiers_add_the_suffix_to_every_name_and_alias() {
-        let aliases = vec!["triage".to_owned(), "sorter".to_owned()];
-        let ids: Vec<(String, &str, String)> = identifiers("qwen", &aliases, "-i-2");
-        assert_eq!(ids, [
-            ("qwen-i-2".to_owned(), "name", "qwen".to_owned()),
-            ("triage-i-2".to_owned(), "alias", "triage".to_owned()),
-            ("sorter-i-2".to_owned(), "alias", "sorter".to_owned()),
-        ]);
-        let plain: Vec<String> = identifiers("qwen", &aliases, "").into_iter().map(|(id, _, _)| id).collect();
-        assert_eq!(plain, ["qwen", "triage", "sorter"]);
     }
 
     #[test]
@@ -2217,7 +2261,7 @@ mod tests {
         // The slot's own default is always accepted, even when it would not pass.
         let long = "q".repeat(62);
         assert_eq!(check_suffix(2, "-i-2", &long, &[], &[], &[]).unwrap(), "-i-2");
-        assert!(check_suffix(2, "-xyz", &long, &[], &[], &[]).is_err());
+        assert!(check_suffix(2, "-xyz", &long, &[], &[], &[]).unwrap_err().contains("up to 64 characters"));
     }
 
     fn table(instances: &[(&str, &str, u32, &str, bool)], entries: &[&str], fall_through: bool) -> Vec<Route> {
@@ -2414,7 +2458,7 @@ mod tests {
             settings.runtime_port = port;
             settings.gpu_layers = 0;
         }
-        let old = load_model(&state).await.unwrap();
+        let old = load_model_in(&state, None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         let snapshot = tokio::time::timeout(Duration::from_millis(500), state_snapshot(&state))
             .await
@@ -2422,11 +2466,10 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot["running"], true);
         let old = state.instance(&old).await.unwrap();
-        let mut settings = state.settings.lock().await.clone();
-        settings.download_dir = base.join("downloads").to_string_lossy().into_owned();
+        let downloads = base.join("downloads").to_string_lossy().into_owned();
         tokio::time::timeout(
             Duration::from_millis(500),
-            persist_settings(&state, settings),
+            update_settings(&state, |s| { s.download_dir = downloads; Ok(()) }),
         )
         .await
         .unwrap()
@@ -2436,7 +2479,7 @@ mod tests {
             .unwrap();
         assert!(!is_registered(&state, &old).await);
         drop(old);
-        let replacement = load_model(&state).await.unwrap();
+        let replacement = load_model_in(&state, None).await.unwrap();
         let replacement = state.instance(&replacement).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(is_registered(&state, &replacement).await);
@@ -2463,12 +2506,10 @@ mod tests {
         );
         let model = base.join("model.gguf");
         std::fs::write(&model, "test").unwrap();
-        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Outside the ephemeral range, where parallel tests' outgoing
+        // connections could take the port; random so other test processes
+        // start elsewhere (as in `slow_loading_state`).
+        let port = 26000 + (uuid::Uuid::new_v4().as_u128() % 6000) as u16;
         {
             let mut settings = state.settings.lock().await;
             settings.runtime_path = runtime.to_string_lossy().into_owned();
@@ -2476,7 +2517,7 @@ mod tests {
             settings.runtime_port = port;
             settings.gpu_layers = 0;
         }
-        let id = load_model(&state).await.unwrap();
+        let id = load_model_in(&state, None).await.unwrap();
         let instance = state.instance(&id).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while instance.child.lock().await.is_none() {
@@ -2485,9 +2526,20 @@ mod tests {
         })
         .await
         .unwrap();
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .await
-            .unwrap();
+        // The load may have skipped a taken port. Its reservation is released
+        // when the runtime starts, but a child a parallel test forks can hold a
+        // copy of it until that child execs, so retry for a moment.
+        let port = instance.session.port;
+        let listener = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                    Ok(listener) => break listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("the runtime port is free again");
         let app = axum::Router::new().route("/v1/models", axum::routing::get(|| async {
             axum::Json(json!({"data":[{"id":"noullama", "architecture":{"output_modalities":["decisions"]}}]}))
         }));
@@ -2513,6 +2565,114 @@ mod tests {
         state.shutdown().await;
         std::fs::remove_dir_all(base).unwrap();
     }
+    /// An app whose loads go through `load_model_in` with a runtime that never
+    /// becomes ready, for `qwen.gguf` in its data directory.
+    #[cfg(unix)]
+    async fn slow_loading_state(name: &str) -> (AppState, PathBuf) {
+        let base = std::env::temp_dir().join(format!("noullama-{name}-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let runtime = fake_runtime(&base, "slow-runtime", "#!/bin/sh\nexec sleep 60\n");
+        let model = base.join("qwen.gguf");
+        std::fs::write(&model, "test").unwrap();
+        // Each load reserves its private port again after `free_runtime_port`
+        // checked it. Outside the ephemeral range (32768 and up), parallel
+        // tests' outgoing connections cannot take it in between; 26000–31999
+        // is kept apart from the API port tests' 20000–25999.
+        let port = 26000 + (uuid::Uuid::new_v4().as_u128() % 6000) as u16;
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = runtime.to_string_lossy().into_owned();
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.runtime_port = port;
+            settings.gpu_layers = 0;
+        }
+        (state, base)
+    }
+
+    /// The Load button (`slot` none) and Reload (unload, then `slot` of the
+    /// replaced instance) through the real load path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loads_take_the_lowest_free_slot_and_a_reload_keeps_its_own() {
+        let (state, base) = slow_loading_state("slots").await;
+        let load = |slot: Option<u32>| {
+            let state = state.clone();
+            async move {
+                let id = load_model_in(&state, slot).await.unwrap();
+                state.instance(&id).await.unwrap()
+            }
+        };
+        // A load that fails is unloaded at once and changes the free slots; say why.
+        let load = |slot: Option<u32>| {
+            let load = load(slot);
+            let state = state.clone();
+            async move {
+                let instance = load.await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let errors: Vec<String> = state.load_errors.lock().await.iter().map(|e| e.message.clone()).collect();
+                assert!(is_registered(&state, &instance).await, "the load failed: {errors:?}");
+                instance
+            }
+        };
+        let reaches = |name: &'static str| {
+            let state = state.clone();
+            async move { state.routes().await.into_iter().find(|r| r.name == name).and_then(|r| r.instance) }
+        };
+        let first = load(None).await;
+        let second = load(None).await;
+        let third = load(None).await;
+        assert_eq!([first.slot, second.slot, third.slot], [1, 2, 3]);
+        assert_eq!([first.suffix(), second.suffix(), third.suffix()], ["", "-i-2", "-i-3"]);
+        assert_eq!([first.label.as_str(), second.label.as_str(), third.label.as_str()], ["qwen", "qwen#2", "qwen#3"]);
+        assert_eq!(reaches("qwen-i-3").await, Some(third.id.clone()));
+        // Instance 2 is ejected, then instance 3 reloaded: it stays instance 3.
+        unload(&state, &second.id).await.unwrap();
+        unload(&state, &third.id).await.unwrap();
+        let reloaded = load(Some(3)).await;
+        assert_eq!((reloaded.slot, reloaded.suffix().as_str()), (3, "-i-3"));
+        assert_eq!(reaches("qwen-i-3").await, Some(reloaded.id.clone()));
+        assert!(matches!(state.route(Some("qwen-i-3")).await, Err(RouteError::Unavailable(m)) if m == "qwen instance 3 is still loading."));
+        // A fresh load fills the gap.
+        let fresh = load(None).await;
+        assert_eq!((fresh.slot, fresh.suffix().as_str()), (2, "-i-2"));
+        // A reload whose slot was taken meanwhile gets the lowest free one.
+        let moved = load(Some(1)).await;
+        assert_eq!((moved.slot, moved.suffix().as_str(), moved.label.as_str()), (4, "-i-4", "qwen#4"));
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// A load starts its Keep context switch from the setting at that moment;
+    /// changing the setting later leaves loaded instances alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_load_starts_keep_context_from_the_setting_and_keeps_its_own_switch() {
+        let (state, base) = slow_loading_state("keep").await;
+        let off = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
+        state.settings.lock().await.keep_context = true;
+        let on = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
+        assert!(!off.keeps_context(), "the setting changed after this load");
+        assert!(on.keeps_context());
+        state.settings.lock().await.keep_context = false;
+        let again = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
+        assert!(!again.keeps_context());
+        assert!(on.keeps_context());
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// Removes a test's data directory. Stopped loads delete their runtime key
+    /// files from their own tasks, so the directory can still be emptying.
+    async fn remove_once_released(base: &Path) {
+        for _ in 0..100 {
+            if std::fs::remove_dir_all(base).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// Loads a real Winnow GGUF through the normal load path and answers a
     /// request in the Winnow layout. Run with
     /// `NOULLAMA_RUNTIME=…/llama-server NOULLAMA_WINNOW=…/Winnow-E4B-Q8_0.gguf cargo test -- --ignored winnow`.
@@ -2533,7 +2693,7 @@ mod tests {
             settings.mtp = std::env::var("NOULLAMA_MTP_HEAD").is_ok();
             settings.mtp_path = std::env::var("NOULLAMA_MTP_HEAD").unwrap_or_default();
         }
-        let id = load_model(&state).await.unwrap();
+        let id = load_model_in(&state, None).await.unwrap();
         let instance = wait_until_ready(&state, &id, 300).await;
         assert_eq!(instance.model().layout.as_deref(), Some("winnow-v1"));
         let request = json!({"state": {"ticket": "My card was charged twice for order #4411 and I need the duplicate refunded today."},
@@ -2625,16 +2785,100 @@ mod tests {
         );
     }
 
+    /// An instance alias change holds the lifecycle lock from its collision
+    /// check to its write; a models.yml save that adds the same name while it
+    /// runs must see it and refuse, not slip past with an older list.
+    #[tokio::test]
+    async fn models_yml_saves_wait_for_an_instance_alias_change_in_progress() {
+        let base = std::env::temp_dir().join(format!("noullama-alias-race-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let file = "/models/acme/qwen.gguf";
+        let instance = insert_test_instance(&state, file, true).await;
+        set_aliases(&state, file.into(), vec![]).await.unwrap();
+        let wait = || tokio::time::sleep(Duration::from_millis(50));
+        // The Library tab's save.
+        let revision = state.library.lock().await.revision;
+        let mut entries = state.library.lock().await.entries.clone();
+        entries[0].aliases = vec!["billing".into()];
+        let guard = state.lifecycle.lock().await;
+        let save = tokio::spawn({
+            let state = state.clone();
+            async move { crate::library::save(&state, entries, revision).await }
+        });
+        wait().await;
+        instance.set_aliases(vec!["billing".into()]);
+        drop(guard);
+        assert!(save.await.unwrap().unwrap_err().starts_with("\"billing\" is an instance alias of instance 1 of qwen"));
+        // The API names editor's save.
+        let guard = state.lifecycle.lock().await;
+        let save = tokio::spawn({
+            let state = state.clone();
+            async move { set_aliases(&state, file.into(), vec!["refunds".into()]).await }
+        });
+        wait().await;
+        instance.set_aliases(vec!["billing".into(), "refunds".into()]);
+        drop(guard);
+        assert!(save.await.unwrap().unwrap_err().starts_with("\"refunds\" is an instance alias of instance 1 of qwen"));
+        assert!(state.library.lock().await.entries[0].aliases.is_empty(), "neither save was written");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A settings form's changed fields, as `save_settings` receives them.
+    fn form(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().expect("an object").clone()
+    }
+
+    /// Every command that changes settings, at once and each on its own
+    /// field: none may write back another's old value.
+    #[tokio::test]
+    async fn concurrent_settings_changes_all_survive() {
+        let base = std::env::temp_dir().join(format!("noullama-concurrent-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let downloads = base.join("models").to_string_lossy().into_owned();
+        let results = tokio::join!(
+            set_when_busy(&state, "wait"),
+            set_wait_ms(&state, 5_000),
+            change_fall_through(&state, true),
+            set_memory_pref(&state, "allow_force_fit", true),
+            set_memory_pref(&state, "hide_crowded_load_warning", true),
+            crate::library::set_check(&state, "every_load".into()),
+            // The load panel, the Runtime tab and the download directory.
+            save_from_editor(&state, form(json!({"context_size": 4096, "keep_context": true}))),
+            save_from_editor(&state, form(json!({"hf_path": "/opt/hf", "runtime_port": 12346}))),
+            save_from_editor(&state, form(json!({"download_dir": downloads}))),
+            crate::api::save_api_port(&state, 12345),
+        );
+        let (a, b, c, d, e, f, g, h, i, j) = results;
+        for result in [a, b, c, d, e, f, g, h, i, j] {
+            result.unwrap();
+        }
+        let check = |s: &Settings| {
+            assert_eq!(s.any_available_when_busy, "wait");
+            assert_eq!(s.any_available_wait_ms, 5_000);
+            assert!(s.fall_through_to_other_instances && s.allow_force_fit && s.hide_crowded_load_warning && s.keep_context);
+            assert_eq!(s.sha256_check, "every_load");
+            assert_eq!((s.context_size, s.hf_path.as_str(), s.runtime_port, s.api_port), (4096, "/opt/hf", 12346, 12345));
+            assert_eq!(s.download_dir, downloads);
+        };
+        check(&state.settings.lock().await.clone());
+        check(&AppState::new(base.clone()).unwrap().settings.lock().await.clone());
+        assert_eq!(save_from_editor(&state, form(json!({"nope": 1}))).await.unwrap_err(), "Unknown setting \"nope\".");
+        assert!(save_from_editor(&state, form(json!({"context_size": "big"}))).await.unwrap_err().starts_with("Invalid settings"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[tokio::test]
     async fn memory_preferences_are_independent_persisted_and_survive_stale_forms() {
         let old: Settings = serde_json::from_str("{}").unwrap();
         assert!(!old.allow_force_fit && !old.hide_crowded_load_warning);
         let base = std::env::temp_dir().join(format!("noullama-memory-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(base.clone()).unwrap();
-        persist_memory_settings(&state, old.clone(), Some(("hide_crowded_load_warning", true))).await.unwrap();
+        set_memory_pref(&state, "hide_crowded_load_warning", true).await.unwrap();
         assert!(!state.settings.lock().await.allow_force_fit);
-        persist_memory_settings(&state, old.clone(), Some(("allow_force_fit", true))).await.unwrap();
-        save_from_editor(&state, old).await.unwrap();
+        set_memory_pref(&state, "allow_force_fit", true).await.unwrap();
+        assert_eq!(set_memory_pref(&state, "other", true).await.unwrap_err(), "Unknown memory preference");
+        // A form that sends every field, with older copies of these two.
+        save_from_editor(&state, form(serde_json::to_value(old).unwrap())).await.unwrap();
         let loaded = AppState::new(base.clone()).unwrap();
         let settings = loaded.settings.lock().await;
         assert!(settings.allow_force_fit && settings.hide_crowded_load_warning);
@@ -2656,7 +2900,7 @@ mod tests {
         saved.runtime_port = 12112;
         saved.hf_path = "/usr/local/bin/hf".into();
         saved.library_path = "/opt/cuda/lib64".into();
-        persist_settings(&state, saved.clone()).await.unwrap();
+        update_settings(&state, |s| { *s = saved.clone(); Ok(()) }).await.unwrap();
         drop(state);
 
         // A second AppState reads the same directory the way a fresh launch does.
@@ -2681,14 +2925,44 @@ mod tests {
         let state = AppState::new(base.clone()).unwrap();
         let mut settings = Settings::default();
         settings.download_dir = "relative/models".into();
-        assert!(persist_settings(&state, settings.clone()).await.is_err());
+        assert_eq!(save_from_editor(&state, form(json!({"download_dir": settings.download_dir}))).await.unwrap_err(), "Choose an absolute path for the download directory.");
+        assert!(!base.join("settings.json").exists(), "nothing is saved");
         settings.download_dir = base.join("custom models").to_string_lossy().into_owned();
-        persist_settings(&state, settings.clone()).await.unwrap();
+        save_from_editor(&state, form(json!({"download_dir": settings.download_dir}))).await.unwrap();
         assert!(Path::new(&settings.download_dir).is_dir());
         let stored: Settings =
             serde_json::from_slice(&std::fs::read(base.join("settings.json")).unwrap()).unwrap();
         assert_eq!(stored.download_dir, settings.download_dir);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn routing_settings_are_checked_saved_and_kept_from_stale_forms() {
+        let base = std::env::temp_dir().join(format!("noullama-routing-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let stale = state.settings.lock().await.clone();
+        assert_eq!(stale.any_available_wait_ms, 120_000);
+        for out_of_range in [0, 600_001] {
+            assert_eq!(set_wait_ms(&state, out_of_range).await.unwrap_err(), "Use a wait of 1–600000 ms.");
+        }
+        assert_eq!(state.settings.lock().await.any_available_wait_ms, 120_000);
+        set_wait_ms(&state, 600_000).await.unwrap();
+        set_when_busy(&state, "wait").await.unwrap();
+        change_fall_through(&state, true).await.unwrap();
+        // The load panel saves its form, whose copies of these are older.
+        save_from_editor(&state, form(serde_json::to_value(Settings { context_size: 4096, ..stale }).unwrap())).await.unwrap();
+        let reread = |base: PathBuf| async move { AppState::new(base).unwrap().settings.lock().await.clone() };
+        let saved = reread(base.clone()).await;
+        assert_eq!((saved.context_size, saved.any_available_wait_ms, saved.any_available_when_busy.as_str(), saved.fall_through_to_other_instances), (4096, 600_000, "wait", true));
+        set_wait_ms(&state, 1).await.unwrap();
+        assert_eq!(reread(base.clone()).await.any_available_wait_ms, 1);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn waits_read_as_seconds_when_whole() {
+        let texts: Vec<String> = [1, 999, 1000, 1500, 60_000, 120_000, 600_000].map(wait_text).into();
+        assert_eq!(texts, ["1 ms", "999 ms", "1 second", "1500 ms", "60 seconds", "120 seconds", "600 seconds"]);
     }
 
     #[test]
@@ -2703,17 +2977,6 @@ mod tests {
         assert_eq!(check_suffix(2, "-available", "qwen", &["any".into()], &[], &[]).unwrap_err(), format!("{reserved} Choose another suffix."));
         assert_eq!(check_suffix(2, "-available-2", "any", &[], &[], &[]).unwrap(), "-available-2");
         assert!(is_reserved("ANY-available") && !is_reserved("any-available-2"));
-    }
-
-    #[test]
-    fn instance_aliases_must_not_collide_with_models_yml_or_loaded_identifiers() {
-        let library = vec![("qwen".to_owned(), "qwen".to_owned()), ("triage".to_owned(), "qwen".to_owned())];
-        let taken = vec![("qwen-i-2".to_owned(), "instance 2 of qwen".to_owned()), ("sorter".to_owned(), "instance 1 of other".to_owned())];
-        let check = |aliases: &[&str]| check_instance_aliases(aliases.iter().map(|a| a.to_string()).collect(), &taken, &library);
-        assert_eq!(check(&["billing", "refunds"]).unwrap(), ["billing", "refunds"]);
-        assert_eq!(check(&["TRIAGE"]).unwrap_err(), "\"TRIAGE\" is already a name or alias of qwen in models.yml. Choose another alias.");
-        assert_eq!(check(&["Qwen-I-2"]).unwrap_err(), "\"Qwen-I-2\" already reaches instance 2 of qwen. Choose another alias.");
-        assert_eq!(check(&["billing", "sorter"]).unwrap_err(), "\"sorter\" already reaches instance 1 of other. Choose another alias.");
     }
 
     #[test]

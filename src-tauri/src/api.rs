@@ -73,9 +73,7 @@ pub async fn start(state: AppState) {
         .expect("Bound TCP listener has an address")
         .port();
     if port != state.api_port {
-        let mut settings = state.settings.lock().await.clone();
-        settings.api_port = port;
-        let saved = crate::runtime::persist_settings(&state, settings).await;
+        let saved = save_api_port(&state, port).await;
         let notice = match saved {
             Ok(())=>format!("Local API moved to http://127.0.0.1:{port}/v1 because port {} is in use. This endpoint is saved for future launches.",state.api_port),
             Err(error)=>format!("Local API is available at http://127.0.0.1:{port}/v1, but its new port could not be saved: {error}"),
@@ -85,6 +83,15 @@ pub async fn start(state: AppState) {
     }
     *state.api_error.lock().await = None;
     start_with_listener(state, listener).await;
+}
+
+/// Saves the port the local API moved to, so later launches use it.
+pub async fn save_api_port(state: &AppState, port: u16) -> Result<(), String> {
+    crate::runtime::update_settings(state, |s| {
+        s.api_port = port;
+        Ok(())
+    })
+    .await
 }
 
 async fn bind_available(
@@ -254,22 +261,44 @@ async fn chat(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{
         body::{to_bytes, Body},
         http::Request,
     };
     use tower::ServiceExt;
+
+    /// Whether a released port stops accepting connections within 2 seconds.
+    /// A child process that a parallel test forks holds a copy of every open
+    /// socket until it execs, so a closed listener can linger for a moment.
+    /// Connecting, not binding, checks it: a parallel test's outgoing
+    /// connection may take the freed port as its local port, which would make
+    /// a bind fail although nothing listens.
+    pub(crate) async fn nothing_listens_on(port: u16) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return true,
+                _ if tokio::time::Instant::now() >= deadline => return false,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn replacement_port_is_saved_and_relaunch_does_not_repeat_the_conflict() {
         let path =
             std::env::temp_dir().join(format!("noullama-remember-port-{}", uuid::Uuid::new_v4()));
         let mut state = AppState::new(path.clone()).unwrap();
         // Keep this two-launch fixture outside the kernel's ephemeral client
-        // port range, so parallel HTTP tests cannot claim the freed endpoint.
+        // port range (32768 and up on Linux), so parallel HTTP tests cannot
+        // claim the freed endpoint. The start is random so that test runs in
+        // other processes do not scan the same ports, and below 26000, where
+        // the load tests take their private runtime ports.
+        let first_port = 20000 + (uuid::Uuid::new_v4().as_u128() % 5450) as u16;
         let mut reservation = None;
-        for port in 22000..22500 {
+        for port in first_port..first_port + 500 {
             if let Ok(listener) =
                 tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await
             {
@@ -289,6 +318,7 @@ mod tests {
         let actual = state.listening_port();
         assert_ne!(actual, preferred);
         crate::lifecycle::shutdown_app(&state).await;
+        assert!(nothing_listens_on(actual).await);
         let relaunched = AppState::new(path.clone()).unwrap();
         assert_eq!(
             relaunched.api_port, actual,
@@ -334,11 +364,7 @@ mod tests {
             .unwrap()
             .contains(&port.to_string()));
         crate::lifecycle::shutdown_app(&state).await;
-        assert!(
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-                .await
-                .is_ok()
-        );
+        assert!(nothing_listens_on(port).await);
         assert!(
             tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, state.api_port))
                 .await
@@ -374,11 +400,7 @@ mod tests {
         );
         server.abort();
         let _ = server.await;
-        assert!(
-            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, state.api_port))
-                .await
-                .is_ok()
-        );
+        assert!(nothing_listens_on(state.api_port).await);
         std::fs::remove_dir_all(path).unwrap();
     }
     #[tokio::test]
@@ -429,18 +451,16 @@ mod tests {
         let result = chat_payload(&body).unwrap();
         assert_eq!(result["questions"], request()["questions"]);
         assert_eq!(result["state"], "charged twice");
-        assert!(chat_payload(&json!({"stream":true})).is_err());
-        assert!(chat_payload(&json!({"messages":[{"role":"system","content":"foo"},{"role":"user","content":request().to_string()}]})).is_err());
+        assert_eq!(chat_payload(&json!({"stream":true})).unwrap_err(), "Decision models return one result; streaming is not supported. Set stream to false.");
+        // A system prompt is refused, not merged into the request.
+        assert_eq!(chat_payload(&json!({"messages":[{"role":"system","content":"foo"},{"role":"user","content":request().to_string()}]})).unwrap_err(), "Send one user message containing JSON with state and questions. Include all instructions in the questions object.");
     }
     #[test]
     fn validates_native_types_and_rejects_unsupported_features() {
-        assert!(validate_request(&request()).is_ok());
-        assert!(validate_request(&json!({"state":"", "questions":{}})).is_err());
-        assert!(validate_request(
-            &json!({"state":null, "questions":{"x":{"type":"text","instructions":"Extract"}}})
-        )
-        .is_err());
-        assert!(validate_request(&json!({"state":"", "questions":{"x":{"type":"choice","instructions":"Choose", "multiple":true,"criteria":{"a":null,"b":null}}}})).is_err());
+        assert_eq!(validate_request(&request()), Ok(()));
+        assert_eq!(validate_request(&json!({"state":"", "questions":{}})).unwrap_err(), "Add at least one named question to the JSON editor.");
+        assert_eq!(validate_request(&json!({"state":null, "questions":{"x":{"type":"text","instructions":"Extract"}}})).unwrap_err(), "x: supported question types are choice, score, and noul.");
+        assert_eq!(validate_request(&json!({"state":"", "questions":{"x":{"type":"choice","instructions":"Choose", "multiple":true,"criteria":{"a":null,"b":null}}}})).unwrap_err(), "x: multiple-choice selection is not supported by the pinned runtime.");
     }
     #[tokio::test]
     async fn unloaded_model_is_unavailable_and_models_is_empty() {
@@ -475,6 +495,8 @@ mod tests {
             .unwrap();
         // A request must name its model, loaded or not.
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["message"], "Set \"model\" to a loaded model's name or alias. No model is loaded yet; load one in noullama.");
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -637,7 +659,7 @@ mod tests {
         assert_eq!(message, "'triage' is instance 1 of qwen, which is not loaded. Other loaded instances answer to: triage-i-2, triage-i-3. Load it again, or turn on Fall through to another instance in Settings.");
         assert_eq!(listed(&app).await, ["qwen-i-3", "triage-i-3", "any-available"]);
         // On: the lowest slot (2), which is still loading.
-        state.settings.lock().await.fall_through_to_other_instances = true;
+        crate::runtime::change_fall_through(&state, true).await.unwrap();
         let (status, message) = status_and_message(&app, "triage").await;
         assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "qwen instance 2 is still loading."));
         crate::runtime::set_test_ready(&second, true);
@@ -660,7 +682,7 @@ mod tests {
     fn aliases_are_trimmed_checked_and_deduplicated() {
         let names = crate::runtime::normalize_aliases(&[" triage ".into(), "Triage".into(), "".into(), "noullama".into(), "acme/d1:q8".into()]).unwrap();
         assert_eq!(names, ["triage", "noullama", "acme/d1:q8"]);
-        assert!(crate::runtime::normalize_aliases(&["has space".into()]).is_err());
+        assert_eq!(crate::runtime::normalize_aliases(&["has space".into()]).unwrap_err(), "Model name \"has space\" can use letters, digits and . _ : / - only, up to 64 characters.");
     }
 
     #[tokio::test]
@@ -672,7 +694,7 @@ mod tests {
         let mut edited = stale;
         edited.context_size = 4096;
         edited.keep_context = true;
-        crate::runtime::save_from_editor(&state, edited).await.unwrap();
+        crate::runtime::save_from_editor(&state, serde_json::to_value(edited).unwrap().as_object().unwrap().clone()).await.unwrap();
         let settings = state.settings.lock().await.clone();
         assert_eq!(settings.context_size, 4096);
         assert_eq!(settings.model_routes["/m/a.gguf"], ["triage"]);
@@ -856,7 +878,7 @@ mod tests {
         let other = path.join("Any-Available.gguf");
         std::fs::write(&other, "test").unwrap();
         state.settings.lock().await.model_path = other.to_string_lossy().into_owned();
-        assert_eq!(crate::runtime::load_model(&state).await.unwrap_err(), "This model's API name would be \"any-available\", which is reserved for sending a request to any free loaded instance. Give it another name in Library, or rename the file.");
+        assert_eq!(crate::runtime::load_model_in(&state, None).await.unwrap_err(), "This model's API name would be \"any-available\", which is reserved for sending a request to any free loaded instance. Give it another name in Library, or rename the file.");
         assert!(state.instances.lock().await.is_empty());
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -926,10 +948,11 @@ mod tests {
         crate::runtime::set_when_busy(&state, "wait").await.unwrap();
         assert_eq!(ask_for(&app, "any-available").await.1, none);
         crate::runtime::set_when_busy(&state, "reject").await.unwrap();
-        assert!(crate::runtime::set_when_busy(&state, "queue").await.is_err());
+        assert_eq!(crate::runtime::set_when_busy(&state, "queue").await.unwrap_err(), "Unknown choice for when every instance is busy.");
+        assert_eq!(state.settings.lock().await.any_available_when_busy, "reject");
         crate::runtime::set_test_ready(&loading, true);
         let held = crate::runtime::hold_test_claim(&state, &loading);
-        let (status, message, _) = ask_for(&app, "any-available").await;
+        let (status, message, _) = tokio::time::timeout(std::time::Duration::from_secs(5), ask_for(&app, "any-available")).await.expect("reject answers at once");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(message, "Every loaded instance is busy with another request, so \"any-available\" has none to send this one to. Try again, or set \"When every instance is busy\" to Wait in Settings.");
         drop(held);
@@ -992,6 +1015,44 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    /// "Wait for one" waits as long as "Wait up to (ms)" says, read at each request.
+    #[tokio::test]
+    async fn any_available_waits_as_long_as_the_setting_says() {
+        let path = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(path.clone()).unwrap();
+        let (port, seen) = fake_native_runtime().await;
+        let a = crate::runtime::insert_test_instance_on(&state, "/models/acme/qwen.gguf", true, port).await;
+        crate::runtime::set_when_busy(&state, "wait").await.unwrap();
+        crate::runtime::set_wait_ms(&state, 50).await.unwrap();
+        let app = router(state.clone());
+        let held = crate::runtime::hold_test_claim(&state, &a);
+        let started = std::time::Instant::now();
+        let (status, message, _) = tokio::time::timeout(std::time::Duration::from_secs(5), ask_for(&app, "any-available")).await.expect("a 50 ms wait ends long before 5 s");
+        let waited = started.elapsed();
+        assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "Every loaded instance stayed busy for 50 ms, so \"any-available\" gave up on this request. Try again."));
+        assert!(waited >= std::time::Duration::from_millis(50) && waited < std::time::Duration::from_secs(2), "{waited:?}");
+        assert_eq!(seen.lock().unwrap().len(), 0);
+        // A longer wait: the instance frees after 300 ms, well past the old 50.
+        crate::runtime::set_wait_ms(&state, 3000).await.unwrap();
+        let waiting = tokio::spawn({ let app = app.clone(); async move { ask_for(&app, "any-available").await } });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "it is still waiting");
+        drop(held);
+        let (status, message, _) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK, "{message}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // Whole seconds read as seconds.
+        crate::runtime::set_wait_ms(&state, 1000).await.unwrap();
+        let held = crate::runtime::hold_test_claim(&state, &a);
+        assert_eq!(ask_for(&app, "any-available").await.1, "Every loaded instance stayed busy for 1 second, so \"any-available\" gave up on this request. Try again.");
+        // A hand-edited settings.json below the range waits the minimum.
+        state.settings.lock().await.any_available_wait_ms = 0;
+        assert!(ask_for(&app, "any-available").await.1.starts_with("Every loaded instance stayed busy for 1 ms,"));
+        drop(held);
+        state.shutdown().await;
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     /// A real HTTP client that gives up mid-request frees its instance.
     #[tokio::test]
     async fn a_client_that_disconnects_frees_its_instance() {
@@ -1039,7 +1100,7 @@ mod tests {
                 settings.runtime_port = 18440;
             }
             // The second load starts while the first is still loading.
-            ids.push(crate::runtime::load_model(&state).await.unwrap());
+            ids.push(crate::runtime::load_model_in(&state, None).await.unwrap());
         }
         let first = crate::runtime::wait_until_ready(&state, &ids[0], 300).await;
         let second = crate::runtime::wait_until_ready(&state, &ids[1], 300).await;
@@ -1108,7 +1169,7 @@ mod tests {
                 .unwrap_or(8192);
             settings.runtime_port = 18437;
         }
-        let id = crate::runtime::load_model(&state).await.unwrap();
+        let id = crate::runtime::load_model_in(&state, None).await.unwrap();
         let instance = crate::runtime::wait_until_ready(&state, &id, 90).await;
         let private_port = state.settings.lock().await.runtime_port;
         let unauthenticated = state

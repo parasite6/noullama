@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Plus, X } from 'lucide-react';
 import { CopyButton } from './CopyButton';
+import { waitText } from './ui-state';
 
 // `name` is the identifier a request sends: `base` plus the instance's suffix.
 // An instance alias belongs to one loaded instance and is never suffixed.
@@ -55,17 +56,17 @@ export function ModelAliases({ path, instance, aliases, routes, disabled, onSave
 
 // Local API: the rules for "model" and the names that do not reach a loaded
 // model yet. A loaded model's own names are edited on its card.
-export function ModelRouting({ loadedCount, anyReady, whenBusy, routes, aliasesFor, disabled, onSave, onError }: { loadedCount: number; anyReady: boolean; whenBusy: string; routes: Route[]; aliasesFor: (path: string) => string[]; disabled?: boolean; onSave: (path: string, aliases: string[]) => Promise<void>; onError: (message: string) => void }) {
+export function ModelRouting({ loadedCount, anyReady, whenBusy, waitMs, routes, aliasesFor, disabled, onSave, onError }: { loadedCount: number; anyReady: boolean; whenBusy: string; waitMs: number; routes: Route[]; aliasesFor: (path: string) => string[]; disabled?: boolean; onSave: (path: string, aliases: string[]) => Promise<void>; onError: (message: string) => void }) {
   const unloaded = routes.filter(route => !route.instance && !route.fallthrough);
   const withoutFirst = routes.filter(route => !route.instance && route.fallthrough);
-    return <section className="panel model-names">
+  return <section className="panel model-names">
     <div className="panel-heading"><span>Model routing</span><span className="muted normal-weight">Every request sends one of these names as "model"</span></div>
     <div className="model-names-body">
       <p className="hint">{loadedCount === 0 ? 'Load a model to route requests to it. Several can be loaded at once; each answers to its name and aliases from Library.' : 'Each loaded model answers to the names on its card under Loaded.'}</p>
       <div className="route-group">
         <div className="route-model"><span className={`status-dot ${anyReady ? 'green' : ''}`}/><strong>Any free instance</strong><small>{anyReady ? 'Reaches a ready instance now' : 'Answers 503 until an instance is ready'}</small></div>
         <div className="model-name-list"><Name value={ANY_AVAILABLE} note="Any model" onError={onError}/></div>
-        <small>Sends the request to whichever ready instance, of any model, is not running a request; the one idle longest goes first. When every instance is busy it {whenBusy === 'wait' ? 'waits up to 120 seconds for the first to finish' : 'gets 503'} (When every instance is busy, in Settings). Each instance keeps its own Keep context history.</small>
+        <small>Sends the request to whichever ready instance, of any model, is not running a request; the one idle longest goes first. When every instance is busy it {whenBusy === 'wait' ? `waits up to ${waitText(waitMs)} for the first to finish` : 'gets 503'} (When every instance is busy, in Settings). Each instance keeps its own Keep context history.</small>
       </div>
       {unloaded.length > 0 && <div className="route-group">
         <div className="route-model"><span className="status-dot"/><strong>Not loaded</strong><small>These names answer 503 until their model is loaded</small></div>

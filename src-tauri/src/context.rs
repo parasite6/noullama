@@ -236,21 +236,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_instance_starts_from_the_keep_context_setting() {
-        let (state, path) = temp_state();
-        let off = crate::runtime::insert_test_instance(&state, "/m/a.gguf", true).await;
-        state.settings.lock().await.keep_context = true;
-        let on = crate::runtime::insert_test_instance(&state, "/m/a.gguf", true).await;
-        assert!(!off.keeps_context(), "a loaded instance keeps its own switch when the setting changes");
-        assert!(on.keeps_context());
-        state.settings.lock().await.keep_context = false;
-        let again = crate::runtime::insert_test_instance(&state, "/m/b.gguf", true).await;
-        assert!(!again.keeps_context());
-        assert!(on.keeps_context());
-        std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[tokio::test]
     async fn two_instances_of_one_file_have_their_own_switch_and_off_clears_only_that_one() {
         let (state, path) = temp_state();
         let first = crate::runtime::insert_test_instance(&state, "/m/a.gguf", true).await;
@@ -289,7 +274,7 @@ mod tests {
             settings.runtime_port = 18438;
             settings.keep_context = true;
         }
-        let id = crate::runtime::load_model(&state).await.unwrap();
+        let id = crate::runtime::load_model_in(&state, None).await.unwrap();
         let model = crate::runtime::wait_until_ready(&state, &id, 120).await;
         let questions = json!({"route":{"type":"choice","instructions":"Which team should handle this?","criteria":{"billing":"Payments and refunds","technical":"Bugs and errors"}}});
         let mut results = Vec::new();

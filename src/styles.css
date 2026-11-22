@@ -609,7 +609,11 @@ label small { font-weight: 400; line-height: 1.6; }
 .instance-aliases { display: grid; gap: 8px; }
 .instance-aliases .model-name-list, .instance-aliases .alias-form, .instance-aliases > small { margin-left: 46px; }
 .instance-aliases > small { font-size: 12px; color: var(--muted); }
-.load-instance { min-width: 200px; margin-left: auto; }
+/* A fixed share of the row, so a long API name in the picker cannot squeeze
+   the loaded model's name and device beside it; the label ellipsizes and the
+   open menu shows it whole. */
+.load-instance { flex: 0 1 300px; min-width: 180px; margin-left: auto; }
+.load-instance .select-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .instance-card .model-aliases { padding-left: 46px; }
 /* An instance's own Keep context switch, Clear and status */
 .instance-keep { padding-left: 46px; }

@@ -456,8 +456,10 @@ fn refresh_locked(data_dir: &Path, library: &mut Library, legacy: &BTreeMap<Stri
 /// Adds an entry for each model file that has none.
 pub async fn ensure(state: &AppState, paths: &[String]) {
     refresh(state).await;
-    let owners = crate::runtime::instance_alias_owners(state).await;
     let added = {
+        // Held so an instance alias added meanwhile cannot become a new entry's name.
+        let _guard = state.lifecycle.lock().await;
+        let owners = crate::runtime::instance_alias_owners(state).await;
         let mut library = state.library.lock().await;
         let mut entries = library.entries.clone();
         for path in paths {
@@ -516,6 +518,8 @@ fn instance_alias_clash(before: &[Entry], next: &[Entry], owners: &[(String, Str
 pub async fn set_aliases(state: &AppState, path: &str, aliases: Vec<String>) -> Result<Vec<String>, String> {
     let path = path.to_owned();
     let mut saved = Vec::new();
+    // Held through the write, as in `save`.
+    let _guard = state.lifecycle.lock().await;
     let owners = crate::runtime::instance_alias_owners(state).await;
     update(state, Change::Edit, |entries| {
         let before = entries.clone();
@@ -767,8 +771,12 @@ pub async fn save_library(entries: Vec<Entry>, revision: u64, state: tauri::Stat
 pub async fn save(state: &AppState, entries: Vec<Entry>, revision: u64) -> Result<(), String> {
     refresh(state).await;
     let entries = validate(&entries)?;
-    let owners = crate::runtime::instance_alias_owners(state).await;
     {
+        // The lock instance alias changes hold (see change_instance_aliases in
+        // runtime.rs), so none can be added between this check and the write.
+        // Lock order: lifecycle, then library.
+        let _guard = state.lifecycle.lock().await;
+        let owners = crate::runtime::instance_alias_owners(state).await;
         let mut library = state.library.lock().await;
         if library.revision != revision {
             return Err("models.yml changed since you started editing. Discard your changes to see the new version, then edit again.".into());
@@ -820,13 +828,19 @@ pub async fn record_sha256(path: String, slot: Slot, state: tauri::State<'_, App
 
 #[tauri::command]
 pub async fn set_sha256_check(mode: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    set_check(state.inner(), mode).await
+}
+
+pub async fn set_check(state: &AppState, mode: String) -> Result<(), String> {
     if !["off", "once", "every_load", "warn"].contains(&mode.as_str()) {
         return Err("Unknown sha256 check.".into());
     }
-    let mut settings = state.settings.lock().await.clone();
-    settings.sha256_check = mode;
-    crate::runtime::persist_settings(state.inner(), settings).await?;
-    hash_missing(state.inner().clone());
+    crate::runtime::update_settings(state, |s| {
+        s.sha256_check = mode;
+        Ok(())
+    })
+    .await?;
+    hash_missing(state.clone());
     Ok(())
 }
 
@@ -899,9 +913,9 @@ mod tests {
         assert_eq!(tidy[1].sha256, "ab".repeat(32));
         b.aliases = vec!["FAST".into()];
         assert!(validate(&[a.clone(), b.clone()]).unwrap_err().contains("used by both triage and sorter"));
-        assert!(validate(&[entry("x", "relative.gguf")]).is_err());
+        assert_eq!(validate(&[entry("x", "relative.gguf")]).unwrap_err(), "x: the path must be an absolute path to a .gguf file.");
         assert!(validate(&[entry("x", "/m/a.gguf"), entry("y", "/m/a.gguf")]).unwrap_err().contains("listed twice"));
-        assert!(validate(&[Entry { sha256: "nothex".into(), ..entry("x", "/m/a.gguf") }]).is_err());
+        assert_eq!(validate(&[Entry { sha256: "nothex".into(), ..entry("x", "/m/a.gguf") }]).unwrap_err(), "x: sha256 must be 64 hexadecimal characters, or empty.");
     }
 
     #[test]
@@ -912,7 +926,7 @@ mod tests {
         let text = render(&[a.clone()]).unwrap();
         assert!(text.starts_with("# Noullama models"));
         assert_eq!(parse(&text).unwrap(), (vec![a], VERSION));
-        assert!(parse("models: [ {name: ").is_err());
+        assert!(parse("models: [ {name: ").unwrap_err().starts_with("models.yml could not be read: "));
     }
 
     #[test]
@@ -997,7 +1011,7 @@ mod tests {
         assert_eq!(state.mismatches.lock().await.get(&model).map(String::as_str), Some(right));
         verify(&state, &model, Slot::Model, Check::Warn, "").await.unwrap();
         verify(&state, &model, Slot::Model, Check::Off, "").await.unwrap();
-        assert!(verify(&state, &model, Slot::Model, Check::EveryLoad, "").await.is_err());
+        assert!(verify(&state, &model, Slot::Model, Check::EveryLoad, "").await.unwrap_err().contains("does not match the one in models.yml"));
         set_sha256(&state, &model, Slot::Model, &model, right).await.unwrap();
         verify(&state, &model, Slot::Model, Check::EveryLoad, "").await.unwrap();
         assert!(state.mismatches.lock().await.is_empty());
@@ -1051,8 +1065,8 @@ mod tests {
         library.stamp = None;
         refresh_locked(&dir, &mut library, &BTreeMap::new());
         assert_eq!(library.entries[0].mmproj, "");
-        assert!(validate(&[Entry { mtp: "relative.gguf".into(), ..entry("x", "/m/a.gguf") }]).is_err());
-        assert!(validate(&[Entry { mmproj_sha256: "zz".into(), ..entry("x", "/m/a.gguf") }]).is_err());
+        assert_eq!(validate(&[Entry { mtp: "relative.gguf".into(), ..entry("x", "/m/a.gguf") }]).unwrap_err(), "x: mtp must be empty or an absolute path to another .gguf file.");
+        assert_eq!(validate(&[Entry { mmproj_sha256: "zz".into(), ..entry("x", "/m/a.gguf") }]).unwrap_err(), "x: mmproj_sha256 must be 64 hexadecimal characters, or empty.");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

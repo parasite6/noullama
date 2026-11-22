@@ -87,6 +87,7 @@ fn main() {
             runtime::set_fall_through,
             runtime::set_instance_aliases,
             runtime::set_any_available_when_busy,
+            runtime::set_any_available_wait_ms,
             context::set_instance_keep_context,
             context::clear_context,
             hub::hf_session,

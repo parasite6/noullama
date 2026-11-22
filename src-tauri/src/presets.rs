@@ -122,11 +122,11 @@ mod tests {
         let reopened = read_presets(&dir).unwrap();
         assert_eq!(reopened[0].name, "My router");
         assert_eq!(reopened[0].state, "hello");
-        assert!(store_preset(&dir, preset).is_err());
+        assert_eq!(store_preset(&dir, preset).err().as_deref(), Some("A saved preset already has that name. Choose another name or select it to update it."));
         let mut updated = reopened[0].clone();
         updated.state = "updated".into();
         assert_eq!(store_preset(&dir, updated).unwrap()[0].state, "updated");
-        assert!(remove_preset(&dir, "triage").is_err());
+        assert_eq!(remove_preset(&dir, "triage").err().as_deref(), Some("Saved preset not found; built-in presets cannot be deleted."));
         assert!(remove_preset(&dir, &stored[0].id).unwrap().is_empty());
         assert!(read_presets(&dir).unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();

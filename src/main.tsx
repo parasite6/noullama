@@ -27,7 +27,7 @@ import { DownloadPanel, type DownloadState } from './DownloadPanel';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { HuggingFaceLogo } from './HuggingFaceLogo';
 import { RuntimeManager, type RuntimeDownload } from './RuntimeManager';
-import { visibleBanner } from './ui-state';
+import { instancesOf, playModelAfterLoad, reloadSlot, visibleBanner, waitText } from './ui-state';
 import { containScrollChaining } from './scroll-contain';
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
@@ -37,7 +37,7 @@ import './styles.css';
 // decoded to 3.7 MB of bitmap for the sidebar.
 const logoUrl = new URL('./logo-96.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
 
 // One loaded model, with the settings it was loaded with.
 type Instance = { id: string; name: string; label: string; slot: number; suffix: string; default_suffix: string; api_names: string[]; instance_aliases: string[]; path: string; device: string; runtime_path: string; projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null; ready: boolean; context_size: number; gpu_layers: number; required_bytes: number | null; context: { entries: number; last_flushed: number }; keep_context: boolean; settings: Settings };
@@ -53,10 +53,12 @@ type Session = { authenticated: boolean; account: string | null; cli_available: 
 type Result = { answers?: Record<string, { type?: string; choice?: string; score?: number; noul?: number; confidence?: number; probabilities?: Record<string, number> }>; usage?: { input_tokens: number; output_tokens: number }; [key: string]: unknown };
 // The Settings tab's choice for `any-available` when every ready instance is running a request.
 const WHEN_BUSY = [
-  { value: 'reject', label: 'Answer 503', detail: 'The request gets 503 at once, saying every loaded instance is busy.' },
-  { value: 'wait', label: 'Wait for one', detail: 'The request waits for the first instance to finish, up to 120 seconds, then gets 503.' },
+  { value: 'reject', label: 'Answer 503', detail: (_ms: number) => 'The request gets 503 at once, saying every loaded instance is busy.' },
+  { value: 'wait', label: 'Wait for one', detail: (ms: number) => `The request waits for the first instance to finish, up to ${waitText(ms)}, then gets 503.` },
 ] as const;
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject' };
+// "Wait up to (ms)": the backend accepts 1–600000 (set_wait_ms in runtime.rs).
+const WAIT_MS = { min: 1, max: 600000, step: 1000 };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
 // The form is edited in two places, each saved on its own: the Local API
 // load panel (settings a load uses) and the Runtime tab (build and ports).
 // keep_context is the default a new instance starts with; loaded instances
@@ -241,6 +243,19 @@ function App() {
   }, [settings.model_path, scanTick]);
   useEffect(() => { if (desktop && tab === 'hub' && !session) invoke<Session>('hf_session').then(setSession).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab]);
   useEffect(() => { if (desktop && tab !== 'hub') invoke<{ models: typeof localModels; warnings: string[] }>('local_models').then(scan => { setLocalModels(scan.models); setScanWarnings(scan.warnings); }).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab, finishedDownloads, scanTick, snapshot?.download_dir, settings.model_path]);
+  // "Wait up to (ms)" saves on its own, once typing pauses, so half-typed
+  // numbers are not sent. The draft shows until the saved value comes back.
+  const whenBusy = snapshot?.settings.any_available_when_busy ?? 'reject';
+  const savedWait = snapshot?.settings.any_available_wait_ms ?? 120000;
+  const [waitDraft, setWaitDraft] = useState<number | null>(null);
+  useEffect(() => {
+    if (waitDraft === null) return;
+    if (waitDraft === savedWait) { setWaitDraft(null); return; }
+    const value = waitDraft;
+    const timer = setTimeout(() => void action(`wait-ms:${value}`, async () => { await invoke('set_any_available_wait_ms', { ms: value }); })
+      .then(() => setWaitDraft(draft => draft === value ? null : draft)), 600);
+    return () => clearTimeout(timer);
+  }, [waitDraft]);
   async function action(name: string, task: () => Promise<void>) {
     if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
     if (!actionOwners.current.begin(name)) return;
@@ -271,11 +286,12 @@ function App() {
       setImages(current => [...current, ...added]); setResult(null);
     }).catch(e => setNotice({ text: errorText(e), error: true }));
   }
-  // Each save writes only its own group over the saved settings, so unsaved
-  // edits in the other place are neither saved nor lost. The refresh comes
-  // first so the form does not flash back to the old values.
+  // Each save sends only its own group; the backend applies it over the
+  // settings saved at that moment, so unsaved edits in the other place are
+  // neither saved nor lost, and two saves close together both stick. The
+  // refresh comes first so the form does not flash back to the old values.
   async function saveGroup(keys: readonly (keyof Settings)[], clean: () => void) {
-    await invoke('save_settings', { settings: { ...(snapshot?.settings ?? defaultSettings), ...pick(settings, keys) } });
+    await invoke('save_settings', { settings: pick(settings, keys) });
     await refresh(); clean();
   }
   const saveLoadSettings = () => saveGroup(LOAD_FIELDS, () => setLoadDirty(false));
@@ -407,18 +423,17 @@ function App() {
       if (warning) { setHideCrowded(false); setCrowdedWarning({ ...warning, replace }); return; }
       setCrowdedWarning(null);
       // It may have stopped on its own meanwhile; then there is nothing to eject.
-      // A reload keeps the replaced instance's slot, so its suffixed names stay.
-      const slot = replace ? instances.find(i => i.id === replace)?.slot ?? null : null;
+      const slot = reloadSlot(instances, replace);
       if (replace) await invoke('unload_model', { id: replace }).catch(() => {});
       const id = await invoke<string>('start_runtime', { slot });
       setLoadTarget(id);
-      setPlayModel(current => current && current !== replace && current !== ejectOther && instances.some(i => i.id === current) ? current : id);
+      setPlayModel(current => playModelAfterLoad(current, id, instances, replace, ejectOther));
     });
   }
   async function saveDownloadDirectory() {
     await action('directory', async () => {
       if (!snapshot) return;
-      await invoke('save_settings', { settings: { ...snapshot.settings, download_dir: downloadDir } });
+      await invoke('save_settings', { settings: { download_dir: downloadDir } });
       setSettings(current => ({ ...current, download_dir: downloadDir }));
       setNotice({ text: 'Download directory saved. Existing files stay in place.', error: false });
     });
@@ -434,8 +449,7 @@ function App() {
   const modelMissing = !loadDirty && !!snapshot?.model_missing;
   // The selected file's loaded model, if it is loaded.
   // Several instances of one file can be loaded; the load bar acts on one, chosen in the panel.
-  const selectedInstances = instances.filter(i => i.path === settings.model_path).sort((a, b) => a.slot - b.slot);
-  const selectedInstance = selectedInstances.find(i => i.id === loadTarget) ?? selectedInstances[0] ?? null;
+  const { list: selectedInstances, selected: selectedInstance } = instancesOf(instances, settings.model_path, loadTarget);
   const model = modelStatus(settings.model_path, selectedInstance, modelMissing);
   // Whether a load now would differ from what this instance was loaded with:
   // the load panel's values, plus the saved build (unsaved Runtime tab edits
@@ -624,7 +638,8 @@ function App() {
           <section className="panel settings-panel"><div className="panel-heading"><span><Route size={16}/> Local API routing</span></div><div className="settings-body">
             <div className="field"><div className="field-row"><span>Fall through to another instance</span><Toggle label={snapshot?.settings.fall_through_to_other_instances ? 'On' : 'Off'} ariaLabel="Fall through to another instance" checked={snapshot?.settings.fall_through_to_other_instances ?? false} disabled={!desktop || isBusy('fall-through')} onChange={on => void action('fall-through', async () => { await invoke('set_fall_through', { on }); })}/></div><small>When instance 1 of a model file is not loaded but another instance is, requests for its plain names (without a suffix) go to the loaded instance with the lowest number. Off, they get 503. Suffixed names never fall through.</small></div>
             <div className="field"><div className="field-row"><span>When every instance is busy</span><div className="segmented" role="group" aria-label="When every instance is busy">{WHEN_BUSY.map(option => <button key={option.value} type="button" className={(snapshot?.settings.any_available_when_busy ?? 'reject') === option.value ? 'on' : ''} aria-pressed={(snapshot?.settings.any_available_when_busy ?? 'reject') === option.value} disabled={!desktop || isBusy('when-busy')} onClick={() => void action('when-busy', async () => { await invoke('set_any_available_when_busy', { mode: option.value }); })}>{option.label}</button>)}</div></div>
-              <small>{WHEN_BUSY.find(option => option.value === (snapshot?.settings.any_available_when_busy ?? 'reject'))?.detail}</small>
+              {whenBusy === 'wait' && <div className="field-row"><span>Wait up to (ms)</span><NumberField value={waitDraft ?? savedWait} min={WAIT_MS.min} max={WAIT_MS.max} step={WAIT_MS.step} onChange={value => setWaitDraft(Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(value))))}/></div>}
+              <small>{WHEN_BUSY.find(option => option.value === whenBusy)?.detail(waitDraft ?? savedWait)}</small>
               <small>Applies to requests that send "any-available" as the model. They go to a ready instance of any model that is not running a request, the one idle longest first.</small></div>
           </div></section>
           <section className="panel settings-panel"><div className="panel-heading"><span><ShieldCheck size={16}/> Model file checks</span></div><div className="settings-body">
@@ -645,7 +660,7 @@ function App() {
               <div className="load-identity-icon">{accountFor(model.selected) ? <AuthorLogo author={accountFor(model.selected)} size={40}/> : <Cpu size={20}/>}</div>
               <div className="model-identity"><small>{selectedInstance ? selectedInstance.ready ? 'Loaded model' : 'Loading model' : 'Selected model'}</small><span className="identity-line"><strong title={model.selected}>{model.selected ? nameFor(model.selected) ?? basename(model.selected) : 'No model selected'}</strong>{model.selected && <CopyButton value={basename(model.selected)} label="Copy model file name" size={13} onError={copyError}/>}</span>{model.device && <small>{model.device}</small>}</div>
               <span className={`chip ${model.ready ? 'success' : ''}`}><span className={`status-dot ${model.ready ? 'green' : model.loaded ? 'amber' : ''}`}/>{isBusy('start') ? 'Starting…' : model.label}</span>
-              {selectedInstances.length > 1 && <div className="load-instance"><Select label="Instance" value={selectedInstance?.id ?? ''} options={selectedInstances.map(i => ({ value: i.id, label: `${apiName(i)} · instance ${i.slot}${i.ready ? '' : ' (loading)'}` }))} onChange={setLoadTarget}/></div>}
+              {selectedInstances.length > 1 && <div className="load-instance"><Select label="Instance" value={selectedInstance?.id ?? ''} options={selectedInstances.map(i => ({ value: i.id, label: `${apiName(i)} · instance\u00a0${i.slot}${i.ready ? '' : ' (loading)'}` }))} onChange={setLoadTarget}/></div>}
             </div>
             <p className="hint fit-note">{fit ? fitDetail : model.selected ? 'The selected model file could not be read.' : 'Select a model to see how it would run on this machine.'}</p>
             <label>Model file (GGUF)<div className="file-input-row"><input placeholder="/path/to/model.gguf" value={settings.model_path} onChange={e => edit('model_path', e.target.value)}/><button className="secondary" type="button" disabled={modelPending} onClick={() => browseFile('model_path')}><FolderOpen size={14}/>Browse file</button><button className="secondary" type="button" disabled={modelPending} onClick={() => setTab('models')}><Layers3 size={14}/>Select model</button></div></label>
@@ -666,7 +681,7 @@ function App() {
             stale={differsFrom(instance)} canReload={differsFrom(instance) && instance.ready} starting={isBusy('start')} ejecting={isBusy(`eject:${instance.id}`)} reloadDisabled={modelPending || model.missing} namesDisabled={!desktop}
             keepContext={keepsContext(instance)} onKeepContext={on => void toggleKeepContext(instance.id, on)} onClearContext={() => void clearContext(instance.id)}
             onEject={() => void eject(instance.id)} onReload={() => void loadSelected({ replace: instance.id })} onSaveAliases={saveAliases} onSaveSuffix={suffix => saveSuffix(instance.id, suffix)} onSaveInstanceAliases={aliases => saveInstanceAliases(instance.id, aliases)} onError={copyError}/>)}</div></>}
-          <ModelRouting loadedCount={instances.length} anyReady={instances.some(i => i.ready)} whenBusy={snapshot?.settings.any_available_when_busy ?? 'reject'} routes={routes} aliasesFor={aliasesFor} disabled={!desktop} onSave={saveAliases} onError={copyError}/>
+          <ModelRouting loadedCount={instances.length} anyReady={instances.some(i => i.ready)} whenBusy={whenBusy} waitMs={savedWait} routes={routes} aliasesFor={aliasesFor} disabled={!desktop} onSave={saveAliases} onError={copyError}/>
           <div className="endpoint-list">{([['GET', '/v1/models', 'List the names that reach a loaded model'], ['POST', '/v1/systemone', 'Native state + typed questions'], ['POST', '/v1/chat/completions', 'OpenAI chat response envelope'], ['GET', '/health', 'Gateway health and model readiness (outside /v1)']] as const).map(([method, path, text]) => <div key={path}><span className={`method ${method === 'GET' ? 'get' : ''}`}>{method}</span><code>{path}</code><span>{text}</span><CopyButton value={`${apiOrigin}${path}`} label={`Copy ${apiOrigin}${path}`} size={13} onError={copyError}/></div>)}</div>
           <section className="panel code-panel"><div className="panel-heading"><span>Native decision request</span><button className="icon-button" aria-label="Copy native API example" onClick={() => copy(`curl ${apiBase}/systemone -H 'Content-Type: application/json' -d '${requestJson.replace(/'/g, "'\\''")}'`, 'curl')}>{copied === 'curl' ? <Check size={14}/> : <Copy size={14}/>}</button></div><pre>{`curl ${apiBase}/systemone \\\n  -H 'Content-Type: application/json' \\\n  -d '${requestJson.replace(/'/g, "'\\''")}'`}</pre></section>
           <section className="panel code-panel"><div className="panel-heading"><span>Python · OpenAI SDK</span><div className="heading-actions"><span className="chip">Non-streaming</span><CopyButton value={pythonExample} label="Copy Python example" onError={copyError}/></div></div><pre>{pythonExample}</pre></section>

@@ -498,18 +498,18 @@ mod tests {
     fn rejects_what_winnow_rejects() {
         let q = json!({"q": {"type": "noul", "instructions": "x"}});
         assert!(compile(&json!({"state": null, "questions": q}), &labels(64), false).unwrap_err().contains("state"));
-        assert!(compile(&json!({"state": 3, "questions": q}), &labels(64), false).is_err());
-        assert!(compile(&json!({"state": "s", "questions": {}}), &labels(64), false).is_err());
+        assert_eq!(compile(&json!({"state": 3, "questions": q}), &labels(64), false).unwrap_err(), "state must be text, an object, or an array");
+        assert_eq!(compile(&json!({"state": "s", "questions": {}}), &labels(64), false).unwrap_err(), "questions must contain 1-256 named questions");
         let bad_noul = json!({"state": "s", "questions": {"q": {"type": "noul", "instructions": "x", "criteria": {"maybe": null}}}});
-        assert!(compile(&bad_noul, &labels(64), false).is_err());
+        assert_eq!(compile(&bad_noul, &labels(64), false).unwrap_err(), "q: noul criteria may only describe false and true");
         let one = json!({"state": "s", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": {"a": null}}}});
         assert!(compile(&one, &labels(64), false).unwrap_err().contains("2-64"));
         let three = json!({"state": "s", "questions": {"q": {"type": "choice", "instructions": "x", "criteria": {"a": null, "b": null, "c": null}}}});
-        assert!(compile(&three, &labels(2), false).is_err());
-        assert!(compile(&json!({"state": "s", "questions": {"q": {"type": "rank", "instructions": "x"}}}), &labels(64), false).is_err());
+        assert_eq!(compile(&three, &labels(2), false).unwrap_err(), "q: questions need 2-2 alternatives");
+        assert_eq!(compile(&json!({"state": "s", "questions": {"q": {"type": "rank", "instructions": "x"}}}), &labels(64), false).unwrap_err(), "q: supported question types are choice, score, and noul.");
         assert_eq!(temperature(&json!({}), 1.25).unwrap(), 1.25);
         assert_eq!(temperature(&json!({"winnow": {"temperature": 2.0}}), 1.25).unwrap(), 2.0);
-        assert!(temperature(&json!({"winnow": {"temperature": 0}}), 1.0).is_err());
+        assert_eq!(temperature(&json!({"winnow": {"temperature": 0}}), 1.0).unwrap_err(), "temperature must be positive and finite");
     }
 
     #[test]

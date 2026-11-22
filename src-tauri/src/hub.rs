@@ -1069,9 +1069,9 @@ mod tests {
             "aaaaaaaaaaaéaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "----------------------------------------",
         ] {
-            assert!(download_revision(&json!({"sha":sha})).is_err());
+            assert_eq!(download_revision(&json!({"sha":sha})).unwrap_err(), "Hub returned an invalid commit revision");
         }
-        assert!(download_revision(&json!({})).is_err());
+        assert_eq!(download_revision(&json!({})).unwrap_err(), "Hub returned an invalid commit revision");
         assert_eq!(
             download_revision(&json!({"sha":"0123456789abcdef0123456789abcdef01234567"})).unwrap(),
             "0123456789abcdef0123456789abcdef01234567"
@@ -1183,19 +1183,15 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot["downloads"][0]["active"], true);
         assert_eq!(snapshot["downloads"][0]["id"], "acme/decision-model-GGUF/model.gguf");
-        let mut settings = state.settings.lock().await.clone();
-        settings.hf_path = "/custom/hf".into();
         tokio::time::timeout(
             Duration::from_millis(500),
-            crate::runtime::persist_settings(&state, settings.clone()),
+            crate::runtime::update_settings(&state, |s| { s.hf_path = "/custom/hf".into(); Ok(()) }),
         )
         .await
         .unwrap()
         .unwrap();
-        settings.download_dir = base.join("different").to_string_lossy().into_owned();
-        assert!(crate::runtime::persist_settings(&state, settings)
-            .await
-            .is_err());
+        let different = base.join("different").to_string_lossy().into_owned();
+        assert_eq!(crate::runtime::update_settings(&state, |s| { s.download_dir = different; Ok(()) }).await.unwrap_err(), "Wait for downloads to finish before changing their directory.");
         // The same file cannot start twice while it is active.
         let duplicate = tokio::time::timeout(
             Duration::from_millis(500),
