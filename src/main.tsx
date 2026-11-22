@@ -3,6 +3,7 @@ import { MemoryWarningDialog, type CrowdedWarning } from './MemoryWarningDialog'
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { Toggle } from './Toggle';
 import { ModelDetails, type MemoryUse } from './ModelDetails';
 import { ImageAttachments, MAX_TOTAL_BYTES, readImages, type Attachment } from './ImageAttachments';
@@ -249,6 +250,16 @@ function App() {
   useEffect(() => { if (desktop && tab !== 'hub') invoke<{ models: typeof localModels; warnings: string[] }>('local_models').then(scan => { setLocalModels(scan.models); setScanWarnings(scan.warnings); }).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab, finishedDownloads, scanTick, snapshot?.download_dir, settings.model_path]);
   // "Wait up to (ms)" saves on its own, once typing pauses, so half-typed
   // numbers are not sent. The draft shows until the saved value comes back.
+  // The quit prompt opens on the click, or on the backend's quit-requested
+  // event (tray, window close), without waiting for a snapshot. A snapshot
+  // that shows a pending confirmation also opens it, in case an event was missed.
+  const [quitPrompt, setQuitPrompt] = useState(false);
+  useEffect(() => {
+    if (!desktop) return;
+    const stop = listen('quit-requested', () => setQuitPrompt(true));
+    return () => { void stop.then(unlisten => unlisten()); };
+  }, []);
+  useEffect(() => { if (snapshot?.quit_confirmation) setQuitPrompt(true); }, [snapshot?.quit_confirmation]);
   // Settings-tab choices show their new value at once while their command
   // saves, instead of dimming and snapping over when the snapshot arrives.
   // A failed save drops the override, so the saved value shows again.
@@ -549,7 +560,7 @@ function App() {
         {loadErrors.length > 0 && <button className="nav-item load-error-nav" title={`${loadErrors.length === 1 ? `Load error: ${loadErrors[0].name}` : `${loadErrors.length} load errors`}. Open Local API`} aria-label={`${loadErrors.length === 1 ? '1 load error' : `${loadErrors.length} load errors`}, open Local API`} onClick={() => setTab('api')}><AlertCircle size={18}/><span>{loadErrors.length === 1 ? 'Load error' : `${loadErrors.length} load errors`}</span></button>}
         {desktop &&<button className={`nav-item ${updates?.offer ? 'has-update' : ''}`} title={updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'} aria-haspopup="dialog" onClick={() => setUpdatesOpen(true)}><CircleArrowUp size={18}/><span>{updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'}</span></button>}
         <button className="nav-item" title="Runtime logs" aria-label="Runtime logs" aria-pressed={showLogs} onClick={() => setShowLogs(v => !v)}><Terminal size={18}/><span>Runtime logs</span></button>
-        <button className="nav-item" title="Quit Noullama" aria-label="Quit Noullama" disabled={!desktop || isBusy('quit')} onClick={() => action('quit-prompt', async () => { await invoke('request_quit'); })}><Power size={18}/><span>Quit Noullama</span></button>
+        <button className="nav-item" title="Quit Noullama" aria-label="Quit Noullama" disabled={!desktop || isBusy('quit')} onClick={() => { setQuitPrompt(true); void action('quit-prompt', async () => { await invoke('request_quit'); }); }}><Power size={18}/><span>Quit Noullama</span></button>
         <div className="runtime-card-wrap" onMouseEnter={() => setDetailsOpen(true)} onMouseLeave={() => setDetailsOpen(false)} onFocus={() => setDetailsOpen(true)} onBlur={() => setDetailsOpen(false)}>
           <button className="runtime-card" onClick={() => setTab('runtime')} aria-label={`Selected llama.cpp: ${chosenRuntime.source} ${chosenRuntime.name}${chosenRuntime.inUse ? ', in use' : ', not running'}`}><span className={`runtime-card-icon ${readyCount ? 'ready' : running ? 'loading' : ''}`}><Cpu size={16}/></span><span><strong>{readyCount > 1 ? `${readyCount} models ready` : readyCount ? 'Model ready' : running ? 'Loading model' : 'Runtime offline'}</strong><small>llama.cpp {chosenRuntime.source} · {chosenRuntime.name}</small>{chosenRuntime.pending && <small className="runtime-pending">Next selection not applied</small>}</span></button>
           {detailsOpen && <ModelDetails
@@ -719,7 +730,7 @@ function App() {
     <ContextMenu/>
     {updates && <UpdatesDialog open={updatesOpen} view={updates} onClose={() => setUpdatesOpen(false)} onCheck={() => { void updateCommand('check_for_update'); }} onInstall={() => { void updateCommand('install_update'); }} onPrefs={(includePrereleases, checkOnLaunch) => { setUpdates(view => view && { ...view, include_prereleases: includePrereleases, check_on_launch: checkOnLaunch }); void updateCommand('set_update_prefs', { includePrereleases, checkOnLaunch }); }}/>}
     <DeletePresetDialog name={presetToDelete?.name ?? null} pending={isBusy('preset')} onCancel={() => setPresetToDelete(null)} onConfirm={() => { if (presetToDelete) void trashPreset(presetToDelete.id); }}/>
-    <QuitDialog open={snapshot?.quit_confirmation ?? false} pending={isBusy('quit') || isBusy('cancel-quit')} onCancel={() => { void action('cancel-quit', async () => { await invoke('cancel_quit'); }); }} onConfirm={() => { void action('quit', async () => { await invoke('quit_app'); }); }}/>
+    <QuitDialog open={quitPrompt} pending={isBusy('quit') || isBusy('cancel-quit')} onCancel={() => { setQuitPrompt(false); void action('cancel-quit', async () => { await invoke('cancel_quit'); }); }} onConfirm={() => { void action('quit', async () => { await invoke('quit_app'); }); }}/>
     {showLogs && <div className="log-drawer"><div className="panel-heading"><span><Terminal size={16}/> Runtime activity</span><button className="icon-button" aria-label="Close runtime logs" onClick={() => setShowLogs(false)}><X size={17}/></button></div><pre>{snapshot?.logs.join('\n') || 'No runtime activity yet.'}</pre></div>}
   </div>;
 }

@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager,
+    Emitter, Manager,
 };
 
 pub fn request_exit(app: &tauri::AppHandle, code: i32) {
@@ -38,6 +38,9 @@ pub fn request_quit(app: tauri::AppHandle) {
         .app
         .quit_confirmation
         .store(true, Ordering::SeqCst);
+    // Tells the window at once, so the prompt does not wait for the next
+    // snapshot poll. The poll still shows it if the event is missed.
+    let _ = app.emit("quit-requested", ());
     open_window(&app);
 }
 
