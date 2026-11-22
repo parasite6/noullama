@@ -1,4 +1,4 @@
-import { PendingActions, LatestRequest, retainEqual, usePageVisible } from './refresh-state';
+import { PendingActions, retainEqual, usePageVisible } from './refresh-state';
 import { MemoryWarningDialog, type CrowdedWarning } from './MemoryWarningDialog';
 import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -138,7 +138,7 @@ function App() {
   const [elapsed, setElapsed] = useState(0);
   const [resultTab, setResultTab] = useState('decisions');
   const actionOwners = useRef(new PendingActions());
-  const refreshRequests = useRef(new LatestRequest());
+  const refreshRequests = useRef<Promise<void> | null>(null);
   const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
   const isBusy = (...names: string[]) => names.some(name => pendingActions.has(name));
   const modelPending = isBusy('start', 'save', 'save-load') || [...pendingActions].some(name => name.startsWith('eject:'));
@@ -187,17 +187,21 @@ function App() {
   }, [detailsOpen, pageVisible]);
 
   useEffect(() => { if (!desktop || tab !== 'models' || !pageVisible) return; const timer = setInterval(() => setScanTick(t => t + 1), 5000); return () => clearInterval(timer); }, [tab, pageVisible]);
-  async function refresh() {
+  async function refresh(poll = false) {
     if (!desktop) return;
-    const request = refreshRequests.current.begin();
-    await Promise.all([
-      invoke<Snapshot>('snapshot').then(next => {
-        if (refreshRequests.current.isLatest(request)) setSnapshot(current => retainEqual(current, next));
-      }),
-      invoke<UpdateView>('update_state').then(next => {
-        if (refreshRequests.current.isLatest(request)) setUpdates(current => retainEqual(current, next));
-      }),
-    ]);
+    while (refreshRequests.current) {
+      if (poll) return;
+      await refreshRequests.current.catch(() => {});
+    }
+    const request = Promise.allSettled([
+      invoke<Snapshot>('snapshot').then(next => setSnapshot(current => retainEqual(current, next))),
+      invoke<UpdateView>('update_state').then(next => setUpdates(current => retainEqual(current, next))),
+    ]).then(results => {
+      const failure = results.find(result => result.status === 'rejected');
+      if (failure) throw failure.reason;
+    }).finally(() => { refreshRequests.current = null; });
+    refreshRequests.current = request;
+    await request;
   }
   async function updateCommand(command: string, args?: Record<string, unknown>) {
     try { const next = await invoke<UpdateView | null>(command, args); if (next) setUpdates(next); }
@@ -215,8 +219,8 @@ function App() {
   // loaded runtimes on its own. Coming back shows current state at once.
   useEffect(() => {
     if (!desktop || !pageVisible) return;
-    refresh().catch(() => {});
-    const timer = setInterval(() => { refresh().catch(() => {}); }, 1200);
+    refresh(true).catch(() => {});
+    const timer = setInterval(() => { refresh(true).catch(() => {}); }, 1200);
     return () => clearInterval(timer);
   }, [pageVisible]);
   // The form follows the saved settings, except the group that has unsaved edits.

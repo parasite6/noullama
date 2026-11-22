@@ -772,6 +772,37 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    #[tokio::test]
+    async fn inference_finishing_after_a_context_reset_does_not_add_history() {
+        let dir = std::env::temp_dir().join(format!("noullama-context-reset-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        let (port, seen) = fake_native_runtime_after(300).await;
+        let instance = crate::runtime::insert_test_instance_on(&state, "/m/model.gguf", true, port).await;
+        let mut kept = Vec::new();
+        for switch_off in [false, true] {
+            instance.set_keep_context(true).await;
+            let (state, instance_for_request) = (state.clone(), instance.clone());
+            let task = tokio::spawn(async move {
+                state.infer_on(&instance_for_request, json!({"state":"ticket","questions":request()["questions"]})).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while seen.lock().unwrap().len() <= usize::from(switch_off) {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            if switch_off {
+                instance.set_keep_context(false).await;
+                instance.set_keep_context(true).await;
+            } else {
+                instance.context.lock().await.clear();
+            }
+            task.await.unwrap().unwrap();
+            kept.push(instance.context.lock().await.len());
+        }
+        assert_eq!(kept, [0, 0]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// POSTs a decision request for `model` and returns the status, error
     /// message and the `model` the response echoes.
     async fn ask_for(app: &Router, model: &str) -> (StatusCode, String, Value) {

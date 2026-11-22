@@ -1,11 +1,39 @@
 //! OOM policy: utilization is not pressure, and fit estimates are not measurements.
 const MIB: u64 = 1024 * 1024;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Memory {
     pub total: u64,
     pub available: u64,
-    pub stalled: bool,
+    critical: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct MemorySource {
+    total: u64,
+    available: u64,
+    stalled: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl MemorySource {
+    fn sample(self) -> Memory {
+        Memory {
+            total: self.total,
+            available: self.available,
+            critical: self.total > 0 && self.available < (self.total / 100).min(256 * MIB) && self.stalled,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn merge(memory: Memory, source: MemorySource) -> Memory {
+    let source = source.sample();
+    Memory {
+        total: memory.total.min(source.total),
+        available: memory.available.min(source.available),
+        critical: memory.critical || source.critical,
+    }
 }
 
 pub fn clearly_exceeds(required: u64, available: u64) -> bool {
@@ -18,9 +46,7 @@ pub struct Pressure {
 }
 impl Pressure {
     pub fn sample(&mut self, memory: Option<Memory>) -> bool {
-        let critical = memory.is_some_and(|m| {
-            m.total > 0 && m.available < (m.total / 100).min(256 * MIB) && m.stalled
-        });
+        let critical = memory.is_some_and(|m| m.critical);
         self.consecutive = if critical {
             self.consecutive.saturating_add(1)
         } else {
@@ -34,14 +60,24 @@ impl Pressure {
 mod tests {
     use super::*;
     #[test]
+    fn critical_host_survives_a_tighter_non_stalled_cgroup() {
+        let host = MemorySource { total: 8000 * MIB, available: 32 * MIB, stalled: true };
+        let cgroup = MemorySource { total: 1000 * MIB, available: 16 * MIB, stalled: false };
+        let sample = merge(host.sample(), cgroup);
+        assert_eq!(sample.available, 16 * MIB);
+        assert_eq!(sample.total, 1000 * MIB);
+        assert!(sample.critical);
+    }
+
+    #[test]
     fn high_utilization_is_not_oom() {
         let mut pressure = Pressure::default();
         for _ in 0..10 {
-            assert!(!pressure.sample(Some(Memory {
+            assert!(!pressure.sample(Some(MemorySource {
                 total: 8000 * MIB,
                 available: 1000 * MIB,
                 stalled: true
-            })));
+            }.sample())));
         }
         assert!(!clearly_exceeds(7000 * MIB, 8000 * MIB));
         assert!(!clearly_exceeds(8500 * MIB, 8000 * MIB));
@@ -49,21 +85,22 @@ mod tests {
     }
     #[test]
     fn requires_sustained_pressure_and_resets_on_unknown() {
-        let critical = Some(Memory {
+        let source = MemorySource {
             total: 8000 * MIB,
             available: 32 * MIB,
             stalled: true,
-        });
+        };
+        let critical = Some(MemorySource { ..source }.sample());
         let mut pressure = Pressure::default();
         assert!(!pressure.sample(critical));
         assert!(!pressure.sample(None));
         assert!(!pressure.sample(critical));
         assert!(!pressure.sample(critical));
         assert!(pressure.sample(critical));
-        assert!(!pressure.sample(Some(Memory {
+        assert!(!pressure.sample(Some(MemorySource {
             stalled: false,
-            ..critical.unwrap()
-        })));
+            ..source
+        }.sample())));
     }
 }
 
@@ -93,13 +130,13 @@ pub fn memory() -> Option<Memory> {
             })
             .map(|v| v.saturating_mul(1024))
     };
-    let mut result = Memory {
+    let mut result = MemorySource {
         total: field("MemTotal:")?,
         available: field("MemAvailable:")?,
         stalled: std::fs::read_to_string("/proc/pressure/memory")
             .ok()
             .is_some_and(|v| psi_stalled(&v)),
-    };
+    }.sample();
     // The process may be constrained even when the host has plenty of RAM.
     // Inspect ancestors too: limits are hierarchical in cgroup v2.
     if let Ok(groups) = std::fs::read_to_string("/proc/self/cgroup") {
@@ -115,14 +152,13 @@ pub fn memory() -> Option<Memory> {
                         .ok()
                 };
                 if let (Some(limit), Some(used)) = (read("memory.max"), read("memory.current")) {
-                    result.total = result.total.min(limit);
-                    let available = limit.saturating_sub(used);
-                    if available < result.available {
-                        result.available = available;
-                        result.stalled = std::fs::read_to_string(path.join("memory.pressure"))
+                    result = merge(result, MemorySource {
+                        total: limit,
+                        available: limit.saturating_sub(used),
+                        stalled: std::fs::read_to_string(path.join("memory.pressure"))
                             .ok()
-                            .is_some_and(|v| psi_stalled(&v));
-                    }
+                            .is_some_and(|v| psi_stalled(&v)),
+                    });
                 }
                 if path == root || !path.pop() {
                     break;

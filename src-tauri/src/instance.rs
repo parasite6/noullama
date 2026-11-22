@@ -23,7 +23,12 @@ pub fn acquire(data_dir: &Path) -> Result<InstanceGuard, Box<dyn std::error::Err
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => {
                 #[cfg(target_os = "linux")]
-                linux::clean_owned_runtimes(&root)?;
+                {
+                    linux::clean_owned_runtimes(&root)?;
+                    // Leftover key files only belong to runtimes that are gone,
+                    // so failing to remove one must not stop startup.
+                    linux::clean_runtime_keys(&root);
+                }
                 return Ok(InstanceGuard { _lock: file });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -263,9 +268,37 @@ mod linux {
         Ok(())
     }
 
+    pub fn clean_runtime_keys(root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let id = name.to_str().and_then(|name| name.strip_prefix("runtime-")?.strip_suffix(".key"));
+            if id.is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()) && entry.file_type().is_ok_and(|t| t.is_file()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn startup_removes_only_regular_runtime_key_files() {
+            let root = std::env::temp_dir().join(format!("noullama-keys-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let stale = root.join(format!("runtime-{}.key", uuid::Uuid::new_v4()));
+            let unrelated = root.join("runtime-not-a-uuid.key");
+            let link = root.join(format!("runtime-{}.key", uuid::Uuid::new_v4()));
+            std::fs::write(&stale, "stale").unwrap();
+            std::fs::write(&unrelated, "keep").unwrap();
+            std::os::unix::fs::symlink(&unrelated, &link).unwrap();
+            let _guard = acquire(&root).unwrap();
+            assert!(!stale.exists());
+            assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep");
+            assert!(std::fs::symlink_metadata(link).unwrap().is_symlink());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
         #[test]
         fn only_runtime_with_both_unique_ownership_markers_is_eligible() {
             let root =

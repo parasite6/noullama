@@ -26,6 +26,7 @@ pub struct Entry {
 pub struct History {
     entries: VecDeque<Entry>,
     next_seq: u64,
+    generation: u64,
     /// Decisions flushed to make the most recent request fit.
     pub last_flushed: usize,
 }
@@ -35,6 +36,7 @@ impl History {
         self.entries.len()
     }
     pub fn clear(&mut self) {
+        self.generation += 1;
         self.entries.clear();
         self.last_flushed = 0;
     }
@@ -116,12 +118,16 @@ pub enum Failure {
 /// Runs one decision, adding earlier decisions when this instance's Keep
 /// context is on.
 pub async fn infer(state: &AppState, instance: &Arc<Instance>, payload: Value) -> Result<Value, String> {
+    let history = instance.context.lock().await;
     if !instance.keeps_context() {
+        drop(history);
         return state.infer_once(instance, payload, false).await.map_err(|failure| match failure {
             Failure::ContextFull(message) | Failure::Other(message) => message,
         });
     }
-    let earlier: Vec<Entry> = instance.context.lock().await.entries.iter().cloned().collect();
+    let generation = history.generation;
+    let earlier: Vec<Entry> = history.entries.iter().cloned().collect();
+    drop(history);
     // Leave out the oldest decision each time the request does not fit. The
     // history only loses them once a request succeeds, so a state too long to
     // fit even alone fails without wiping the kept decisions.
@@ -133,8 +139,7 @@ pub async fn infer(state: &AppState, instance: &Arc<Instance>, payload: Value) -
         match state.infer_once(instance, request, !carried.is_empty()).await {
             Ok(result) => {
                 let mut history = instance.context.lock().await;
-                // Turned off (and cleared) while this request ran: keep nothing.
-                if !instance.keeps_context() {
+                if history.generation != generation {
                     return Ok(result);
                 }
                 history.last_flushed = match skipped.checked_sub(1).map(|last| earlier[last].seq) {

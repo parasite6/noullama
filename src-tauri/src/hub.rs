@@ -431,10 +431,7 @@ pub async fn hf_session(state: tauri::State<'_, AppState>) -> Result<Value, Stri
         None
     };
     let hf = state.settings.lock().await.hf_path.clone();
-    let cli = tokio::time::timeout(
-        Duration::from_secs(8),
-        Command::new(hf).arg("--version").output(),
-    )
+    let cli = crate::runtime::probe_output(Command::new(hf).arg("--version"), Duration::from_secs(8))
     .await
     .ok()
     .and_then(Result::ok)

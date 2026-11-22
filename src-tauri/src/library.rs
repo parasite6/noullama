@@ -346,8 +346,20 @@ fn backup(data_dir: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+const NOT_REGULAR: &str = "models.yml is not a regular file.";
+const CHECKSUM_CONFLICT: &str = "models.yml changed on disk while a sha256 was being recorded. It will be recorded again.";
+
+fn models_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let meta = if meta.is_symlink() { std::fs::metadata(path)? } else { meta };
+    if !meta.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, NOT_REGULAR));
+    }
+    Ok(meta)
+}
+
 fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = models_metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
 }
 
@@ -367,12 +379,26 @@ fn write(data_dir: &Path, library: &mut Library, entries: Vec<Entry>, change: Ch
     let path = file_path(data_dir);
     let text = render(&entries)?;
     if change == Change::Edit {
-        if let Ok(current) = std::fs::read_to_string(&path) {
-            backup(data_dir, &current)?;
+        match models_metadata(&path) {
+            Ok(_) => {
+                if let Ok(current) = std::fs::read_to_string(&path) {
+                    backup(data_dir, &current)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                library.stamp = None;
+                library.error = Some(NOT_REGULAR.into());
+                return Err(NOT_REGULAR.into());
+            }
+            Err(_) => {}
         }
     }
     let temp = data_dir.join("models.yml.tmp");
     std::fs::write(&temp, &text).map_err(|e| format!("Cannot write models.yml: {e}"))?;
+    if change != Change::Edit && stamp(&path) != library.stamp {
+        let _ = std::fs::remove_file(&temp);
+        return Err(CHECKSUM_CONFLICT.into());
+    }
     std::fs::rename(&temp, &path).map_err(|e| format!("Cannot write models.yml: {e}"))?;
     library.entries = entries;
     library.text = text;
@@ -396,8 +422,21 @@ pub async fn refresh(state: &AppState) {
 
 fn refresh_locked(data_dir: &Path, library: &mut Library, legacy: &BTreeMap<String, Vec<String>>) {
     let path = file_path(data_dir);
-    let Some(current) = stamp(&path) else {
-        if path.exists() {
+    let meta = match models_metadata(&path) {
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            library.error = Some(if error.kind() == std::io::ErrorKind::InvalidData {
+                library.stamp = None;
+                NOT_REGULAR.into()
+            } else {
+                "models.yml cannot be read.".into()
+            });
+            return;
+        }
+    };
+    let Some(current) = meta.as_ref().and_then(|meta| Some((meta.modified().ok()?, meta.len()))) else {
+        if meta.is_some() {
             library.error = Some("models.yml cannot be read.".into());
             return;
         }
@@ -616,6 +655,23 @@ fn hash_file(path: &str) -> std::io::Result<String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+struct Hashing<'a> {
+    paths: &'a std::sync::Mutex<BTreeMap<String, usize>>,
+    path: &'a str,
+}
+
+impl Drop for Hashing<'_> {
+    fn drop(&mut self) {
+        let mut paths = self.paths.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = paths.get_mut(self.path) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                paths.remove(self.path);
+            }
+        }
+    }
+}
+
 /// The file's sha256: from the cache while its size and modified time are
 /// unchanged, otherwise read in full.
 pub async fn current_hash(state: &AppState, path: &str, force: bool) -> Result<String, String> {
@@ -628,10 +684,11 @@ pub async fn current_hash(state: &AppState, path: &str, force: bool) -> Result<S
             }
         }
     }
-    state.hashing.lock().await.insert(path.to_owned());
+    *state.hashing.lock().unwrap_or_else(|error| error.into_inner()).entry(path.to_owned()).or_default() += 1;
+    let hashing = Hashing { paths: &state.hashing, path };
     let owned = path.to_owned();
     let result = tokio::task::spawn_blocking(move || hash_file(&owned)).await;
-    state.hashing.lock().await.remove(path);
+    drop(hashing);
     let sha256 = result.map_err(|e| e.to_string())?.map_err(|e| format!("Cannot read {path}: {e}"))?;
     let _guard = state.hash_cache_lock.lock().await;
     let mut cache = read_cache(&data_dir);
@@ -656,19 +713,24 @@ pub fn hash_missing(state: AppState) {
             }
             let next = {
                 let library = state.library.lock().await;
-                let busy = state.hashing.lock().await.clone();
+                let busy = state.hashing.lock().unwrap_or_else(|error| error.into_inner()).clone();
                 library.entries.iter().find_map(|e| {
                     SLOTS.into_iter().find_map(|slot| {
                         let file = e.file(slot);
-                        (e.sum(slot).is_empty() && !file.is_empty() && !busy.contains(file) && Path::new(file).is_file()).then(|| (e.path.clone(), slot, file.to_owned()))
+                        (e.sum(slot).is_empty() && !file.is_empty() && !busy.contains_key(file) && Path::new(file).is_file()).then(|| (e.path.clone(), slot, file.to_owned()))
                     })
                 })
             };
             let Some((model, slot, file)) = next else { break };
             match current_hash(&state, &file, false).await {
                 Ok(sha256) => {
-                    if set_sha256(&state, &model, slot, &file, &sha256).await.is_err() {
-                        break;
+                    match set_sha256(&state, &model, slot, &file, &sha256).await {
+                        Ok(()) => {}
+                        Err(error) if error == CHECKSUM_CONFLICT => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            refresh(&state).await;
+                        }
+                        Err(_) => break,
                     }
                 }
                 Err(error) => {
@@ -738,7 +800,7 @@ pub async fn verify(state: &AppState, model: &str, slot: Slot, check: Check, log
 pub async fn snapshot(state: &AppState) -> Value {
     refresh(state).await;
     let library = state.library.lock().await;
-    let hashing = state.hashing.lock().await.clone();
+    let hashing = state.hashing.lock().unwrap_or_else(|error| error.into_inner()).clone();
     let mismatches = state.mismatches.lock().await.clone();
     let entries: Vec<Value> = library
         .entries
@@ -750,7 +812,7 @@ pub async fn snapshot(state: &AppState) -> Value {
                 .map(|slot| {
                     let file = e.file(slot);
                     let mismatch = mismatches.get(file).filter(|actual| !file.is_empty() && actual.as_str() != e.sum(slot));
-                    (slot.key().to_owned(), json!({"missing": !file.is_empty() && !Path::new(file).is_file(), "hashing": !file.is_empty() && hashing.contains(file), "mismatch": mismatch}))
+                    (slot.key().to_owned(), json!({"missing": !file.is_empty() && !Path::new(file).is_file(), "hashing": !file.is_empty() && hashing.contains_key(file), "mismatch": mismatch}))
                 })
                 .collect();
             let mut value = serde_json::to_value(e).unwrap_or_default();
@@ -798,6 +860,9 @@ pub async fn reload_library(state: tauri::State<'_, AppState>) -> Result<(), Str
 #[tauri::command]
 pub async fn open_models_file(state: tauri::State<'_, AppState>) -> Result<(), String> {
     refresh(state.inner()).await;
+    if state.library.lock().await.error.as_deref() == Some(NOT_REGULAR) {
+        return Err(NOT_REGULAR.into());
+    }
     tauri_plugin_opener::open_path(file_path(&state.data_dir), None::<&str>).map_err(|e| format!("Cannot open models.yml: {e}"))
 }
 
@@ -958,6 +1023,73 @@ mod tests {
         let backups = std::fs::read_dir(backups_dir(&dir)).unwrap().count();
         assert!(backups >= 1, "the version before the edit was backed up");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checksum_write_preserves_an_external_edit_after_refresh() {
+        let (state, base) = temp_state().await;
+        refresh(&state).await;
+        let path = file_path(&base);
+        let external = "# externally edited\n";
+        std::fs::write(&path, external).unwrap();
+        let mut library = state.library.lock().await;
+        let result = write(&base, &mut library, Vec::new(), Change::Checksums);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), external);
+        assert_eq!(result.unwrap_err(), "models.yml changed on disk while a sha256 was being recorded. It will be recorded again.");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn library_rejects_non_regular_models_file() {
+        let (state, base) = temp_state().await;
+        let path = file_path(&base);
+        refresh(&state).await;
+        let regular = base.join("regular.yml");
+        std::fs::rename(&path, &regular).unwrap();
+        let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(stamp(&path).is_none());
+        refresh(&state).await;
+        let mut library = state.library.lock().await;
+        assert_eq!(library.error.as_deref(), Some("models.yml is not a regular file."));
+        assert_eq!(write(&base, &mut library, Vec::new(), Change::Edit).unwrap_err(), "models.yml is not a regular file.");
+        drop(library);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(regular, &path).unwrap();
+        refresh(&state).await;
+        assert!(state.library.lock().await.error.is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn dropping_hash_future_clears_its_marker() {
+        use std::future::Future;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build().unwrap();
+        runtime.block_on(async {
+            let (state, base) = temp_state().await;
+            let path = base.join("model.gguf");
+            std::fs::write(&path, b"model").unwrap();
+            let path = path.to_str().unwrap();
+            let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+            let worker = tokio::task::spawn_blocking(move || { let _ = blocked.blocking_recv(); });
+            let mut first = Box::pin(current_hash(&state, path, true));
+            let mut second = Box::pin(current_hash(&state, path, true));
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx).is_pending())).await);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(second.as_mut().poll(cx).is_pending())).await);
+            assert!(state.hashing.lock().unwrap().contains_key(path));
+            drop(first);
+            assert!(state.hashing.lock().unwrap().contains_key(path));
+            drop(second);
+            let marker_remains = state.hashing.lock().unwrap().contains_key(path);
+            release.send(()).unwrap();
+            worker.await.unwrap();
+            std::fs::remove_dir_all(base).unwrap();
+            assert!(!marker_remains);
+        });
     }
 
     async fn temp_state() -> (AppState, PathBuf) {

@@ -115,7 +115,7 @@ pub struct AppState {
     pub presets_lock: Arc<Mutex<()>>,
     // models.yml, and the sha256 work around it.
     pub library: Arc<Mutex<crate::library::Library>>,
-    pub hashing: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    pub hashing: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
     // Model paths whose file no longer matches its recorded sha256, with the new sum.
     pub mismatches: Arc<Mutex<BTreeMap<String, String>>>,
     pub hash_worker: Arc<AtomicBool>,
@@ -318,7 +318,7 @@ pub fn file_stem(path: &str) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     match name.len().checked_sub(5) {
-        Some(end) if name[end..].eq_ignore_ascii_case(".gguf") => name[..end].to_owned(),
+        Some(end) if name.get(end..).is_some_and(|suffix| suffix.eq_ignore_ascii_case(".gguf")) => name[..end].to_owned(),
         _ => name,
     }
 }
@@ -1090,7 +1090,7 @@ pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Value, String
 /// stopped after it was ready. Runs from the UI snapshot and from the
 /// supervisor tick, so a crash is noticed while the window is hidden too.
 async fn reap_exited(state: &AppState) -> Result<(), String> {
-    let _guard = state.lifecycle.lock().await;
+    let Ok(_guard) = state.lifecycle.try_lock() else { return Ok(()) };
     reap_exited_locked(state).await
 }
 
@@ -1333,6 +1333,13 @@ pub async fn update_settings(state: &AppState, change: impl FnOnce(&mut Settings
     Ok(())
 }
 
+pub(crate) async fn probe_output(
+    command: &mut Command,
+    limit: Duration,
+) -> Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(limit, command.kill_on_drop(true).output()).await
+}
+
 #[tauri::command]
 pub async fn probe_runtime(path: String, library_path: String) -> Result<String, String> {
     let settings = Settings {
@@ -1340,10 +1347,7 @@ pub async fn probe_runtime(path: String, library_path: String) -> Result<String,
         library_path,
         ..Settings::default()
     };
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        runtime_command(&settings).arg("--version").output(),
-    )
+    let output = probe_output(runtime_command(&settings).arg("--version"), Duration::from_secs(10))
     .await
     .map_err(|_| "Runtime version check timed out")?
     .map_err(|e| format!("Cannot run llama-server: {e}"))?;
@@ -1355,10 +1359,7 @@ pub async fn probe_runtime(path: String, library_path: String) -> Result<String,
     if !output.status.success() {
         return Err(text);
     }
-    let devices = tokio::time::timeout(
-        Duration::from_secs(15),
-        runtime_command(&settings).arg("--list-devices").output(),
-    )
+    let devices = probe_output(runtime_command(&settings).arg("--list-devices"), Duration::from_secs(15))
     .await
     .map_err(|_| "Device detection timed out")?
     .map_err(|e| e.to_string())?;
@@ -1419,7 +1420,7 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
         }
     }
     let loaded = state.instances.lock().await.clone();
-    if let Some(reason) = load_memory_risk(&settings, 0, 0).await {
+    if let Some(reason) = load_memory_risk(&settings, loaded.iter(), (0, 0)).await {
         return Err(format!("OOM prevention: {reason} Eject another model, reduce context or GPU offload, or enable Allow force fit in Settings."));
     }
     let port = free_runtime_port(state, &settings, &loaded)?;
@@ -1664,7 +1665,9 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
         }
         let mut live_settings = settings.clone();
         live_settings.allow_force_fit = state.settings.lock().await.allow_force_fit;
-        if let Some(reason) = load_memory_risk(&live_settings, 0, 0).await {
+        let loaded = state.instances.lock().await.clone();
+        let others = loaded.iter().filter(|other| other.id != instance.id);
+        if let Some(reason) = load_memory_risk(&live_settings, others, (0, 0)).await {
             return Err(format!("OOM prevention: {reason}"));
         }
         drop(reservation);
@@ -2052,15 +2055,32 @@ pub async fn set_memory_pref(state: &AppState, key: &str, value: bool) -> Result
 
 /// `freed_vram` and `freed_ram`: memory a loaded instance being replaced
 /// holds now, counted as available because it is unloaded before the load.
-async fn load_memory_risk(settings: &Settings, freed_vram: u64, freed_ram: u64) -> Option<String> {
+async fn load_memory_risk<'a>(
+    settings: &Settings,
+    loaded: impl Iterator<Item = &'a Arc<Instance>>,
+    freed: (u64, u64),
+) -> Option<String> {
+    load_memory_risk_with_ram(settings, loaded, freed, || crate::oom::memory().map(|m| m.available)).await
+}
+
+async fn load_memory_risk_with_ram<'a>(
+    settings: &Settings,
+    loaded: impl Iterator<Item = &'a Arc<Instance>>,
+    (freed_vram, freed_ram): (u64, u64),
+    available_ram: fn() -> Option<u64>,
+) -> Option<String> {
     if settings.allow_force_fit { return None; }
     let required = crate::hardware::estimate_bytes(&settings.model_path, &instance_extras(settings), settings.context_size)?;
     let gpu_layers = settings.gpu_layers;
+    let reserved = loaded
+        .filter(|other| !other.is_ready() && (other.settings.gpu_layers == 0) == (gpu_layers == 0))
+        .filter_map(|other| crate::hardware::estimate_bytes(other.path(), &instance_extras(&other.settings), other.settings.context_size))
+        .fold(0u64, u64::saturating_add);
     tokio::task::spawn_blocking(move || {
         if gpu_layers != 0 {
             let gpu = crate::hardware::memory_use(&[]);
             if let (Some(total), Some(used)) = (gpu.total_bytes, gpu.used_bytes) {
-                let available = total.saturating_sub(used).saturating_add(freed_vram).min(total);
+                let available = total.saturating_sub(used).saturating_add(freed_vram).min(total).saturating_sub(reserved);
                 if (gpu_layers == -1 || gpu_layers >= 99) && crate::oom::clearly_exceeds(required, available) {
                     return Some(format!("Estimated GPU allocation {:.1} GiB clearly exceeds {:.1} GiB available VRAM.", required as f64 / 1073741824., available as f64 / 1073741824.));
                 }
@@ -2069,8 +2089,8 @@ async fn load_memory_risk(settings: &Settings, freed_vram: u64, freed_ram: u64) 
         // Partial offload cannot be divided accurately from file size alone.
         // Do not pretend the entire file must be resident in system RAM.
         if gpu_layers == 0 {
-            if let Some(m) = crate::oom::memory() {
-                let available = m.available.saturating_add(freed_ram);
+            if let Some(available) = available_ram() {
+                let available = available.saturating_add(freed_ram).saturating_sub(reserved);
                 if crate::oom::clearly_exceeds(required, available) {
                     return Some(format!("Estimated allocation {:.1} GiB clearly exceeds {:.1} GiB available RAM.", required as f64 / 1073741824., available as f64 / 1073741824.));
                 }
@@ -2091,7 +2111,7 @@ pub async fn crowded_load_warning(replace: Option<String>, state: tauri::State<'
     let others: Vec<_> = loaded.iter().filter(|i| Some(i.id.as_str()) != replace.as_deref()).collect();
     if others.is_empty() { return Ok(None); }
     let (mut freed_vram, mut freed_ram) = (0, 0);
-    if let Some(instance) = replaced {
+    if let Some(instance) = replaced.filter(|instance| instance.is_ready()) {
         let pid = instance.child.lock().await.as_ref().and_then(Child::id);
         let estimate = crate::hardware::estimate_bytes(instance.path(), &instance_extras(&instance.settings), instance.settings.context_size).unwrap_or(0);
         if instance.settings.gpu_layers != 0 {
@@ -2110,7 +2130,7 @@ pub async fn crowded_load_warning(replace: Option<String>, state: tauri::State<'
         let (name, _) = state.api_names(instance.path()).await;
         names.push(json!({"id": instance.id, "name": format!("{name}{}", instance.suffix())}));
     }
-    Ok(load_memory_risk(&settings, freed_vram, freed_ram).await.map(|reason| json!({ "reason": reason, "models": names })))
+    Ok(load_memory_risk(&settings, others.into_iter(), (freed_vram, freed_ram)).await.map(|reason| json!({ "reason": reason, "models": names })))
 }
 
 /// Supervises loaded models once a second: notices runtimes that exited and
@@ -2338,6 +2358,49 @@ mod tests {
             "Plain."
         );
     }
+    #[tokio::test]
+    async fn loading_cpu_instance_reserves_ram_until_ready() {
+        let base = std::env::temp_dir().join(format!("noullama-admission-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let model = base.join("model.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        let settings = Settings {
+            model_path: model.to_str().unwrap().into(),
+            gpu_layers: 0,
+            context_size: 65_536,
+            ..Settings::default()
+        };
+        *state.settings.lock().await = settings.clone();
+        let available_ram = || Some(2 * 1024 * 1024 * 1024);
+        let _guard = state.lifecycle.lock().await;
+        assert!(load_memory_risk_with_ram(&settings, std::iter::empty(), (0, 0), available_ram).await.is_none());
+        let first = insert_test_instance(&state, &settings.model_path, false).await;
+        let loaded = state.instances.lock().await.clone();
+        assert!(load_memory_risk_with_ram(&settings, loaded.iter(), (0, 0), available_ram).await.is_some());
+        let force = Settings { allow_force_fit: true, ..settings.clone() };
+        assert!(load_memory_risk_with_ram(&force, loaded.iter(), (0, 0), || panic!("force fit must skip RAM sampling")).await.is_none());
+        first.ready.store(true, Ordering::SeqCst);
+        assert!(load_memory_risk_with_ram(&settings, loaded.iter(), (0, 0), available_ram).await.is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn file_stem_handles_utf8_and_case_insensitive_suffixes() {
+        for (path, stem) in [("éabcd", "éabcd"), ("x.GGUF", "x"), ("é.gguf", "é"), (".gguf", "")] {
+            assert_eq!(file_stem(path), stem);
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_while_lifecycle_is_locked() {
+        let base = std::env::temp_dir().join(format!("noullama-snapshot-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let _guard = state.lifecycle.lock().await;
+        tokio::time::timeout(Duration::from_secs(2), state_snapshot(&state))
+            .await.unwrap().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn supervisor_wakes_on_load_and_reaps_a_crash_without_any_snapshot() {
@@ -2435,6 +2498,23 @@ mod tests {
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_probe_kills_the_child() {
+        let base = std::env::temp_dir().join(format!("noullama-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let script = fake_runtime(&base, "slow-probe", "#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nexec sleep 5\n");
+        assert!(probe_output(&mut Command::new(script), Duration::from_millis(500)).await.is_err());
+        let pid: u32 = std::fs::read_to_string(base.join("slow-probe.pid")).unwrap().parse().unwrap();
+        let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while proc_dir.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("timed-out probe child still exists");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]
@@ -2883,7 +2963,7 @@ mod tests {
         let settings = loaded.settings.lock().await;
         assert!(settings.allow_force_fit && settings.hide_crowded_load_warning);
         drop(settings);
-        assert!(load_memory_risk(&loaded.settings.lock().await.clone(), 0, 0).await.is_none());
+        assert!(load_memory_risk(&loaded.settings.lock().await.clone(), std::iter::empty(), (0, 0)).await.is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 
