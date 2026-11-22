@@ -346,3 +346,7 @@ Noullama is in early beta:
 - The OpenAI-compatible endpoint is a decision adapter, not a general chat API.
 
 [Report a bug](https://github.com/parasite6/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/parasite6/noullama/issues/new?template=feature_request.md).
+
+## License
+
+Noullama is free software, licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`). Copyright (C) 2026 parasite6.
