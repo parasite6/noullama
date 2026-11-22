@@ -245,7 +245,21 @@ function App() {
   useEffect(() => { if (desktop && tab !== 'hub') invoke<{ models: typeof localModels; warnings: string[] }>('local_models').then(scan => { setLocalModels(scan.models); setScanWarnings(scan.warnings); }).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab, finishedDownloads, scanTick, snapshot?.download_dir, settings.model_path]);
   // "Wait up to (ms)" saves on its own, once typing pauses, so half-typed
   // numbers are not sent. The draft shows until the saved value comes back.
-  const whenBusy = snapshot?.settings.any_available_when_busy ?? 'reject';
+  // Settings-tab choices show their new value at once while their command
+  // saves, instead of dimming and snapping over when the snapshot arrives.
+  // A failed save drops the override, so the saved value shows again.
+  const [settingOverride, setSettingOverride] = useState<Partial<Settings>>({});
+  const shownSetting = <K extends keyof Settings>(key: K, fallback: Settings[K]): Settings[K] =>
+    (key in settingOverride ? settingOverride[key] : snapshot?.settings[key] ?? fallback) as Settings[K];
+  async function changeSetting<K extends keyof Settings>(key: K, value: Settings[K], command: string, args: Record<string, unknown>) {
+    if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
+    setSettingOverride(current => ({ ...current, [key]: value }));
+    try { await invoke(command, args); await refresh(); }
+    catch (e) { setNotice({ text: errorText(e), error: true }); }
+    // A later change of the same setting owns the override from then on.
+    finally { setSettingOverride(current => { if (current[key] !== value) return current; const next = { ...current }; delete next[key]; return next; }); }
+  }
+  const whenBusy = shownSetting('any_available_when_busy', 'reject');
   const savedWait = snapshot?.settings.any_available_wait_ms ?? 120000;
   const [waitDraft, setWaitDraft] = useState<number | null>(null);
   useEffect(() => {
@@ -354,7 +368,6 @@ function App() {
     if (!desktop) throw new Error('Launch the desktop app with npm run desktop to use the local backend.');
     await invoke(command, args); await refresh();
   }
-  async function setShaCheck(mode: string) { await action('sha-check', async () => { await invoke('set_sha256_check', { mode }); }); }
   async function eject(id: string) { await action(`eject:${id}`, async () => { await invoke('unload_model', { id }); }); }
   async function dismissLoadError(id: string) { if (desktop) { await invoke('dismiss_load_error', { id }).catch(() => {}); await refresh().catch(() => {}); } }
   async function saveInstanceAliases(id: string, aliases: string[]) {
@@ -632,19 +645,19 @@ function App() {
           onRecordSha={(path, slot) => libraryCommand('record_sha256', { path, slot })} onBrowse={() => invoke<string | null>('pick_model_file')} onError={copyError}/>}
         {tab === 'settings' && <>
           <section className="panel settings-panel"><div className="panel-heading"><span><MemoryStick size={16}/> Memory protection</span></div><div className="settings-body">
-            <div className="field"><div className="field-row"><span>Allow force fit</span><Toggle label={snapshot?.settings.allow_force_fit ? 'On' : 'Off'} ariaLabel="Allow force fit" checked={snapshot?.settings.allow_force_fit ?? false} disabled={!desktop || isBusy('memory-pref')} onChange={value => void action('memory-pref', async () => { await invoke('set_memory_preference', { key: 'allow_force_fit', value }); })}/></div><small>Disables OOM load prevention and automatic recovery from sustained critical memory pressure. The operating system or runtime may still stop a model if memory runs out.</small></div>
+            <div className="field"><div className="field-row"><span>Allow force fit</span><Toggle label={shownSetting('allow_force_fit', false) ? 'On' : 'Off'} ariaLabel="Allow force fit" checked={shownSetting('allow_force_fit', false)} disabled={!desktop} onChange={value => void changeSetting('allow_force_fit', value, 'set_memory_preference', { key: 'allow_force_fit', value })}/></div><small>Disables OOM load prevention and automatic recovery from sustained critical memory pressure. The operating system or runtime may still stop a model if memory runs out.</small></div>
             {snapshot?.settings.hide_crowded_load_warning && <button className="text-button" disabled={isBusy('memory-pref')} onClick={() => void action('memory-pref', async () => { await invoke('set_memory_preference', { key: 'hide_crowded_load_warning', value: false }); })}>Show crowded-load warning again</button>}
           </div></section>
           <section className="panel settings-panel"><div className="panel-heading"><span><Route size={16}/> Local API routing</span></div><div className="settings-body">
-            <div className="field"><div className="field-row"><span>Fall through to another instance</span><Toggle label={snapshot?.settings.fall_through_to_other_instances ? 'On' : 'Off'} ariaLabel="Fall through to another instance" checked={snapshot?.settings.fall_through_to_other_instances ?? false} disabled={!desktop || isBusy('fall-through')} onChange={on => void action('fall-through', async () => { await invoke('set_fall_through', { on }); })}/></div><small>When instance 1 of a model file is not loaded but another instance is, requests for its plain names (without a suffix) go to the loaded instance with the lowest number. Off, they get 503. Suffixed names never fall through.</small></div>
-            <div className="field"><div className="field-row"><span>When every instance is busy</span><div className="segmented" role="group" aria-label="When every instance is busy">{WHEN_BUSY.map(option => <button key={option.value} type="button" className={(snapshot?.settings.any_available_when_busy ?? 'reject') === option.value ? 'on' : ''} aria-pressed={(snapshot?.settings.any_available_when_busy ?? 'reject') === option.value} disabled={!desktop || isBusy('when-busy')} onClick={() => void action('when-busy', async () => { await invoke('set_any_available_when_busy', { mode: option.value }); })}>{option.label}</button>)}</div></div>
+            <div className="field"><div className="field-row"><span>Fall through to another instance</span><Toggle label={shownSetting('fall_through_to_other_instances', false) ? 'On' : 'Off'} ariaLabel="Fall through to another instance" checked={shownSetting('fall_through_to_other_instances', false)} disabled={!desktop} onChange={on => void changeSetting('fall_through_to_other_instances', on, 'set_fall_through', { on })}/></div><small>When instance 1 of a model file is not loaded but another instance is, requests for its plain names (without a suffix) go to the loaded instance with the lowest number. Off, they get 503. Suffixed names never fall through.</small></div>
+            <div className="field"><div className="field-row"><span>When every instance is busy</span><div className="segmented" role="group" aria-label="When every instance is busy">{WHEN_BUSY.map(option => <button key={option.value} type="button" className={whenBusy === option.value ? 'on' : ''} aria-pressed={whenBusy === option.value} disabled={!desktop} onClick={() => { if (whenBusy !== option.value) void changeSetting('any_available_when_busy', option.value, 'set_any_available_when_busy', { mode: option.value }); }}>{option.label}</button>)}</div></div>
               {whenBusy === 'wait' && <div className="field-row"><span>Wait up to (ms)</span><NumberField value={waitDraft ?? savedWait} min={WAIT_MS.min} max={WAIT_MS.max} step={WAIT_MS.step} onChange={value => setWaitDraft(Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.round(value))))}/></div>}
               <small>{WHEN_BUSY.find(option => option.value === whenBusy)?.detail(waitDraft ?? savedWait)}</small>
               <small>Applies to requests that send "any-available" as the model. They go to a ready instance of any model that is not running a request, the one idle longest first.</small></div>
           </div></section>
           <section className="panel settings-panel"><div className="panel-heading"><span><ShieldCheck size={16}/> Model file checks</span></div><div className="settings-body">
-            <div className="field"><div className="field-row"><span>sha256 before loading</span><div className="segmented" role="group" aria-label="sha256 check">{SHA_CHECKS.map(option => <button key={option.value} type="button" className={(snapshot?.settings.sha256_check ?? 'once') === option.value ? 'on' : ''} aria-pressed={(snapshot?.settings.sha256_check ?? 'once') === option.value} disabled={!desktop || isBusy('sha-check')} onClick={() => void setShaCheck(option.value)}>{option.label}</button>)}</div></div>
-              <small>{SHA_CHECKS.find(option => option.value === (snapshot?.settings.sha256_check ?? 'once'))?.detail}</small>
+            <div className="field"><div className="field-row"><span>sha256 before loading</span><div className="segmented" role="group" aria-label="sha256 check">{SHA_CHECKS.map(option => <button key={option.value} type="button" className={shownSetting('sha256_check', 'once') === option.value ? 'on' : ''} aria-pressed={shownSetting('sha256_check', 'once') === option.value} disabled={!desktop} onClick={() => { if (shownSetting('sha256_check', 'once') !== option.value) void changeSetting('sha256_check', option.value, 'set_sha256_check', { mode: option.value }); }}>{option.label}</button>)}</div></div>
+              <small>{SHA_CHECKS.find(option => option.value === shownSetting('sha256_check', 'once'))?.detail}</small>
               <small>Each model's sha256 is kept in models.yml. It guards against loading a file that was replaced, truncated or swapped by mistake; it is not a security boundary.</small></div>
           </div></section>
           <section className="panel settings-panel"><div className="panel-heading"><span><FileJson size={16}/> Models file</span></div><div className="settings-body">

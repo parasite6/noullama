@@ -36,15 +36,16 @@ function SuffixEditor({ instance, disabled, onSave, onError }: { instance: CardI
   useEffect(() => { setDraft(instance.suffix); }, [instance.suffix]);
   if (instance.slot <= 1) return <div className="instance-suffix"><span className="instance-names-label">Instance suffix</span><small>None. Instance 1 answers to the plain names.</small></div>;
   async function save(value: string) {
+    if (saving) return;
     setSaving(true);
     try { await onSave(value); } catch (e) { onError(errorText(e)); setDraft(instance.suffix); } finally { setSaving(false); }
   }
   const changed = draft.trim() !== instance.suffix;
   return <form className="instance-suffix" onSubmit={event => { event.preventDefault(); if (changed) void save(draft); }}>
     <span className="instance-names-label">Instance suffix</span>
-    <input aria-label={`Suffix for instance ${instance.slot} of ${instance.name}`} placeholder={instance.default_suffix} maxLength={64} value={draft} disabled={disabled || saving} onChange={event => setDraft(event.target.value)}/>
-    <button className="secondary compact" disabled={disabled || saving || !changed}><Check size={13}/>Save suffix</button>
-    {instance.suffix !== instance.default_suffix && <button type="button" className="text-button" disabled={disabled || saving} title={`Go back to ${instance.default_suffix}`} onClick={() => void save(instance.default_suffix)}><RotateCcw size={13}/>Use {instance.default_suffix}</button>}
+    <input aria-label={`Suffix for instance ${instance.slot} of ${instance.name}`} placeholder={instance.default_suffix} maxLength={64} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)}/>
+    <button className="secondary compact" disabled={disabled || !changed}><Check size={13}/>Save suffix</button>
+    {instance.suffix !== instance.default_suffix && <button type="button" className="text-button" disabled={disabled} title={`Go back to ${instance.default_suffix}`} onClick={() => void save(instance.default_suffix)}><RotateCcw size={13}/>Use {instance.default_suffix}</button>}
     <small>Added to each of this file's names and aliases. Kept only until this instance is ejected; loading it again starts at {instance.default_suffix}.</small>
   </form>;
 }
@@ -56,15 +57,16 @@ function InstanceAliasEditor({ instance, disabled, onSave, onError }: { instance
   const [saving, setSaving] = useState(false);
   const aliases = instance.instance_aliases;
   async function save(next: string[], clear: boolean) {
+    if (saving) return;
     setSaving(true);
     try { await onSave(next); if (clear) setDraft(''); } catch (e) { onError(errorText(e)); } finally { setSaving(false); }
   }
   return <div className="instance-aliases">
     <span className="instance-names-label">Instance aliases</span>
-    {aliases.length > 0 ? <div className="model-name-list">{aliases.map(alias => <Name key={alias} value={alias} note="This instance only" removeTitle="Remove instance alias" disabled={disabled || saving} onRemove={() => void save(aliases.filter(other => other !== alias), false)} onError={onError}/>)}</div> : <small>None.</small>}
+    {aliases.length > 0 ? <div className="model-name-list">{aliases.map(alias => <Name key={alias} value={alias} note="This instance only" removeTitle="Remove instance alias" disabled={disabled} onRemove={() => void save(aliases.filter(other => other !== alias), false)} onError={onError}/>)}</div> : <small>None.</small>}
     <form className="alias-form" onSubmit={event => { event.preventDefault(); if (draft.trim()) void save([...aliases, draft.trim()], true); }}>
-      <input aria-label={`New instance alias for instance ${instance.slot} of ${instance.name}`} placeholder="Add a name for this instance only, such as billing" maxLength={64} value={draft} disabled={disabled || saving} onChange={event => setDraft(event.target.value)}/>
-      <button className="secondary compact" disabled={disabled || saving || !draft.trim()}><Plus size={13}/>Add instance alias</button>
+      <input aria-label={`New instance alias for instance ${instance.slot} of ${instance.name}`} placeholder="Add a name for this instance only, such as billing" maxLength={64} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)}/>
+      <button className="secondary compact" disabled={disabled || !draft.trim()}><Plus size={13}/>Add instance alias</button>
     </form>
     <small>Exact names that reach only this instance; no suffix is added. Kept only until this instance is ejected or reloaded, and never saved.</small>
   </div>;

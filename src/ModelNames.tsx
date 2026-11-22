@@ -29,6 +29,7 @@ export function ModelAliases({ path, instance, aliases, routes, disabled, onSave
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   async function save(next: string[]) {
+    if (saving) return;
     setSaving(true);
     try { await onSave(path, next); setDraft(''); } catch (e) { onError(errorText(e)); } finally { setSaving(false); }
   }
@@ -41,15 +42,15 @@ export function ModelAliases({ path, instance, aliases, routes, disabled, onSave
     {instance ? <div className="model-name-list">
       {ownRoutes.map(route => <Name key={`${route.kind}:${route.name}`} value={route.name} warn={route.conflict}
         note={route.conflict ? conflictNote(route) : route.fallthrough ? `${plainNote(route)} · falls through` : plainNote(route)}
-        disabled={disabled || saving} onRemove={route.kind === 'alias' && !route.fallthrough ? () => void save(aliases.filter(other => other !== route.base)) : undefined} onError={onError}/>)}
+        disabled={disabled} onRemove={route.kind === 'alias' && !route.fallthrough ? () => void save(aliases.filter(other => other !== route.base)) : undefined} onError={onError}/>)}
     </div> : <div className="model-name-list">
       {mine.map(route => <Name key={`${route.kind}:${route.name}`} value={route.name} note={route.conflict ? 'Shared; rename it in Library' : 'Name'} warn={route.conflict} onError={onError}/>)}
       {!mine.length && <Name value={stemOf(path)} note="Name" onError={onError}/>}
-      {aliases.map(alias => <Name key={alias} value={alias} note="Alias" disabled={disabled || saving} onRemove={() => void save(aliases.filter(other => other !== alias))} onError={onError}/>)}
+      {aliases.map(alias => <Name key={alias} value={alias} note="Alias" disabled={disabled} onRemove={() => void save(aliases.filter(other => other !== alias))} onError={onError}/>)}
     </div>}
     <form className="alias-form" onSubmit={event => { event.preventDefault(); if (draft.trim()) void save([...aliases, draft.trim()]); }}>
       <input aria-label={`New alias for ${stemOf(path)}`} placeholder="Add an alias, such as triage or gpt-4o-mini" maxLength={64} value={draft} onChange={event => setDraft(event.target.value)}/>
-      <button className="secondary compact" disabled={disabled || saving || !draft.trim()}><Plus size={13}/>Add alias</button>
+      <button className="secondary compact" disabled={disabled || !draft.trim()}><Plus size={13}/>Add alias</button>
     </form>
   </div>;
 }
