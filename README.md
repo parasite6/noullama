@@ -7,7 +7,7 @@
 <p align="center"><a href="https://noullama.dev">noullama.dev</a></p>
 <p align="center">A local workbench and API for decision models using llama.cpp</p>
 
-[Quick start](#quick-start) · [What's new in v0.4.1](#whats-new-in-v041) · [Cheat sheet](#cheat-sheet) · [Requirements](#requirements) · [Runtime](#runtime) · [Memory protection](#memory-protection) · [Models and Library](#models-and-library) · [Playground](#playground) · [Images](#images) · [Multi-token prediction](#multi-token-prediction) · [Winnow models](#winnow-models) · [Local API](#local-api) · [Updates](#updates) · [Data and verification](#data-and-verification) · [Current limits](#current-limits)
+[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Requirements](#requirements) · [Runtime](#runtime) · [Memory protection](#memory-protection) · [Models and Library](#models-and-library) · [Playground](#playground) · [Images](#images) · [Multi-token prediction](#multi-token-prediction) · [Winnow models](#winnow-models) · [Local API](#local-api) · [Updates](#updates) · [Data and verification](#data-and-verification) · [Current limits](#current-limits)
 
 ## Quick start
 
@@ -37,16 +37,6 @@ cd noullama
 npm ci
 npm run desktop
 ```
-
-## What's new in v0.4.1
-
-- **Several models at once**, each with its own runtime process, settings, private port, context history, API names and aliases. Eject one without stopping the others, including from the sidebar's loaded-model list.
-- **Library and models.yml** for model names, aliases, Hugging Face accounts, file paths, MTP heads, projectors and sha256 values. Edit in the app or your text editor, with backups and protection against overwriting newer changes.
-- **OOM prevention** with conservative load checks and automatic recovery from sustained critical memory pressure on Linux. **Allow force fit** disables this protection. A separate crowded-load prompt offers to eject another model and can be hidden without disabling protection.
-- **Steadier interactions**: actions no longer dim unrelated controls across the app, unchanged polling results preserve displayed state, and MTP controls stay visible during rescans. Notifications float over the page rather than shifting its contents.
-- **Concurrent downloads**, per-file cancellation, named model routing, and shared **Keep context** controls for the Playground and API.
-- **Runtime download improvements**: remember the chosen backend, select the nightly after installation, and keep the official stable build as a fallback for that backend when available.
-- App-drawn Library suggestions, copy controls, clearer load errors and confirmation before deleting a preset.
 
 ## Cheat sheet
 
