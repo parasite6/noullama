@@ -340,3 +340,4 @@ Noullama is in early beta:
 ## License
 
 Noullama is free software, licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`). Copyright (C) 2026 parasite6.
+Code is AGPL-3.0. The Noullama name and logos are not covered; see TRADEMARK.md.
