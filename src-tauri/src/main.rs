@@ -22,14 +22,9 @@ use std::sync::atomic::Ordering;
 use tauri::Manager;
 
 fn main() {
-    // WebKitGTK's DMA-BUF renderer repaints the whole window when it regains
-    // focus on Wayland with hybrid or NVIDIA graphics, which shows as a flash
-    // on every alt-tab. The shared-memory path draws the same UI without it.
-    // Set before any thread starts; a value the user chose is kept.
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-    }
+    // WebKitGTK keeps its default DMA-BUF renderer. Forcing the shared-memory
+    // path copies every frame through the CPU and makes all animation choppy.
+    // A user who needs it can still set WEBKIT_DISABLE_DMABUF_RENDERER=1.
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
