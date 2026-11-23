@@ -155,7 +155,7 @@ Set an absolute **Model download directory** under Models to choose where new do
 The app-data `models.yml` holds one entry per model: its API **name**, **aliases**, file **path**, Hugging Face **account**, **sha256**, and optional **MTP head** and **projector**, each with its own sha256. Discovered models are registered automatically. Companion files do not get separate model entries.
 
 ```yaml
-version: 1
+version: 2
 models:
 - name: d1-3B-Q8_0
   aliases:

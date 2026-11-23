@@ -92,18 +92,7 @@ pub struct KeyInfo {
 
 // Requiring the field distinguishes a partial record from an explicit Any scope.
 fn read_models<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<Binding>>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Scope {
-        Restricted(Vec<Binding>),
-        Name(String),
-    }
-    match Option::<Scope>::deserialize(deserializer)? {
-        None => Ok(None),
-        Some(Scope::Restricted(bindings)) => Ok(Some(bindings)),
-        Some(Scope::Name(name)) if name == "any" => Ok(None),
-        _ => Err(serde::de::Error::custom("Invalid API key scope")),
-    }
+    Option::<Vec<Binding>>::deserialize(deserializer)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -395,18 +384,18 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn stored_scope_requires_models_and_accepts_legacy_any_values() {
+    fn stored_scope_requires_models_and_reads_null_as_any() {
         let mut record = serde_json::json!({
             "id": "example", "name": "Example", "prefix": "example",
             "created": 1, "expires": null, "digest": vec![0; 32]
         });
         assert!(serde_json::from_value::<StoredKey>(record.clone()).is_err());
-        for scope in [serde_json::Value::Null, serde_json::json!("any")] {
-            record["models"] = scope;
-            let key = serde_json::from_value::<StoredKey>(record.clone()).unwrap();
-            assert!(key.info.models.is_none());
-            assert!(serde_json::to_value(key).unwrap().as_object().unwrap().contains_key("models"));
-        }
+        record["models"] = serde_json::Value::Null;
+        let key = serde_json::from_value::<StoredKey>(record.clone()).unwrap();
+        assert!(key.info.models.is_none());
+        assert!(serde_json::to_value(key).unwrap().as_object().unwrap().contains_key("models"));
+        record["models"] = serde_json::json!("any");
+        assert!(serde_json::from_value::<StoredKey>(record).is_err());
     }
 
     #[tokio::test]
@@ -442,29 +431,16 @@ mod tests {
         assert!(!raw.contains(&created.key[created.info.prefix.len() + 1..]));
         assert!(!directory.join("data/api-keys.json").exists());
 
-        let legacy = "nk-1234abcd-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut stored = state.api_keys.read().unwrap();
-        stored.push(StoredKey {
-            digest: Sha256::digest(legacy).into(),
-            info: KeyInfo {
-                id: "1234abcd000000000000000000000000".into(),
-                name: "Legacy".into(),
-                prefix: "nk-1234abcd".into(),
-                created: 1,
-                expires: None,
-                models: None,
-            },
-        });
-        state.api_keys.write(&stored).unwrap();
+        let second = create(&state, "Second", None, None).await.unwrap();
         let reloaded = KeyStore::new(directory.join("config"));
         let listed = reloaded.list().await.unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, created.info.id);
-        assert_eq!(listed[1].prefix, "nk-1234abcd");
+        assert_eq!(listed[1].id, second.info.id);
         assert!(reloaded.authorize(&created.key).await.is_ok());
-        assert!(reloaded.authorize(legacy).await.is_ok());
+        assert!(reloaded.authorize(&second.key).await.is_ok());
         assert_eq!(reloaded.delete(&created.info.id).await.unwrap().len(), 1);
-        assert!(reloaded.authorize(legacy).await.is_ok());
+        assert!(reloaded.authorize(&second.key).await.is_ok());
         assert!(matches!(
             reloaded.authorize(&created.key).await,
             Err(Rejection::Unknown)

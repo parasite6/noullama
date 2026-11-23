@@ -105,7 +105,7 @@ impl Entry {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Document {
-    version: u32,
+    version: Option<u32>,
     models: Vec<Entry>,
 }
 
@@ -301,17 +301,20 @@ pub fn validate(entries: &[Entry]) -> Result<Vec<Entry>, String> {
     Ok(out)
 }
 
-/// The entries and the file's format version.
-fn parse(text: &str) -> Result<(Vec<Entry>, u32), String> {
+/// The entries of a version 2 file, or of one that states no version.
+fn parse(text: &str) -> Result<Vec<Entry>, String> {
     if text.trim().is_empty() {
-        return Ok((Vec::new(), VERSION));
+        return Ok(Vec::new());
     }
     let document: Document = serde_norway::from_str(text).map_err(|e| format!("models.yml could not be read: {e}"))?;
-    Ok((validate(&document.models).map_err(|e| format!("models.yml: {e}"))?, document.version))
+    if let Some(version) = document.version.filter(|version| *version != VERSION) {
+        return Err(format!("models.yml: version {version} is not supported; this Noullama reads version {VERSION}."));
+    }
+    validate(&document.models).map_err(|e| format!("models.yml: {e}"))
 }
 
 fn render(entries: &[Entry]) -> Result<String, String> {
-    let body = serde_norway::to_string(&Document { version: VERSION, models: entries.to_vec() }).map_err(|e| e.to_string())?;
+    let body = serde_norway::to_string(&Document { version: Some(VERSION), models: entries.to_vec() }).map_err(|e| e.to_string())?;
     Ok(format!("{HEADER}\n{body}"))
 }
 
@@ -470,23 +473,13 @@ fn refresh_locked(data_dir: &Path, library: &mut Library, legacy: &BTreeMap<Stri
         return;
     }
     match parse(&text) {
-        Ok((mut entries, version)) => {
+        Ok(entries) => {
             // Someone edited the file: keep the version before their edit.
             let _ = backup(data_dir, &library.text);
-            library.entries = entries.clone();
+            library.entries = entries;
             library.text = text;
             library.error = None;
             library.revision += 1;
-            // Version 1 had no MTP head or projector fields: record what each
-            // model's folder holds, once.
-            if version == 1 {
-                for entry in &mut entries {
-                    (entry.mtp, entry.mmproj) = discover(&entry.path);
-                }
-                if let Err(error) = write(data_dir, library, entries, Change::Edit) {
-                    library.error = Some(error);
-                }
-            }
         }
         Err(error) => library.error = Some(format!("{error} Noullama keeps using the last valid version until it is fixed.")),
     }
@@ -1082,7 +1075,7 @@ mod tests {
         a.account = "LiquidAI".into();
         let text = render(&[a.clone()]).unwrap();
         assert!(text.starts_with("# Noullama models"));
-        assert_eq!(parse(&text).unwrap(), (vec![a], VERSION));
+        assert_eq!(parse(&text).unwrap(), vec![a]);
         assert!(parse("models: [ {name: ").unwrap_err().starts_with("models.yml could not be read: "));
     }
 
@@ -1309,20 +1302,18 @@ mod tests {
     }
 
     #[test]
-    fn version_1_files_are_upgraded_once_and_empty_fields_stay_empty() {
+    fn other_versions_are_rejected_and_empty_fields_stay_empty() {
         let dir = std::env::temp_dir().join(format!("noullama-library-{}", uuid::Uuid::new_v4()));
         let folder = dir.join("m");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("m.gguf"), b"abc").unwrap();
         std::fs::write(folder.join("mmproj-m.gguf"), b"p").unwrap();
         let model = folder.join("m.gguf").to_str().unwrap().to_owned();
-        std::fs::write(file_path(&dir), format!("version: 1\nmodels:\n- name: m\n  path: {model}\n")).unwrap();
+        assert!(parse(&format!("version: 1\nmodels:\n- name: m\n  path: {model}\n")).unwrap_err().contains("version 1 is not supported"));
+        assert_eq!(parse(&format!("models:\n- name: m\n  path: {model}\n")).unwrap().len(), 1);
         let mut library = Library::default();
-        refresh_locked(&dir, &mut library, &BTreeMap::new());
-        assert!(library.entries[0].mmproj.ends_with("mmproj-m.gguf"));
-        assert!(std::fs::read_to_string(file_path(&dir)).unwrap().contains("version: 2"));
         // Cleared by hand in a version 2 file: stays empty, so the folder is searched at load.
-        let cleared = render(&[Entry { mmproj: String::new(), ..library.entries[0].clone() }]).unwrap();
+        let cleared = render(&[Entry { mmproj: String::new(), ..entry("m", &model) }]).unwrap();
         std::fs::write(file_path(&dir), cleared).unwrap();
         library.stamp = None;
         refresh_locked(&dir, &mut library, &BTreeMap::new());
