@@ -3,6 +3,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Select } from './Select';
 import { CopyButton } from './CopyButton';
 import { ArrowDownToLine, Check, Cpu, RefreshCw, X } from 'lucide-react';
+import { Help, SettingRow, SettingSection, StatusNote } from './SettingsLayout';
 
 export type LocalRuntime = { path: string; label: string; backend: string | null; source: string };
 type Scan = { platform: string; backends: string[]; local: LocalRuntime[]; warnings: string[] };
@@ -29,7 +30,7 @@ function InstallStatus({ progress, label }: { progress?: RuntimeDownload; label:
 // its "CPU runtime" panel (`cpu_runtime_path`, for loads on Device CPU).
 // Both share the build scan; each download has its own progress, and only
 // one runtime download runs at a time.
-export function RuntimeManager({ currentPath, running, progress, onSelect, onRefresh, children, cpuPath, cpuName, cpuProgress, onSelectCpu, cpuChildren }: { currentPath: string; running: boolean; progress?: RuntimeDownload; onSelect: (runtime: LocalRuntime) => void; onRefresh: () => Promise<void>; children?: React.ReactNode; cpuPath: string; cpuName: string; cpuProgress?: RuntimeDownload; onSelectCpu: (runtime: LocalRuntime) => void; cpuChildren?: React.ReactNode }) {
+export function RuntimeManager({ currentPath, currentName, running, progress, onSelect, onRefresh, children, cpuPath, cpuName, cpuProgress, onSelectCpu, cpuChildren }: { currentPath: string; currentName: string; running: boolean; progress?: RuntimeDownload; onSelect: (runtime: LocalRuntime) => void; onRefresh: () => Promise<void>; children?: React.ReactNode; cpuPath: string; cpuName: string; cpuProgress?: RuntimeDownload; onSelectCpu: (runtime: LocalRuntime) => void; cpuChildren?: React.ReactNode }) {
   const desktop = isTauri();
   const [scan, setScan] = useState<Scan | null>(null);
   const [backend, setBackendState] = useState(() => savedBackend() ?? 'cpu');
@@ -87,40 +88,67 @@ export function RuntimeManager({ currentPath, running, progress, onSelect, onRef
   const message = error ?? (progress?.error !== dismissedError ? progress?.error : null);
   const cpuMessage = cpuError ?? (cpuProgress?.error !== dismissedCpuError ? cpuProgress?.error : null);
   const cpuBuilds = installed.filter(runtime => runtime.backend === 'cpu');
-  return <><section className="panel runtime-manager">
+  const scanning = pending === 'scan';
+  const buildRow = (runtime: LocalRuntime, chosen: string, use: string, onUse: (runtime: LocalRuntime) => void, onCopyError: (error: string) => void) => {
+    const selected = isChosen(runtime, chosen);
+    return <div className={`runtime-build-row ${selected ? 'selected' : ''}`} key={runtime.path}>
+      <div className="runtime-build-text"><strong>{runtime.label}</strong><span className="identity-line"><code title={runtime.path}>{runtime.path}</code><CopyButton value={runtime.path} label="Copy runtime path" size={12} onError={onCopyError}/></span><small>{runtime.source}{runtime.backend ? ` / ${backendNames[runtime.backend] ?? runtime.backend}` : ''}</small></div>
+      <div className="setting-control"><button className="secondary compact" disabled={selected} onClick={() => onUse(runtime)}>{selected ? <><Check size={13}/>Selected</> : use}</button></div>
+    </div>;
+  };
+  return <><section className="panel runtime-manager" aria-label="GPU build">
     <div className="panel-heading"><span><Cpu size={16}/> llama.cpp</span><span className="muted">{scan?.platform ?? 'Local runtimes'}</span></div>
     <div className="settings-body">
-      <div className="runtime-manager-heading"><div><h3>Installed builds</h3><p className="hint">Found in Noullama downloads, in the folders of the selected GPU and CPU builds, in the folder above the GPU build's folder, and on PATH.</p></div><button className="secondary compact" disabled={!desktop || !!pending} onClick={() => void discover()}><RefreshCw size={14} className={pending === 'scan' ? 'spin' : ''}/>{pending === 'scan' ? 'Scanning…' : 'Scan local builds'}</button></div>
-      {installed.length > 0 ? <div className="runtime-build-list">{installed.map(runtime => {
-        const selected = isChosen(runtime, currentPath);
-        return <div className="runtime-build-row" key={runtime.path}><div><strong>{runtime.label}</strong><span className="identity-line"><code title={runtime.path}>{runtime.path}</code><CopyButton value={runtime.path} label="Copy runtime path" size={12} onError={setError}/></span><small>{runtime.source}{runtime.backend ? ` / ${backendNames[runtime.backend] ?? runtime.backend}` : ''}</small></div><button className="secondary compact" disabled={selected} onClick={() => onSelect(runtime)}>{selected ? <><Check size={13}/>Selected</> : 'Use'}</button></div>;
-      })}</div> : <p className="hint">{pending === 'scan' ? 'Checking local runtime locations…' : 'No builds found. Download one below or enter a custom path.'}</p>}
-      {scan?.warnings.map(warning => <p className="hint" key={warning}>{warning}</p>)}
-      {running && <p className="hint">Loaded models keep the build they started with. A new choice applies to the next model you load.</p>}
-      <div className="subsection"><h3>Custom path</h3>{children}</div>
-      <div className="subsection"><h3>Download a build</h3><p className="hint">Downloads the newest nightly for the backend you pick, which becomes your runtime, plus the latest official stable release for the same backend as a fallback. Checking only reads release details from GitHub.</p></div>
-      <div className="runtime-release-controls field"><span>Nightly backend</span><div className="file-input-row"><Select label="Nightly runtime backend" value={backend} disabled={!!pending || downloading} onChange={value => { setBackend(value); setPlan(null); }} options={(scan?.backends ?? ['cpu']).map(backend => ({ value: backend, label: backendNames[backend] ?? backend }))}/><button className="secondary" disabled={!desktop || !scan || !!pending || downloading} onClick={() => void checkReleases()}><RefreshCw size={14} className={pending === 'releases' ? 'spin' : ''}/>{pending === 'releases' ? 'Checking GitHub…' : 'Check official releases'}</button></div></div>
-      {plan && <div className="runtime-download-plan">{[['Nightly (default)', plan.nightly], ['Official stable (fallback)', plan.fallback]].map(([label, value]) => { const build = value as Build; return <div className="runtime-plan-build" key={String(label)}><strong>{String(label)} <span className="pill">{build.release} / {build.tag} / {backendNames[build.backend]}</span></strong>{build.assets.map(asset => <div className="runtime-asset" key={asset.name}><code>{asset.name}</code><span>{size(asset.size)}</span></div>)}</div>; })}<div className="runtime-download-confirm"><span className="hint">{size(plan.total_bytes)} in total. Checked against SHA-256 and extracted locally.</span><button className="primary compact" disabled={!!pending || downloading} onClick={() => void download()}><ArrowDownToLine size={14}/>Download nightly + fallback</button></div></div>}
-      {cpuProgress?.active && <p className="hint">One runtime download runs at a time. This one can start when the CPU runtime download below has finished.</p>}
-      <InstallStatus progress={progress} label="Runtime download progress"/>
-      {message && <div className="notice error" role="alert"><span>{message}</span><button aria-label="Dismiss runtime error" onClick={() => { setError(null); setDismissedError(progress?.error ?? null); }}><X size={16}/></button></div>}
+      <Current kicker="Selected build" name={currentName} path={currentPath} copyLabel="Copy runtime path" onCopyError={setError}
+        description="Used by loads on a GPU device." more="Loads whose Device is CPU use the CPU runtime below instead."
+        status={<>{!currentPath && <StatusNote tone="warn">No build selected. Choose one below, enter its path, or download one.</StatusNote>}{running && <StatusNote tone="info">Loaded models keep the build they started with. A new choice applies to the next model you load.</StatusNote>}</>}/>
+      <SettingSection title="Installed builds" description="Builds found on this computer." more="Found in Noullama downloads, in the folders of the selected GPU and CPU builds, in the folder above the GPU build's folder, and on PATH."
+        aside={<button className="secondary compact" disabled={!desktop || !!pending} onClick={() => void discover()}><RefreshCw size={14} className={scanning ? 'spin' : ''}/>{scanning ? 'Scanning…' : 'Scan local builds'}</button>}>
+        {installed.length > 0 ? <div className="runtime-build-list">{installed.map(runtime => buildRow(runtime, currentPath, 'Use', onSelect, setError))}</div>
+          : <StatusNote tone={scanning ? 'pending' : 'info'}>{scanning ? 'Checking local runtime locations…' : 'No builds found. Download one below or enter a custom path.'}</StatusNote>}
+        {scan?.warnings.map(warning => <StatusNote tone="warn" key={warning}>{warning}</StatusNote>)}
+      </SettingSection>
+      <SettingSection title="Custom path">{children}</SettingSection>
+      <SettingSection title="Download a build" description="The newest nightly for a backend, plus the latest stable release as a fallback." more="Downloads the newest nightly for the backend you pick, which becomes your runtime, plus the latest official stable release for the same backend as a fallback.">
+        <SettingRow label="Nightly backend" description="Checking only reads release details from GitHub." wide
+          control={<div className="file-input-row"><Select label="Nightly runtime backend" value={backend} disabled={!!pending || downloading} onChange={value => { setBackend(value); setPlan(null); }} options={(scan?.backends ?? ['cpu']).map(backend => ({ value: backend, label: backendNames[backend] ?? backend }))}/><button className="secondary" disabled={!desktop || !scan || !!pending || downloading} onClick={() => void checkReleases()}><RefreshCw size={14} className={pending === 'releases' ? 'spin' : ''}/>{pending === 'releases' ? 'Checking GitHub…' : 'Check official releases'}</button></div>}/>
+        {plan && <div className="runtime-download-plan">{[['Nightly (default)', plan.nightly], ['Official stable (fallback)', plan.fallback]].map(([label, value]) => { const build = value as Build; return <div className="runtime-plan-build" key={String(label)}><strong>{String(label)} <span className="pill">{build.release} / {build.tag} / {backendNames[build.backend]}</span></strong>{build.assets.map(asset => <div className="runtime-asset" key={asset.name}><code>{asset.name}</code><span>{size(asset.size)}</span></div>)}</div>; })}<div className="runtime-download-confirm"><span className="hint">{size(plan.total_bytes)} in total. Checked against SHA-256 and extracted locally.</span><button className="primary compact" disabled={!!pending || downloading} onClick={() => void download()}><ArrowDownToLine size={14}/>Download nightly + fallback</button></div></div>}
+        {cpuProgress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the CPU runtime download below has finished.</StatusNote>}
+        <InstallStatus progress={progress} label="Runtime download progress"/>
+        {message && <div className="notice error" role="alert"><span>{message}</span><button aria-label="Dismiss runtime error" onClick={() => { setError(null); setDismissedError(progress?.error ?? null); }}><X size={16}/></button></div>}
+      </SettingSection>
     </div>
   </section>
   <section className="panel runtime-manager cpu-runtime" aria-label="CPU runtime">
     <div className="panel-heading"><span><Cpu size={16}/> CPU runtime</span><span className="muted">For Device CPU</span></div>
     <div className="settings-body">
-      <p className="hint">Loads whose Device is CPU in Local API run this llama-server, with GPU layers 0. Loads on a GPU use the llama.cpp build above.</p>
-      <div className="runtime-build-row cpu-runtime-current"><div><strong>{cpuName}</strong>{cpuPath ? <span className="identity-line"><code title={cpuPath}>{cpuPath}</code><CopyButton value={cpuPath} label="Copy CPU runtime path" size={12} onError={setCpuError}/></span> : <small>Choose a CPU build below, enter its path, or download the official one.</small>}</div></div>
-      <div className="subsection"><h3>CPU builds</h3></div>
-      {cpuBuilds.length > 0 ? <div className="runtime-build-list">{cpuBuilds.map(runtime => {
-        const selected = isChosen(runtime, cpuPath);
-        return <div className="runtime-build-row" key={runtime.path}><div><strong>{runtime.label}</strong><span className="identity-line"><code title={runtime.path}>{runtime.path}</code><CopyButton value={runtime.path} label="Copy runtime path" size={12} onError={setCpuError}/></span><small>{runtime.source} / {backendNames.cpu}</small></div><button className="secondary compact" disabled={selected} onClick={() => onSelectCpu(runtime)}>{selected ? <><Check size={13}/>Selected</> : 'Use for CPU'}</button></div>;
-      })}</div> : <p className="hint">{pending === 'scan' ? 'Checking local runtime locations…' : 'No CPU builds found. Download the official one below or enter a path.'}</p>}
-      <div className="subsection"><h3>Path</h3>{cpuChildren}</div>
-      <div className="subsection"><h3>Download the official CPU build</h3><p className="hint">Downloads the newest nightly CPU build plus the latest official stable CPU build as a fallback, from the same official releases and with the same checks as above. The nightly is filled in as the CPU runtime; save to use it.</p></div>
-      <div className="runtime-download-confirm"><span className="hint">{progress?.active ? 'One runtime download runs at a time. This one can start when the download above has finished.' : 'Checked against SHA-256 and extracted locally.'}</span><button className="primary compact" disabled={!desktop || !!pending || downloading} onClick={() => void downloadCpu()}><ArrowDownToLine size={14}/>{pending === 'cpu-download' ? 'Starting…' : 'Download the official CPU build'}</button></div>
-      <InstallStatus progress={cpuProgress} label="CPU runtime download progress"/>
-      {cpuMessage && <div className="notice error" role="alert"><span>{cpuMessage}</span><button aria-label="Dismiss CPU runtime error" onClick={() => { setCpuError(null); setDismissedCpuError(cpuProgress?.error ?? null); }}><X size={16}/></button></div>}
+      <Current kicker="Selected CPU build" name={cpuName} path={cpuPath} copyLabel="Copy CPU runtime path" onCopyError={setCpuError}
+        description="Used by loads on Device CPU, with GPU layers 0." more="Loads whose Device is CPU in Local API run this llama-server, with GPU layers 0. Loads on a GPU use the llama.cpp build above."
+        status={!cpuPath && <StatusNote tone="warn">Choose a CPU build below, enter its path, or download the official one.</StatusNote>}/>
+      <SettingSection title="CPU builds" description="CPU builds among the installed builds above.">
+        {cpuBuilds.length > 0 ? <div className="runtime-build-list">{cpuBuilds.map(runtime => buildRow(runtime, cpuPath, 'Use for CPU', onSelectCpu, setCpuError))}</div>
+          : <StatusNote tone={scanning ? 'pending' : 'info'}>{scanning ? 'Checking local runtime locations…' : 'No CPU builds found. Download the official one below or enter a path.'}</StatusNote>}
+      </SettingSection>
+      <SettingSection title="Custom path">{cpuChildren}</SettingSection>
+      <SettingSection title="Download a build" description="The newest nightly CPU build, plus the latest stable one as a fallback." more="Downloads the newest nightly CPU build plus the latest official stable CPU build as a fallback, from the same official releases and with the same checks as above. The nightly is filled in as the CPU runtime; save to use it.">
+        <SettingRow label="Official CPU build" description="Checked against SHA-256 and extracted locally." wide
+          control={<button className="primary" disabled={!desktop || !!pending || downloading} onClick={() => void downloadCpu()}><ArrowDownToLine size={14}/>{pending === 'cpu-download' ? 'Starting…' : 'Download the official CPU build'}</button>}/>
+        {progress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the download above has finished.</StatusNote>}
+        <InstallStatus progress={cpuProgress} label="CPU runtime download progress"/>
+        {cpuMessage && <div className="notice error" role="alert"><span>{cpuMessage}</span><button aria-label="Dismiss CPU runtime error" onClick={() => { setCpuError(null); setDismissedCpuError(cpuProgress?.error ?? null); }}><X size={16}/></button></div>}
+      </SettingSection>
     </div>
   </section></>;
+}
+
+// The build a panel uses now, at the top of the panel.
+function Current({ kicker, name, path, copyLabel, onCopyError, description, more, status }: { kicker: string; name: string; path: string; copyLabel: string; onCopyError: (error: string) => void; description: string; more: string; status?: React.ReactNode }) {
+  return <div className="runtime-current">
+    <div className="load-identity">
+      <div className="load-identity-icon"><Cpu size={20}/></div>
+      <div className="model-identity"><small>{kicker}</small><span className="identity-line"><strong title={path || undefined}>{name}</strong></span>{path && <span className="identity-line"><code title={path}>{path}</code><CopyButton value={path} label={copyLabel} size={12} onError={onCopyError}/></span>}</div>
+    </div>
+    <Help text={description} more={more} topic={kicker}/>
+    {status}
+  </div>;
 }

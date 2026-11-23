@@ -16,7 +16,7 @@ pub fn not_found(device: &str) -> String {
 }
 
 /// One device line of `llama-server --list-devices`, such as
-/// `  CUDA0: NVIDIA GeForce RTX 4060 Laptop GPU (7857 MiB, 7742 MiB free)`.
+/// `  CUDA0: NVIDIA GeForce RTX 3080 (10240 MiB, 9800 MiB free)`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RuntimeDevice {
     /// What `--device` takes, such as `CUDA0` or `Vulkan1`.
@@ -174,9 +174,9 @@ pub async fn runtime_devices(state: tauri::State<'_, AppState>) -> Result<Value,
 mod tests {
     use super::*;
 
-    /// Captured from `llama-b12633/llama-server --list-devices` (CUDA 13
-    /// build) on an RTX 4060 Laptop GPU: stdout, then stderr empty.
-    const ONE_GPU: &str = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 4060 Laptop GPU (7857 MiB, 7742 MiB free)\n";
+    /// The format `llama-server --list-devices` (CUDA build) prints for one
+    /// GPU: stdout, then stderr empty.
+    const ONE_GPU: &str = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3080 (10240 MiB, 9800 MiB free)\n";
     /// The same build with no usable GPU (CUDA_VISIBLE_DEVICES empty), and the
     /// official CPU build: exit status 0 either way. The CUDA error goes to stderr.
     const NO_GPU: &str = "Available devices:\n  (none)\n";
@@ -186,9 +186,9 @@ mod tests {
     fn reads_the_real_list_devices_output() {
         assert_eq!(parse_list_devices(ONE_GPU), [RuntimeDevice {
             name: "CUDA0".into(),
-            description: "NVIDIA GeForce RTX 4060 Laptop GPU".into(),
-            total_mib: Some(7857),
-            free_mib: Some(7742),
+            description: "NVIDIA GeForce RTX 3080".into(),
+            total_mib: Some(10240),
+            free_mib: Some(9800),
         }]);
         assert!(parse_list_devices(NO_GPU).is_empty());
         assert!(parse_list_devices("").is_empty());

@@ -46,10 +46,13 @@ export type RuntimeDevice = { name: string; description: string; total_mib: numb
 // The `device` value that loads on the CPU runtime.
 export const CPU_DEVICE = 'CPU';
 
-// "CUDA0 · NVIDIA GeForce RTX 4060 Laptop GPU (8 GB)".
-export function deviceLabel(device: RuntimeDevice): string {
-  const size = device.total_mib ? ` (${Math.round(device.total_mib / 1024)} GB)` : '';
-  return `${device.name}${device.description ? ` · ${device.description}` : ''}${size}`;
+// The device's own name as the option's label ("NVIDIA GeForce
+// RTX 3080"), with its llama.cpp name and memory as the detail ("CUDA0 · 10 GB").
+export function deviceLabel(device: RuntimeDevice): { label: string; detail: string } {
+  const size = device.total_mib ? `${Math.round(device.total_mib / 1024)} GB` : '';
+  return device.description
+    ? { label: device.description, detail: [device.name, size].filter(Boolean).join(' · ') }
+    : { label: device.name, detail: size };
 }
 
 // The load panel's "Device" select for the saved `device` value. `devices`
@@ -62,7 +65,7 @@ export function deviceChoice(saved: string, devices: readonly RuntimeDevice[] | 
   const effective = saved || (devices ? listed[0]?.name ?? CPU_DEVICE : null);
   const known = !saved || saved === CPU_DEVICE || listed.some(d => d.name === saved);
   const missing = !!devices && !known;
-  const options = [...listed.map(d => ({ value: d.name, label: deviceLabel(d) })), { value: CPU_DEVICE, label: 'CPU' }];
+  const options: { value: string; label: string; detail?: string }[] = [...listed.map(d => ({ value: d.name, ...deviceLabel(d) })), { value: CPU_DEVICE, label: 'CPU', detail: 'CPU runtime' }];
   if (!known) options.unshift({ value: saved, label: devices ? `${saved} (not found)` : saved });
   if (effective === null) options.unshift({ value: '', label: 'Checking devices…' });
   return { value: effective ?? '', effective, missing, options };

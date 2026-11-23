@@ -3,7 +3,7 @@ import { Check, ChevronDown } from 'lucide-react';
 
 // The native <select> popup is drawn by GTK in the desktop build and ignores
 // the app's styles, so this draws its own listbox.
-export function Select({ value, options, onChange, disabled, label }: { value: string; options: { value: string; label: string }[]; onChange: (value: string) => void; disabled?: boolean; label: string }) {
+export function Select({ value, options, onChange, disabled, label }: { value: string; options: { value: string; label: string; detail?: string }[]; onChange: (value: string) => void; disabled?: boolean; label: string }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const root = useRef<HTMLDivElement>(null);
@@ -41,11 +41,11 @@ export function Select({ value, options, onChange, disabled, label }: { value: s
 
   return <div className={`select ${open ? 'open' : ''}`} ref={root}>
     <button type="button" className="select-trigger" role="combobox" aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={id} aria-activedescendant={open ? `${id}-${active}` : undefined} disabled={disabled} onClick={() => open ? setOpen(false) : show()} onKeyDown={onKeyDown}>
-      <span>{selected?.label ?? value}</span><ChevronDown size={15}/>
+      <span className="select-value" title={selected ? [selected.label, selected.detail].filter(Boolean).join(' · ') : undefined}><span className="select-label">{selected?.label ?? value}</span>{selected?.detail && <span className="select-detail">{selected.detail}</span>}</span><ChevronDown size={15}/>
     </button>
     {open && <ul className="select-menu" role="listbox" id={id} ref={list} aria-label={label}>
       {options.map((option, index) => <li key={option.value} id={`${id}-${index}`} role="option" aria-selected={option.value === value} className={index === active ? 'active' : ''} onPointerEnter={() => setActive(index)} onClick={() => choose(index)}>
-        <span>{option.label}</span>{option.value === value && <Check size={14}/>}
+        <span className="select-value"><span className="select-label">{option.label}</span>{option.detail && <span className="select-detail">{option.detail}</span>}</span>{option.value === value && <Check size={14}/>}
       </li>)}
     </ul>}
   </div>;

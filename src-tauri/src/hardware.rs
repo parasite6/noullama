@@ -495,13 +495,13 @@ mod tests {
 
     #[test]
     fn nvidia_memory_reads_the_runtime_process_and_the_card() {
-        let usage = parse_nvidia_memory("3120, 8188\n", Some("911, 300\n4242, 2500\n77, 100\n"), &[4242, 77, 5]);
+        let usage = parse_nvidia_memory("3120, 10240\n", Some("911, 300\n4242, 2500\n77, 100\n"), &[4242, 77, 5]);
         assert_eq!(usage.used_bytes, Some(3120 * 1024 * 1024));
-        assert_eq!(usage.total_bytes, Some(8188 * 1024 * 1024));
+        assert_eq!(usage.total_bytes, Some(10240 * 1024 * 1024));
         assert_eq!(usage.process_bytes, Some(2600 * 1024 * 1024));
         assert_eq!(usage.processes, [Some(2500 * 1024 * 1024), Some(100 * 1024 * 1024), None]);
         assert_eq!(
-            parse_nvidia_memory("3120, 8188", Some("911, 300"), &[4242]).process_bytes,
+            parse_nvidia_memory("3120, 10240", Some("911, 300"), &[4242]).process_bytes,
             None
         );
         assert_eq!(
@@ -514,7 +514,7 @@ mod tests {
     fn llama_devices_map_to_their_own_nvidia_gpu() {
         use crate::devices::parse_list_devices;
         // The format nvidia-smi prints for `index,name,memory.used,memory.total`
-        // (this machine: "0, NVIDIA GeForce RTX 4060 Laptop GPU, 15, 8188").
+        // (for example "0, NVIDIA GeForce RTX 3080, 15, 10240").
         let gpus = parse_nvidia_gpus("0, NVIDIA GeForce RTX 3060, 100, 12288\n1, NVIDIA GeForce RTX 4090, 2000, 24564\n2, Odd, Name, 5, 10\n");
         assert_eq!(gpus.len(), 3);
         assert_eq!(gpus[2].name, "Odd, Name");

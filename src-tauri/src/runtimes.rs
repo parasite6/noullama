@@ -815,7 +815,7 @@ mod tests {
             assert!(roots.iter().all(|(p, _, _)| *p != app), "the app's own folder is not scanned");
         }
         let manager = include_str!("../../src/RuntimeManager.tsx");
-        let hint = manager.split("<h3>Installed builds</h3><p className=\"hint\">").nth(1).and_then(|rest| rest.split("</p>").next()).unwrap();
+        let hint = manager.split("title=\"Installed builds\"").nth(1).and_then(|rest| rest.split("more=\"").nth(1)).and_then(|rest| rest.split('"').next()).unwrap();
         assert!(!hint.contains("next to the app"), "{hint}");
         for (source, words) in [("managed", "Noullama downloads"), ("custom", "folders of the selected GPU and CPU builds"), ("near custom runtime", "folder above the GPU build"), ("PATH", "on PATH")] {
             assert!(found.iter().any(|(_, s)| *s == source));

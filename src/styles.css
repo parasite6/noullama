@@ -25,6 +25,23 @@
   --r-pill: 999px;
   --r-card: 16px;
   --r-row: 10px;
+  /* Spacing and type scales, and the settings control column. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 15px;
+  --text-xl: 16px;
+  --desc: #a0a0a8;
+  --info: #93b7e6;
+  --control-w: 320px;
+  --control-w-wide: 420px;
+  --control-h: 36px;
   --sans: "Geist Variable", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "Geist Mono Variable", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-family: var(--sans);
@@ -73,7 +90,7 @@ small { font-size: 12px; color: var(--muted); }
 .sidebar { width: var(--sidebar-w); position: fixed; inset: 0 auto 0 0; background: var(--sidebar); padding: 18px 12px 14px; display: flex; flex-direction: column; z-index: 3; }
 .brand { display: flex; gap: 10px; align-items: center; margin: 0 8px 26px; font-size: 21px; letter-spacing: -.6px; font-weight: 600; color: var(--text); }
 .brand-logo { width: 28px; height: 28px; object-fit: contain; flex-shrink: 0; display: block; }
-.brand-tag { font-size: 10px; font-weight: 500; letter-spacing: .2px; color: var(--muted); border: 1px solid var(--line-strong); border-radius: var(--r-pill); padding: 2px 7px; }
+.brand-tag { font-size: 12px; font-weight: 500; letter-spacing: .2px; color: var(--muted); border: 1px solid var(--line-strong); border-radius: var(--r-pill); padding: 2px 7px; }
 nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-item { width: 100%; justify-content: flex-start; height: 38px; border-radius: var(--r-row); padding: 0 12px; gap: 12px; color: var(--secondary); font-size: 14px; font-weight: 450; }
 .nav-item svg { color: var(--muted); flex-shrink: 0; }
@@ -106,10 +123,10 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .status-dot.amber { background: var(--warn); }
 .status-dot.red { background: var(--bad); }
 .chip, .pill { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; border-radius: var(--r-pill); padding: 5px 11px; font-size: 12px; color: var(--secondary); background: var(--surface-2); line-height: 1.2; }
-.chip code { font-size: 11px; color: var(--text); }
+.chip code { font-size: 12px; color: var(--text); }
 .chip.success, .pill.success { color: var(--ok); background: rgba(111, 207, 151, .1); }
 .chip.warning { color: var(--warn); background: rgba(231, 182, 90, .1); }
-.code-badge { background: var(--accent-soft); color: var(--accent); padding: 2px 7px; font-size: 10.5px; font-weight: 600; border-radius: var(--r-pill); letter-spacing: .3px; }
+.code-badge { background: var(--accent-soft); color: var(--accent); padding: 2px 7px; font-size: 12px; font-weight: 600; border-radius: var(--r-pill); letter-spacing: .3px; }
 .fit-level-1 { --fit-text: #8fd3a6; --fit-bg: rgba(63, 154, 99, .14); --fit-mark: #4fb57a; }
 .fit-level-2 { --fit-text: #c2ec92; --fit-bg: rgba(140, 204, 99, .12); --fit-mark: #8ccc63; }
 .fit-level-3 { --fit-text: #f1d071; --fit-bg: rgba(217, 183, 74, .13); --fit-mark: #d9b74a; }
@@ -155,9 +172,6 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .model-identity strong { min-width: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-identity small { overflow-wrap: anywhere; }
 .pending-model { color: var(--warn); }
-.load-build { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
-.load-build code { font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.load-build .text-button { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .load-bar { margin: 0 0 22px; }
 .load-bar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .settings-panel.load-panel { margin-bottom: 10px; }
@@ -335,17 +349,13 @@ label small { font-weight: 400; line-height: 1.6; }
 .number-field .icon-button + .icon-button { right: 8px; }
 .file-input-row { display: flex; gap: 8px; align-items: stretch; }
 .file-input-row > input, .file-input-row > .select { flex: 1; min-width: 0; }
-.runtime-manager-heading, .runtime-download-confirm { display: flex; gap: 16px; align-items: center; justify-content: space-between; }
-.runtime-manager-heading strong { font-size: 13.5px; }
-.runtime-manager-heading p { margin: 4px 0 0; }
+.runtime-download-confirm { display: flex; gap: 16px; align-items: center; justify-content: space-between; }
 .runtime-build-list { display: grid; gap: 6px; max-height: 320px; overflow-y: auto; }
 .runtime-build-row { display: flex; gap: 16px; justify-content: space-between; align-items: center; padding: 12px 14px; border-radius: 12px; background: var(--field); }
 .runtime-build-row > div { display: grid; gap: 4px; min-width: 0; }
 .runtime-build-row strong { font-size: 13px; }
 .runtime-build-row code { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .runtime-build-row small, .runtime-install-status small { color: var(--muted); font-size: 12px; }
-.runtime-release-controls .file-input-row { justify-content: flex-start; }
-.runtime-release-controls .select { flex: 0 1 240px; }
 .runtime-download-plan { border-radius: 12px; background: var(--field); padding: 16px; display: grid; gap: 18px; }
 .runtime-plan-build > strong { font-size: 13px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
 .runtime-asset { display: flex; gap: 12px; justify-content: space-between; font-size: 13px; color: var(--secondary); padding: 4px 0; }
@@ -357,7 +367,6 @@ label small { font-weight: 400; line-height: 1.6; }
 .runtime-manager .notice { margin: 0; }
 
 /* Dropdowns and the right-click menu share one floating surface. */
-.field { display: flex; flex-direction: column; gap: 8px; font-size: 13px; font-weight: 500; color: var(--secondary); }
 .select { position: relative; }
 .select-trigger { width: 100%; justify-content: space-between; gap: 10px; padding: 9px 12px 9px 16px; border-radius: var(--r-pill); background: var(--field); border: 1px solid var(--line); color: var(--text); font-size: 13px; font-weight: 450; text-align: left; }
 .select-trigger:hover:not(:disabled), .select.open .select-trigger { border-color: var(--line-strong); }
@@ -374,7 +383,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .context-menu button svg { color: var(--muted); }
 .context-menu button.active:not(:disabled) { background: #38383d; color: var(--text); }
 .context-menu button:disabled { opacity: .4; }
-.context-menu kbd { margin-left: auto; font-family: var(--sans); font-size: 11px; color: var(--faint); }
+.context-menu kbd { margin-left: auto; font-family: var(--sans); font-size: 12px; color: var(--faint); }
 
 /* Local API */
 .endpoint-card { padding: 18px; background: var(--surface); border-radius: var(--r-card); margin-bottom: 16px; }
@@ -387,7 +396,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .endpoint-list > div + div { border-top: 1px solid var(--line); }
 .endpoint-list code { font-size: 13px; }
 .endpoint-list > div > span:nth-child(3) { color: var(--muted); }
-.method { padding: 3px 0; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 600; text-align: center; }
+.method { padding: 3px 0; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: 12px; font-weight: 600; text-align: center; }
 .method.get { background: rgba(111, 207, 151, .1); color: var(--ok); }
 .code-panel { margin-bottom: 16px; }
 .code-panel pre { padding: 16px 18px; line-height: 1.75; font-size: 13px; background: var(--field); max-height: 450px; overflow: auto; }
@@ -470,7 +479,6 @@ label small { font-weight: 400; line-height: 1.6; }
 .toggle-thumb { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--text); transition: transform .15s; }
 .toggle.on .toggle-track { background: var(--accent); }
 .toggle.on .toggle-thumb { transform: translateX(14px); background: var(--accent-ink); }
-.field-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .text-button.inline { padding: 0 2px; font-size: inherit; color: var(--accent); }
 
 /* Errors: say what failed and keep the runtime's own words visible. */
@@ -492,7 +500,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .image-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .image-remove { position: absolute; top: 4px; right: 4px; width: 20px; height: 20px; padding: 0; border-radius: 50%; background: rgba(0, 0, 0, .65); color: #fff; }
 .image-remove:hover { background: rgba(0, 0, 0, .85); }
-.image-add { width: 72px; height: 72px; flex-direction: column; gap: 4px; border-radius: 10px; border: 1px dashed var(--line-strong); color: var(--muted); font-size: 11px; }
+.image-add { width: 72px; height: 72px; flex-direction: column; gap: 4px; border-radius: 10px; border: 1px dashed var(--line-strong); color: var(--muted); font-size: 12px; }
 .image-add:hover:not(:disabled) { color: var(--text); border-color: var(--secondary); background: var(--surface); }
 .state-panel.dropping { box-shadow: inset 0 0 0 2px var(--accent); }
 
@@ -515,7 +523,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .model-details dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 16px; margin: 0; }
 .model-details dt { color: var(--muted); }
 .model-details dd { margin: 0; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.model-details code { font-size: 11.5px; }
+.model-details code { font-size: 12px; }
 .model-details-memory { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line-strong); display: grid; gap: 10px; }
 .model-details-title { font-weight: 550; }
 .model-details-title span { color: var(--muted); font-weight: 400; }
@@ -528,13 +536,8 @@ label small { font-weight: 400; line-height: 1.6; }
 .meter-track i.strong { background: var(--accent); }
 
 /* Runtime page */
-.settings-body h3, .runtime-manager-heading h3 { font-size: 13.5px; font-weight: 600; }
-.subsection { display: flex; flex-direction: column; gap: 14px; padding-top: 18px; border-top: 1px solid var(--line); }
-.subsection > h3 { margin-bottom: -4px; }
-.subsection > .hint { margin-top: -6px; }
+.settings-body h3 { font-size: 13.5px; font-weight: 600; }
 .runtime-version { color: var(--secondary); font-size: 12px; line-height: 1.6; padding: 10px 14px; border-radius: 10px; background: var(--field); }
-.settings-panel .panel-heading .fit-badge { font-weight: 450; }
-.fit-note { margin-top: -6px; font-size: 13px; }
 .save-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 10px 10px 18px; border-radius: var(--r-pill); background: var(--surface-2); box-shadow: 0 10px 30px rgba(0, 0, 0, .35); }
 .save-bar { box-shadow: none; background: var(--surface); transition: background .2s, box-shadow .2s; }
 /* Float only while there is something to save. */
@@ -573,7 +576,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .model-name-list { display: flex; flex-wrap: wrap; gap: 6px; }
 .model-name { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 4px 0 12px; border-radius: var(--r-pill); background: var(--field); font-size: 12.5px; }
 .model-name code { color: var(--text); font-size: 12.5px; }
-.model-name small { font-size: 11px; color: var(--faint); }
+.model-name small { font-size: 12px; color: var(--faint); }
 .model-name .icon-button { padding: 4px; }
 .model-names-body > small { line-height: 1.6; }
 .model-name.warn small { color: var(--warn); }
@@ -596,11 +599,11 @@ label small { font-weight: 400; line-height: 1.6; }
 /* Local API instance cards: load-time settings and API names under the head */
 .instance-settings { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 16px; margin: 0; padding-left: 46px; }
 .instance-settings > div { min-width: 0; }
-.instance-settings dt { font-size: 11.5px; color: var(--muted); }
+.instance-settings dt { font-size: 12px; color: var(--muted); }
 .instance-settings dd { margin: 2px 0 0; font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .instance-stale { margin-left: 46px; font-size: 12px; line-height: 1.6; color: var(--warn); }
 .instance-names { display: grid; gap: 8px; }
-.instance-names-label { padding-left: 46px; font-size: 11.5px; color: var(--muted); }
+.instance-names-label { padding-left: 46px; font-size: 12px; color: var(--muted); }
 .instance-suffix { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .instance-suffix .instance-names-label { flex-basis: 100%; }
 .instance-suffix input { width: 180px; max-width: 100%; padding: 6px 14px; margin-left: 46px; }
@@ -615,8 +618,6 @@ label small { font-weight: 400; line-height: 1.6; }
 .load-instance { flex: 0 1 300px; min-width: 180px; margin-left: auto; }
 .load-instance .select-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The load panel's Device select: wide enough for "CUDA0 · <GPU name> (8 GB)". */
-.load-device { flex: 0 1 380px; min-width: 160px; }
-.load-device .select-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .instance-card .model-aliases { padding-left: 46px; }
 /* An instance's own Keep context switch, Clear and status */
 .instance-keep { padding-left: 46px; }
@@ -683,3 +684,106 @@ label small { font-weight: 400; line-height: 1.6; }
 .memory-dialog { width: min(540px, calc(100vw - 40px)); }
 .memory-dialog label { display: block; margin-top: 18px; font-size: 13px; }
 .memory-dialog .quit-dialog-actions { flex-wrap: wrap; }
+
+/* Settings layout (SettingsLayout.tsx): titled sections of even rows. Each
+   row has its label and one line of description on the left and its control
+   in a fixed column on the right, so every control shares one right edge and
+   one height. Live state is a StatusNote; longer explanations open inline. */
+.settings-panel .panel-heading, .runtime-manager .panel-heading { min-height: 56px; padding-left: var(--space-5); font-size: var(--text-xl); font-weight: 600; }
+.settings-body { padding: 0 var(--space-5) var(--space-5); gap: var(--space-6); }
+.setting-section { display: grid; gap: var(--space-2); }
+.setting-section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); }
+.setting-section-title { display: grid; gap: 2px; min-width: 0; }
+.settings-body .setting-section-head h3 { font-size: var(--text-lg); font-weight: 600; color: var(--text); letter-spacing: -.1px; }
+.setting-section-aside { flex-shrink: 0; display: flex; gap: var(--space-2); }
+.setting-rows { display: grid; }
+.setting-row { display: grid; grid-template-columns: minmax(0, 1fr) var(--control-w); column-gap: var(--space-6); row-gap: var(--space-3); align-items: center; padding: var(--space-4) 0; border-top: 1px solid var(--line); }
+.setting-row.wide { grid-template-columns: minmax(0, 1fr) var(--control-w-wide); }
+.setting-row.no-control { grid-template-columns: minmax(0, 1fr); }
+.settings-body > .setting-rows > .setting-row:first-child { border-top: 0; padding-top: var(--space-1); }
+.setting-text { display: grid; gap: 3px; min-width: 0; }
+.setting-label, label.setting-label { display: block; font-size: var(--text-md); font-weight: 500; color: var(--text); line-height: 1.4; }
+.setting-help { display: grid; gap: var(--space-2); }
+.setting-description { font-size: var(--text-base); line-height: 1.5; color: var(--desc); }
+.more-button { display: inline-flex; vertical-align: -3px; margin-left: 6px; padding: 1px; border-radius: 50%; color: var(--faint); }
+.more-button:hover { color: var(--text); }
+.more-button[aria-expanded="true"] { color: var(--accent); }
+.setting-more { max-width: 76ch; padding: var(--space-2) var(--space-3); border-left: 2px solid var(--accent-line); border-radius: 0 8px 8px 0; background: rgba(255, 255, 255, .03); font-size: var(--text-base); line-height: 1.55; color: var(--secondary); }
+.setting-more[hidden] { display: none; }
+.setting-control { display: flex; justify-content: flex-end; align-items: center; min-width: 0; min-height: var(--control-h); }
+.setting-control > .select, .setting-control > .number-field, .setting-control > .segmented, .setting-control > input, .setting-control > .file-input-row, .setting-control > .value-box { flex: 1; width: 100%; max-width: none; }
+.setting-control input, .setting-control .select-trigger, .setting-full input { height: var(--control-h); padding-top: 0; padding-bottom: 0; font-size: var(--text-base); }
+.setting-full .secondary, .setting-control .secondary:not(.compact), .setting-control .primary { min-height: var(--control-h); }
+.setting-control > .toggle { margin-right: -6px; }
+.toggle-text { min-width: 22px; text-align: left; }
+.setting-control .segmented { display: flex; height: var(--control-h); }
+.setting-control .segmented button { flex: 1 1 auto; font-size: var(--text-base); padding: 0 10px; white-space: nowrap; }
+.setting-full, .setting-status { grid-column: 1 / -1; min-width: 0; }
+.setting-full { display: grid; gap: var(--space-3); }
+.setting-status { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: calc(var(--space-1) * -1); }
+.value-box { display: flex; align-items: center; height: var(--control-h); padding: 0 var(--space-4); border-radius: var(--r-pill); background: var(--field); border: 1px solid var(--line); min-width: 0; }
+.value-box code { font-size: var(--text-base); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Live state, by meaning: ok, info, warn, error, pending. */
+.status-note { display: inline-flex; align-items: flex-start; gap: var(--space-2); max-width: 100%; padding: 6px 12px 6px 10px; border-radius: 8px; font-size: var(--text-base); line-height: 1.45; color: var(--secondary); background: var(--surface-2); overflow-wrap: anywhere; }
+.status-note > svg { flex-shrink: 0; margin-top: 2px; }
+.status-note.ok { color: #bfe6cd; background: rgba(111, 207, 151, .09); }
+.status-note.ok > svg { color: var(--ok); }
+.status-note.info { color: #c9d9ef; background: rgba(147, 183, 230, .09); }
+.status-note.info > svg { color: var(--info); }
+.status-note.warn { color: #f1dba9; background: rgba(231, 182, 90, .1); }
+.status-note.warn > svg { color: var(--warn); }
+.status-note.error { color: #f3c4c1; background: rgba(239, 138, 133, .11); }
+.status-note.error > svg { color: var(--bad); }
+.status-note.pending { color: var(--muted); }
+.status-note .text-button.inline { padding: 0; margin-left: 2px; }
+
+/* Select options with a secondary detail (Device: "CUDA0 · 8 GB"). */
+.select-value { display: flex; align-items: baseline; gap: var(--space-2); flex: 1; min-width: 0; }
+.select-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.select-detail { margin-left: auto; flex-shrink: 0; font-size: var(--text-sm); color: var(--muted); white-space: nowrap; }
+
+/* The load panel's summary and the Runtime panels' selected build. */
+.load-summary, .runtime-current { display: grid; gap: var(--space-3); padding: var(--space-4); border-radius: 14px; background: var(--field); }
+.load-summary .load-identity-icon, .runtime-current .load-identity-icon { background: var(--surface-2); }
+.load-summary .model-identity small, .runtime-current .model-identity small { font-size: var(--text-base); color: var(--muted); }
+.load-identity-state { margin-left: auto; display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.load-identity-state .load-instance { margin-left: 0; }
+.load-fit { display: flex; align-items: center; gap: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--line); min-width: 0; }
+.load-fit p { font-size: var(--text-base); color: var(--secondary); line-height: 1.5; min-width: 0; }
+.load-fit p.fit-error { color: #f3c4c1; }
+.load-fit .fit-badge { font-size: var(--text-base); padding: 5px 12px; }
+.load-fit .fit-unavailable { flex-shrink: 0; padding: 5px 12px; border-radius: var(--r-pill); background: var(--surface-2); font-size: var(--text-base); color: var(--muted); }
+.runtime-current code { font-size: var(--text-sm); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.runtime-current .identity-line strong { font-size: var(--text-lg); }
+.runtime-current .copy-button { opacity: 0; transition: opacity .15s; }
+.runtime-current:hover .copy-button, .runtime-current .copy-button:focus-visible, .runtime-current .copy-button.copied { opacity: 1; }
+.runtime-current > .setting-help { padding-top: var(--space-3); border-top: 1px solid var(--line); }
+
+/* Installed builds: list rows share the control column's right edge. */
+.runtime-build-list { gap: var(--space-1); }
+.runtime-build-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-4); padding: var(--space-3) var(--space-4); }
+.runtime-build-text { display: grid; gap: 3px; min-width: 0; }
+.runtime-build-row strong { font-size: var(--text-md); font-weight: 550; }
+.runtime-build-row code { font-size: var(--text-sm); }
+.runtime-build-row small { font-size: var(--text-base); }
+.runtime-build-row.selected { box-shadow: inset 0 0 0 1px var(--accent-line); }
+.setting-section > .setting-rows > .runtime-build-list, .setting-section > .setting-rows > .status-note { margin-top: var(--space-2); }
+.setting-section > .setting-rows > .status-note { justify-self: start; margin-bottom: var(--space-1); }
+.setting-section .runtime-download-plan, .setting-section .runtime-install-status, .setting-section .notice { margin-top: var(--space-2); }
+.setting-section .file-input-row .select { flex: 1; }
+
+@media (max-width: 760px) {
+  .setting-row, .setting-row.wide { grid-template-columns: minmax(0, 1fr); }
+  .setting-control { justify-content: flex-start; }
+  .load-identity { flex-wrap: wrap; }
+  .load-identity-state { margin-left: 54px; }
+  .load-fit { flex-direction: column; align-items: flex-start; }
+}
+.settings-panel .panel-heading, .runtime-manager .panel-heading { padding-right: var(--space-5); }
+.settings-panel .panel-heading > .muted, .runtime-manager .panel-heading > .muted { font-size: var(--text-base); font-weight: 450; }
+.setting-rows > .setting-row:last-child { padding-bottom: 0; }
+.setting-label code { font-size: var(--text-base); font-weight: 450; }
+/* Controls stay on the label's line when a row's "more" text opens below. */
+.setting-row { align-items: start; }
+.setting-row > .setting-control { margin-top: 3px; }

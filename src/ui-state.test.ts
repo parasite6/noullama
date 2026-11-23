@@ -36,21 +36,21 @@ test('the Playground keeps its model through a load unless that model was replac
   assert.equal(playModelAfterLoad('gone', 'new', loaded, null), 'new');
 });
 
-// As runtime_devices returns the real `--list-devices` line of this machine's build.
-const rtx = { name: 'CUDA0', description: 'NVIDIA GeForce RTX 4060 Laptop GPU', total_mib: 7857, free_mib: 7742 };
+// As runtime_devices returns a `--list-devices` line.
+const rtx = { name: 'CUDA0', description: 'NVIDIA GeForce RTX 3080', total_mib: 10240, free_mib: 9800 };
 const second3060 = { name: 'CUDA1', description: 'NVIDIA GeForce RTX 3060', total_mib: 11910, free_mib: 11000 };
 
 test('the Device select lists every GPU plus CPU and defaults to the first GPU', () => {
   const choice = deviceChoice('', [rtx, second3060]);
   assert.deepEqual(choice.options, [
-    { value: 'CUDA0', label: 'CUDA0 · NVIDIA GeForce RTX 4060 Laptop GPU (8 GB)' },
-    { value: 'CUDA1', label: 'CUDA1 · NVIDIA GeForce RTX 3060 (12 GB)' },
-    { value: 'CPU', label: 'CPU' },
+    { value: 'CUDA0', label: 'NVIDIA GeForce RTX 3080', detail: 'CUDA0 · 10 GB' },
+    { value: 'CUDA1', label: 'NVIDIA GeForce RTX 3060', detail: 'CUDA1 · 12 GB' },
+    { value: 'CPU', label: 'CPU', detail: 'CPU runtime' },
   ]);
   assert.equal(choice.effective, 'CUDA0');
   assert.equal(deviceChoice('CUDA1', [rtx, second3060]).effective, 'CUDA1');
   assert.equal(deviceChoice('', []).effective, 'CPU', 'no GPU, or a runtime that cannot list devices, defaults to CPU');
-  assert.deepEqual(deviceChoice('', []).options, [{ value: 'CPU', label: 'CPU' }]);
+  assert.deepEqual(deviceChoice('', []).options, [{ value: 'CPU', label: 'CPU', detail: 'CPU runtime' }]);
 });
 
 test('a saved device the runtime does not report stays chosen and is marked not found', () => {

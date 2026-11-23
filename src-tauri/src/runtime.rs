@@ -3328,10 +3328,10 @@ mod tests {
         assert_eq!(listed_names(&routes), ["qwen", "qwen-i-2", "other", "spare"]);
     }
 
-    /// The real `--list-devices` stdout of the CUDA 13 build on this
-    /// machine's RTX 4060 Laptop GPU, as a fake GPU runtime prints it.
+    /// `--list-devices` stdout of a CUDA build with one GPU, as a fake GPU
+    /// runtime prints it.
     #[cfg(unix)]
-    const GPU_LIST: &str = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 4060 Laptop GPU (7857 MiB, 7742 MiB free)\n";
+    const GPU_LIST: &str = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3080 (10240 MiB, 9800 MiB free)\n";
 
     /// A fake runtime that lists `devices` and, when launched, writes its
     /// arguments beside itself and waits.
@@ -3466,7 +3466,7 @@ mod tests {
         }
         let first = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
         assert_eq!(first.settings.device, "CUDA0");
-        assert_eq!(first.model().device, "CUDA0 · NVIDIA GeForce RTX 4060 Laptop GPU");
+        assert_eq!(first.model().device, "CUDA0 · NVIDIA GeForce RTX 3080");
         let args = launched_args(&state, &gpu).await;
         assert_eq!(flag(&args, "--device"), Some("CUDA0"));
         assert_eq!(flag(&args, "--split-mode"), Some("none"));
