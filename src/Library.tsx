@@ -126,8 +126,10 @@ const LibraryCard = memo(function LibraryCard({
 // writes the file (backing up the old one); edits made in a text editor show
 // up here as soon as they are saved.
 export const Library = memo(function Library({ library, loadedPaths, companions, desktop, scrollPosition, onSave, onReload, onOpenFile, onOpenBackups, onRecordSha, onBrowse, onError }: Props) {
-  const [draft, setDraft] = useState<DraftEntry[]>([]);
+  // Start from the loaded file, so the first frame already shows the models
+  // instead of the empty state collapsing away after an effect fills them in.
   const nextId = useRef(0);
+  const [draft, setDraft] = useState<DraftEntry[]>(() => (library?.entries ?? []).map(entry => ({ ...strip(entry), id: ++nextId.current })));
   const resetDraft = (entries: LibraryEntry[]) => {
     const previous = new Map(draft.map(entry => [entry.path, entry]));
     setDraft(entries.map(entry => {
@@ -137,7 +139,7 @@ export const Library = memo(function Library({ library, loadedPaths, companions,
       return { ...next, id: existing?.id ?? ++nextId.current };
     }));
   };
-  const [base, setBase] = useState<{ revision: number; entries: LibraryEntry[] } | null>(null);
+  const [base, setBase] = useState<{ revision: number; entries: LibraryEntry[] } | null>(() => library ? { revision: library.revision, entries: library.entries.map(strip) } : null);
   const [pending, setPending] = useState<string | null>(null);
   const visiblePending = useDelayedPending(pending);
   const rows = library?.entries ?? emptyRows;
@@ -217,7 +219,7 @@ export const Library = memo(function Library({ library, loadedPaths, companions,
     </section>
     <Reveal open={library?.error} className="library-spaced">{library?.error && <div className="load-error" role="alert"><AlertCircle size={18}/><div><strong>models.yml has an error</strong><pre>{library.error}</pre></div></div>}</Reveal>
     <Reveal open={stale} className="library-spaced">{stale && <div className="notice error" role="alert"><span className="notice-text"><AlertCircle size={16}/><span>models.yml changed on disk while you were editing. Discard your changes to see it, or copy them over afterwards.</span></span></div>}</Reveal>
-    <Reveal open={draft.length === 0} className="library-spaced">{draft.length === 0 && <div className="local-empty"><FileCog size={18}/><p>No models yet. Downloads and models found on this machine are added automatically, or click <strong>Add model</strong>.</p></div>}</Reveal>
+    <Reveal open={!!library && draft.length === 0} className="library-spaced">{!!library && draft.length === 0 && <div className="local-empty"><FileCog size={18}/><p>No models yet. Downloads and models found on this machine are added automatically, or click <strong>Add model</strong>.</p></div>}</Reveal>
     <LibraryDirty.Provider value={dirty}>
       <LibraryList scrollPosition={scrollPosition} ids={draft.map(entry => entry.id)} renderRow={index => {
         const entry = draft[index];

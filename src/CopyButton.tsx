@@ -16,6 +16,6 @@ export function CopyButton({ value, label, size = 14, className = '', weight = '
     } catch (e) { onError?.(`Could not copy: ${e instanceof Error ? e.message : String(e)}`); }
   }
   return <button type="button" className={`icon-button small copy-button ${copied ? 'copied' : ''} ${className}`} aria-label={copied ? 'Copied' : label} title={copied ? 'Copied' : label} onClick={copy}>
-    {copied ? <Check size={size} weight="fill"/> : <Copy size={size} weight={weight}/>}
+    {copied ? <Check size={size} weight="bold"/> : <Copy size={size} weight={weight}/>}
   </button>;
 }

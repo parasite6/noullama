@@ -93,7 +93,7 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
     const selected = isChosen(runtime, chosen);
     return <div className={`runtime-build-row ${selected ? 'selected' : ''}`} key={runtime.path}>
       <div className="runtime-build-text"><strong>{runtime.label}</strong><span className="identity-line"><code title={runtime.path}>{runtime.path}</code><CopyButton value={runtime.path} label="Copy runtime path" size={12} onError={onCopyError}/></span><small>{runtime.source}{runtime.backend ? ` / ${backendNames[runtime.backend] ?? runtime.backend}` : ''}</small></div>
-      <div className="setting-control">{selected ? <span className="selected-badge"><Check size={15} weight="fill"/>Selected</span> : <button className="secondary compact" onClick={() => onUse(runtime)}>{use}</button>}</div>
+      <div className="setting-control">{selected ? <span className="selected-badge"><Check size={15} weight="bold"/>Selected</span> : <button className="secondary compact" onClick={() => onUse(runtime)}>{use}</button>}</div>
     </div>;
   };
   return <><section className="panel runtime-manager" aria-label="GPU build">

@@ -57,7 +57,7 @@ function SuffixEditor({ instance, disabled, onSave, onError }: { instance: CardI
   return <form className="instance-suffix" onSubmit={event => { event.preventDefault(); if (changed) void save(draft); }}>
     <span className="instance-names-label">Instance suffix</span>
     <input aria-label={`Suffix for instance ${instance.slot} of ${instance.name}`} placeholder={instance.default_suffix} maxLength={64} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)}/>
-    <button className="secondary compact" disabled={disabled || !changed}><Check size={13}/>Save suffix</button>
+    <button className="secondary compact" disabled={disabled || !changed}><Check size={13} weight="bold"/>Save suffix</button>
     <Reveal open={instance.suffix !== instance.default_suffix} className="inline-reveal">{instance.suffix !== instance.default_suffix && <button type="button" className="ghost" disabled={disabled} title={`Go back to ${instance.default_suffix}`} onClick={() => void save(instance.default_suffix)}><RotateCcw size={13}/>Use {instance.default_suffix}</button>}</Reveal>
     <small>Added to each of this file's names and aliases. Kept only until this instance is ejected; loading it again starts at {instance.default_suffix}.</small>
   </form>;
