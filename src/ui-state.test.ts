@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, deviceChoice, enablesKeyboardFocus, instancesOf, latestOnly, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
+import { apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, deviceChoice, enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
 
 const file = '/models/acme/qwen.gguf';
 const first = { id: 'a1', slot: 1, path: file };
@@ -37,13 +37,13 @@ test('the Playground keeps its model through a load unless that model was replac
 });
 
 // As runtime_devices returns a `--list-devices` line.
-const rtx = { name: 'CUDA0', description: 'NVIDIA GeForce RTX 3080', total_mib: 10240, free_mib: 9800 };
+const rtx = { name: 'CUDA0', description: 'Example GPU', total_mib: 8192, free_mib: 7168 };
 const second3060 = { name: 'CUDA1', description: 'NVIDIA GeForce RTX 3060', total_mib: 11910, free_mib: 11000 };
 
 test('the Device select lists every GPU plus CPU and defaults to the first GPU', () => {
   const choice = deviceChoice('', [rtx, second3060]);
   assert.deepEqual(choice.options, [
-    { value: 'CUDA0', label: 'NVIDIA GeForce RTX 3080', detail: 'CUDA0 · 10 GB' },
+    { value: 'CUDA0', label: 'Example GPU', detail: 'CUDA0 · 8 GB' },
     { value: 'CUDA1', label: 'NVIDIA GeForce RTX 3060', detail: 'CUDA1 · 12 GB' },
     { value: 'CPU', label: 'CPU', detail: 'CPU runtime' },
   ]);
@@ -100,6 +100,53 @@ test('fit requests wait for a pause in typing, run one at a time and apply only 
   requests.request(5); requests.cancel();
   await pause(40);
   assert.deepEqual(sent, [2, 4], 'cancelled before it was sent');
+});
+
+test('a newer debounce discards arguments already waiting behind a running fit', async () => {
+  const sent: string[] = [];
+  const applied: string[] = [];
+  let finishFirst!: () => void;
+  const first = new Promise<void>(resolve => { finishFirst = resolve; });
+  const fit = latestOnly(20, async (arg: string) => {
+    sent.push(arg);
+    if (arg === 'A') await first;
+    return arg;
+  }, result => { if (result.ok) applied.push(result.value); });
+  fit.request('A');
+  await pause(40);
+  fit.request('B');
+  await pause(40);
+  fit.request('C');
+  finishFirst();
+  await pause(40);
+  assert.deepEqual(sent, ['A', 'C']);
+  assert.deepEqual(applied, ['C']);
+});
+
+test('settings saved during editing only clear matching draft groups', () => {
+  const before = { runtime_path: '/example/old', gpu_layers: 20 };
+  const submitted = { ...before, runtime_path: '/example/new' };
+  const fields = ['runtime_path'] as const;
+  assert.equal(settingsGroupMatches(before, before, fields, true), false);
+  assert.equal(settingsGroupMatches(before, submitted, fields, false), false, 'the edit back to the old path stays dirty');
+  assert.equal(settingsGroupMatches({ ...submitted, gpu_layers: 24 }, submitted, fields, false), true);
+});
+
+test('a runtime probe is shown only for both inputs it checked', () => {
+  const result = { path: '/example/build', libraryPath: '/example/lib', output: 'Example output' };
+  assert.equal(matchingProbe(result, result.path, result.libraryPath), result.output);
+  assert.equal(matchingProbe(result, '/example/other', result.libraryPath), null);
+  assert.equal(matchingProbe(result, result.path, ''), null);
+});
+
+test('choosing a main runtime edits the Runtime path only', () => {
+  const app = readFileSync(new URL('./main.tsx', import.meta.url), 'utf8');
+  assert.match(app, /onSelect=\{runtime => edit\('runtime_path', runtime\.path\)\}/);
+});
+
+test('selected runtime copy controls reveal on keyboard focus', () => {
+  const css = readFileSync(new URL('./styles.css', import.meta.url), 'utf8');
+  assert.match(css, /\.keyboard-nav \.runtime-current \.copy-button:focus[^{}]*\{ opacity: 1; \}/);
 });
 
 test('the quit prompt counts the loaded models', () => {

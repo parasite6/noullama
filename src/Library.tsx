@@ -162,7 +162,7 @@ export function Library({ library, loadedPaths, companions, desktop, onSave, onR
 
 // The Settings tab's sha256 choice.
 export const SHA_CHECKS: { value: string; label: string; detail: string }[] = [
-  { value: 'once', label: 'Hash once', detail: 'Each file is hashed once in the background. Before a load the hash is read again only if the file\'s size or modified time changed. A mismatch stops the load until you accept the new sha256 in Library.' },
+  { value: 'once', label: 'Hash once', detail: 'Each file is hashed once in the background. Before a load the hash is read again if the file changed. A mismatch stops the load until you accept the new sha256 in Library.' },
   { value: 'every_load', label: 'Every load', detail: 'The whole file is hashed before every load. Safest, but a large model takes 10–30 seconds longer to load.' },
   { value: 'warn', label: 'Warn only', detail: 'Hashed as with Hash once, but a mismatch only adds a warning to the log and the model loads anyway.' },
   { value: 'off', label: 'Off', detail: 'No hashing. sha256 values already in models.yml are kept but not checked.' },

@@ -1002,7 +1002,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
         let cpu = state.runtimes.cpu_progress.lock().await.clone();
         assert!(!cpu.active && cpu.error.is_none(), "{:?}", cpu.error);
-        assert_eq!(cpu.message, "The official CPU build and its fallback are ready. Save settings to use the nightly as the CPU runtime.");
+        assert_eq!(cpu.message, "CPU builds installed. Choose Use for CPU, then save settings.");
         assert_eq!(cpu.downloaded, cpu.total);
         let installed: Vec<_> = cpu.installed.iter().map(|r| r.path.clone()).collect();
         assert_eq!(installed.len(), 2);
@@ -1265,7 +1265,7 @@ async fn begin_install(
             Ok(()) => {
                 progress.message = match download {
                     Download::Builds => "Nightly and official fallback are ready. Choose which runtime to use.",
-                    Download::Cpu => "The official CPU build and its fallback are ready. Save settings to use the nightly as the CPU runtime.",
+                    Download::Cpu => "CPU builds installed. Choose Use for CPU, then save settings.",
                 }
                 .into()
             }

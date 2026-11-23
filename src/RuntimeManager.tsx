@@ -56,13 +56,6 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
   useEffect(() => { if (desktop) void discover(); }, []);
   useEffect(() => { if (desktop && progress?.installed.length && !progress.active) void discover(); }, [progress?.installed.length, progress?.active]);
   useEffect(() => { if (desktop && cpuProgress?.installed.length && !cpuProgress.active) void discover(); }, [cpuProgress?.installed.length, cpuProgress?.active]);
-  // When the CPU download finishes, fill in its nightly as the CPU runtime: an unsaved edit, like "Use for CPU".
-  const cpuWasActive = useRef(false);
-  useEffect(() => {
-    if (cpuWasActive.current && cpuProgress && !cpuProgress.active && !cpuProgress.error && cpuProgress.installed.length) onSelectCpu(cpuProgress.installed[0]);
-    cpuWasActive.current = !!cpuProgress?.active;
-  }, [cpuProgress?.active]);
-  // When a download finishes, select the nightly (installed first); the official build stays as the fallback.
   const wasActive = useRef(false);
   useEffect(() => {
     if (wasActive.current && progress && !progress.active && !progress.error && progress.installed.length) onSelect(progress.installed[0]);
@@ -100,7 +93,7 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
     <div className="panel-heading"><span><Cpu size={16}/> llama.cpp</span><span className="muted">{scan?.platform ?? 'Local runtimes'}</span></div>
     <div className="settings-body">
       <Current kicker="Selected build" name={currentName} path={currentPath} copyLabel="Copy runtime path" onCopyError={setError}
-        description="Used by loads on a GPU device." more="Loads whose Device is CPU use the CPU runtime below instead."
+        description="Used by loads on a GPU device." more="Automatic CPU selection uses this build when no CPU runtime is set."
         status={<>{!currentPath && <StatusNote tone="warn">No build selected. Choose one below, enter its path, or download one.</StatusNote>}{running && <StatusNote tone="info">Loaded models keep the build they started with. A new choice applies to the next model you load.</StatusNote>}</>}/>
       <SettingSection title="Installed builds" description="Builds found on this computer." more="Found in Noullama downloads, in the folders of the selected GPU and CPU builds, in the folder above the GPU build's folder, and on PATH."
         aside={<button className="secondary compact" disabled={!desktop || !!pending} onClick={() => void discover()}><RefreshCw size={14} className={scanning ? 'spin' : ''}/>{scanning ? 'Scanning…' : 'Scan local builds'}</button>}>
@@ -130,7 +123,7 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
           : <StatusNote tone={scanning ? 'pending' : 'info'}>{scanning ? 'Checking local runtime locations…' : 'No CPU builds found. Download the official one below or enter a path.'}</StatusNote>}
       </SettingSection>
       <SettingSection title="Custom path">{cpuChildren}</SettingSection>
-      <SettingSection title="Download a build" description="The newest nightly CPU build, plus the latest stable one as a fallback." more="Downloads the newest nightly CPU build plus the latest official stable CPU build as a fallback, from the same official releases and with the same checks as above. The nightly is filled in as the CPU runtime; save to use it.">
+      <SettingSection title="Download a build" description="The newest nightly CPU build, plus the latest stable one as a fallback." more="Downloads the newest nightly CPU build plus the latest official stable CPU build as a fallback, from the same official releases and with the same checks as above. Choose Use for CPU on the build you want, then save settings.">
         <SettingRow label="Official CPU build" description="Checked against SHA-256 and extracted locally." wide
           control={<button className="primary" disabled={!desktop || !!pending || downloading} onClick={() => void downloadCpu()}><ArrowDownToLine size={14}/>{pending === 'cpu-download' ? 'Starting…' : 'Download the official CPU build'}</button>}/>
         {progress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the download above has finished.</StatusNote>}

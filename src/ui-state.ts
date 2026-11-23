@@ -104,6 +104,7 @@ export function latestOnly<A, R>(delay: number, run: (args: A) => Promise<R>, ap
   return {
     request(args: A) {
       generation += 1;
+      waiting = null;
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => { timer = null; waiting = { args }; void start(); }, delay);
     },
@@ -170,4 +171,14 @@ const navigationKeys = new Set(['Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'Ar
 export function enablesKeyboardFocus(event: Pick<KeyboardEvent, 'key' | 'altKey' | 'ctrlKey' | 'metaKey'>, onControl: boolean): boolean {
   if (event.altKey || event.ctrlKey || event.metaKey) return false;
   return navigationKeys.has(event.key) || (onControl && (event.key === 'Enter' || event.key === ' '));
+}
+
+
+export function matchingProbe(result: { path: string; libraryPath: string; output: string } | null, path: string, libraryPath: string) {
+  return result?.path === path && result.libraryPath === libraryPath ? result.output : null;
+}
+
+
+export function settingsGroupMatches<T>(draft: T, saved: T, fields: readonly (keyof T)[], saving: boolean) {
+  return !saving && fields.every(key => draft[key] === saved[key]);
 }

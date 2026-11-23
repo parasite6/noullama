@@ -16,7 +16,7 @@ pub fn not_found(device: &str) -> String {
 }
 
 /// One device line of `llama-server --list-devices`, such as
-/// `  CUDA0: NVIDIA GeForce RTX 3080 (10240 MiB, 9800 MiB free)`.
+/// `  CUDA0: Example GPU (8192 MiB, 7168 MiB free)`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RuntimeDevice {
     /// What `--device` takes, such as `CUDA0` or `Vulkan1`.
@@ -77,7 +77,9 @@ pub fn choose_device(settings: &Settings, listed: Option<&[RuntimeDevice]>) -> R
         name if listed.is_some_and(|l| l.iter().any(|d| d.name == name)) => name.to_owned(),
         name => return Err(not_found(name)),
     };
-    if device == CPU && settings.cpu_runtime_path.trim().is_empty() {
+    if device == CPU && settings.cpu_runtime_path.trim().is_empty()
+        && (!saved.is_empty() || settings.runtime_path.trim().is_empty())
+    {
         return Err(CPU_RUNTIME_MISSING.into());
     }
     Ok(device)
@@ -100,7 +102,9 @@ pub fn gpu_layers(settings: &Settings) -> i32 {
 pub fn launch_settings(settings: &Settings) -> Settings {
     let mut launch = settings.clone();
     if on_cpu(settings) {
-        launch.runtime_path = settings.cpu_runtime_path.clone();
+        if !settings.cpu_runtime_path.trim().is_empty() {
+            launch.runtime_path = settings.cpu_runtime_path.clone();
+        }
         launch.gpu_layers = 0;
     }
     launch
@@ -174,21 +178,36 @@ pub async fn runtime_devices(state: tauri::State<'_, AppState>) -> Result<Value,
 mod tests {
     use super::*;
 
-    /// The format `llama-server --list-devices` (CUDA build) prints for one
+    /// Example output in the format `llama-server --list-devices` (CUDA build) prints for one
     /// GPU: stdout, then stderr empty.
-    const ONE_GPU: &str = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3080 (10240 MiB, 9800 MiB free)\n";
+    const ONE_GPU: &str = "Available devices:\n  CUDA0: Example GPU (8192 MiB, 7168 MiB free)\n";
     /// The same build with no usable GPU (CUDA_VISIBLE_DEVICES empty), and the
     /// official CPU build: exit status 0 either way. The CUDA error goes to stderr.
     const NO_GPU: &str = "Available devices:\n  (none)\n";
     const NO_GPU_STDERR: &str = "0.00.087.363 E ggml_cuda_init: failed to initialize CUDA: no CUDA-capable device is detected\n";
 
     #[test]
-    fn reads_the_real_list_devices_output() {
+    fn automatic_cpu_uses_the_main_runtime_until_a_dedicated_build_is_saved() {
+        let mut settings = Settings { runtime_path: "/example/main".into(), ..Settings::default() };
+        let mut launch = settings.clone();
+        launch.device = choose_device(&settings, Some(&[])).unwrap();
+        assert_eq!(launch.device, CPU);
+        assert_eq!(launch_settings(&launch).runtime_path, settings.runtime_path);
+        assert_eq!(launch_settings(&launch).gpu_layers, 0);
+        assert!(settings.cpu_runtime_path.is_empty());
+
+        settings.cpu_runtime_path = "/example/cpu".into();
+        settings.device = choose_device(&settings, Some(&[])).unwrap();
+        assert_eq!(launch_settings(&settings).runtime_path, "/example/cpu");
+    }
+
+    #[test]
+    fn reads_example_list_devices_output() {
         assert_eq!(parse_list_devices(ONE_GPU), [RuntimeDevice {
             name: "CUDA0".into(),
-            description: "NVIDIA GeForce RTX 3080".into(),
-            total_mib: Some(10240),
-            free_mib: Some(9800),
+            description: "Example GPU".into(),
+            total_mib: Some(8192),
+            free_mib: Some(7168),
         }]);
         assert!(parse_list_devices(NO_GPU).is_empty());
         assert!(parse_list_devices("").is_empty());
@@ -201,15 +220,15 @@ mod tests {
     fn reads_every_device_of_a_multi_gpu_list() {
         // Same format as the capture: two CUDA cards, a Vulkan device whose
         // description has parentheses, and an RPC device with a colon in its name.
-        let text = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 4090 (24076 MiB, 23500 MiB free)\n  CUDA1: NVIDIA GeForce RTX 3060 (11910 MiB, 11000 MiB free)\n  Vulkan0: AMD Radeon Graphics (RADV GFX1103_R1) (8192 MiB, 8000 MiB free)\n  RPC[10.0.0.2:50052]: RPC[10.0.0.2:50052] (16000 MiB, 15000 MiB free)\n";
+        let text = "Available devices:\n  CUDA0: Example GPU A (24076 MiB, 23500 MiB free)\n  CUDA1: Example GPU B (11910 MiB, 11000 MiB free)\n  Vulkan0: Example GPU (Vulkan) (8192 MiB, 8000 MiB free)\n  RPC[192.0.2.20:50052]: RPC[192.0.2.20:50052] (16000 MiB, 15000 MiB free)\n";
         let devices = parse_list_devices(text);
         let names: Vec<_> = devices.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, ["CUDA0", "CUDA1", "Vulkan0", "RPC[10.0.0.2:50052]"]);
-        assert_eq!(devices[1].description, "NVIDIA GeForce RTX 3060");
+        assert_eq!(names, ["CUDA0", "CUDA1", "Vulkan0", "RPC[192.0.2.20:50052]"]);
+        assert_eq!(devices[1].description, "Example GPU B");
         assert_eq!((devices[1].total_mib, devices[1].free_mib), (Some(11910), Some(11000)));
-        assert_eq!(devices[2].description, "AMD Radeon Graphics (RADV GFX1103_R1)");
+        assert_eq!(devices[2].description, "Example GPU (Vulkan)");
         assert_eq!(devices[2].total_mib, Some(8192));
-        assert_eq!(devices[0].display(), "CUDA0 · NVIDIA GeForce RTX 4090");
+        assert_eq!(devices[0].display(), "CUDA0 · Example GPU A");
     }
 
     fn settings(device: &str, cpu_runtime: &str) -> Settings {

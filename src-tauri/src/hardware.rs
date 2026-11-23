@@ -171,17 +171,22 @@ pub fn cuda_in_pci_order(device: &str) -> bool {
         && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none()
 }
 
-/// Graphics memory `(total, used)` for a load on `device`: that GPU's own
-/// reading when it maps to one nvidia-smi entry, else the whole-machine
-/// reading of `memory_use` (the first NVIDIA GPU, or AMD sysfs).
-pub fn device_memory(device: &str, devices: &[crate::devices::RuntimeDevice]) -> Option<(u64, u64)> {
-    if let Some(gpus) = nvidia_gpus() {
-        if let Some(index) = match_gpu(device, devices, &gpus, cuda_in_pci_order(device)) {
-            return Some((gpus[index].total_bytes, gpus[index].used_bytes));
-        }
+/// Live NVIDIA memory for the selected device when it maps unambiguously.
+pub fn nvidia_device_memory(device: &str, devices: &[crate::devices::RuntimeDevice]) -> Option<(u64, u64)> {
+    if !device.starts_with("CUDA") {
+        return None;
     }
-    let usage = memory_use(&[]);
-    Some((usage.total_bytes?, usage.used_bytes?))
+    let gpus = nvidia_gpus()?;
+    let index = match_gpu(device, devices, &gpus, cuda_in_pci_order(device))?;
+    Some((gpus[index].total_bytes, gpus[index].used_bytes))
+}
+
+/// Memory from a fresh runtime probe of the selected device.
+pub fn listed_device_memory(device: &str, devices: &[crate::devices::RuntimeDevice]) -> Option<(u64, u64)> {
+    let reading = devices.iter().find(|entry| entry.name == device)?;
+    let total = reading.total_mib?.saturating_mul(1024 * 1024);
+    let free = reading.free_mib?.saturating_mul(1024 * 1024);
+    (total > 0 && free <= total).then(|| (total, total - free))
 }
 
 fn mib(text: &str) -> Option<u64> {
@@ -491,6 +496,17 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_memory_uses_only_the_selected_device() {
+        let devices = crate::devices::parse_list_devices(
+            "Available devices:\n  CUDA0: Example GPU (8192 MiB, 1024 MiB free)\n  CUDA1: Example GPU (8192 MiB, 7168 MiB free)\n  CUDA2: Example GPU\n",
+        );
+        let mib = 1024 * 1024;
+        assert_eq!(super::listed_device_memory("CUDA1", &devices), Some((8192 * mib, 1024 * mib)));
+        assert_eq!(super::listed_device_memory("CUDA2", &devices), None);
+        assert_eq!(super::listed_device_memory("CUDA3", &devices), None);
+    }
+
     use super::*;
 
     #[test]
@@ -514,23 +530,23 @@ mod tests {
     fn llama_devices_map_to_their_own_nvidia_gpu() {
         use crate::devices::parse_list_devices;
         // The format nvidia-smi prints for `index,name,memory.used,memory.total`
-        // (for example "0, NVIDIA GeForce RTX 3080, 15, 10240").
-        let gpus = parse_nvidia_gpus("0, NVIDIA GeForce RTX 3060, 100, 12288\n1, NVIDIA GeForce RTX 4090, 2000, 24564\n2, Odd, Name, 5, 10\n");
+        // (for example "0, Example GPU, 15, 10240").
+        let gpus = parse_nvidia_gpus("0, Example GPU A, 100, 12288\n1, Example GPU B, 2000, 24564\n2, Odd, Name, 5, 10\n");
         assert_eq!(gpus.len(), 3);
         assert_eq!(gpus[2].name, "Odd, Name");
         assert_eq!((gpus[1].used_bytes, gpus[1].total_bytes), (2000 << 20, 24564 << 20));
         // CUDA lists the faster card first; names put each on its own GPU.
-        let devices = parse_list_devices("Available devices:\n  CUDA0: NVIDIA GeForce RTX 4090 (24076 MiB, 22000 MiB free)\n  CUDA1: NVIDIA GeForce RTX 3060 (11910 MiB, 11800 MiB free)\n");
+        let devices = parse_list_devices("Available devices:\n  CUDA0: Example GPU B (24076 MiB, 22000 MiB free)\n  CUDA1: Example GPU A (11910 MiB, 11800 MiB free)\n");
         assert_eq!(match_gpu("CUDA0", &devices, &gpus, false), Some(1));
         assert_eq!(match_gpu("CUDA1", &devices, &gpus, false), Some(0));
         assert_eq!(match_gpu("CUDA7", &devices, &gpus, false), None);
         // Two identical cards: their order is only known in PCI bus order.
-        let twins = parse_nvidia_gpus("0, NVIDIA A10, 1, 23028\n1, NVIDIA A10, 2, 23028\n");
-        let devices = parse_list_devices("Available devices:\n  CUDA0: NVIDIA A10 (22000 MiB, 21000 MiB free)\n  CUDA1: NVIDIA A10 (22000 MiB, 21000 MiB free)\n");
+        let twins = parse_nvidia_gpus("0, Example GPU C, 1, 23028\n1, Example GPU C, 2, 23028\n");
+        let devices = parse_list_devices("Available devices:\n  CUDA0: Example GPU C (22000 MiB, 21000 MiB free)\n  CUDA1: Example GPU C (22000 MiB, 21000 MiB free)\n");
         assert_eq!(match_gpu("CUDA1", &devices, &twins, false), None);
         assert_eq!(match_gpu("CUDA1", &devices, &twins, true), Some(1));
         // A device nvidia-smi does not list (AMD over Vulkan) has no reading of its own.
-        let amd = parse_list_devices("Available devices:\n  Vulkan0: AMD Radeon RX 7900 XTX (RADV NAVI31) (24560 MiB, 24000 MiB free)\n");
+        let amd = parse_list_devices("Available devices:\n  Vulkan0: Example GPU (Vulkan) (24560 MiB, 24000 MiB free)\n");
         assert_eq!(match_gpu("Vulkan0", &amd, &gpus, true), None);
     }
 

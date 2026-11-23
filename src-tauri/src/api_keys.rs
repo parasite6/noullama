@@ -2,7 +2,7 @@ use crate::{library, runtime::AppState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     os::unix::fs::OpenOptionsExt,
@@ -22,9 +22,16 @@ pub struct Binding {
 // None means unrestricted. A restricted grant is tied to Library entries,
 // irrespective of the names used to reach their loaded instances.
 #[derive(Clone, Default)]
-pub struct Access(pub Option<Vec<Binding>>);
+pub struct Access(pub Option<Vec<Binding>>, Option<[u8; 32]>);
 
 impl Access {
+    pub fn allows_loaded_sum(&self, path: &str, loaded: Option<&str>) -> bool {
+        self.0.as_ref().is_none_or(|bindings| bindings.iter().any(|binding| {
+            binding.path == path && Some(binding.sha256.as_str()) == loaded
+        }))
+    }
+
+
     pub fn allows_alias_owner(&self, base: &str, path: &str) -> bool {
         self.0.as_ref().is_none_or(|bindings| {
             !bindings.iter().any(|binding| {
@@ -79,7 +86,24 @@ pub struct KeyInfo {
     prefix: String,
     created: u64,
     expires: Option<u64>,
+    #[serde(deserialize_with = "read_models")]
     models: Option<Vec<Binding>>,
+}
+
+// Requiring the field distinguishes a partial record from an explicit Any scope.
+fn read_models<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<Binding>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Scope {
+        Restricted(Vec<Binding>),
+        Name(String),
+    }
+    match Option::<Scope>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Scope::Restricted(bindings)) => Ok(Some(bindings)),
+        Some(Scope::Name(name)) if name == "any" => Ok(None),
+        _ => Err(serde::de::Error::custom("Invalid API key scope")),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,6 +122,7 @@ pub struct CreatedKey {
 pub struct KeyStore {
     directory: PathBuf,
     lock: Mutex<()>,
+    live: std::sync::Mutex<HashMap<[u8; 32], Option<u64>>>,
 }
 
 pub enum Rejection {
@@ -118,6 +143,7 @@ impl KeyStore {
         Self {
             directory,
             lock: Mutex::new(()),
+            live: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -157,16 +183,34 @@ impl KeyStore {
     pub async fn authorize(&self, key: &str) -> Result<Access, Rejection> {
         let digest: [u8; 32] = Sha256::digest(key).into();
         let _guard = self.lock.lock().await;
-        let found = self
-            .read()
-            .map_err(|_| Rejection::Unavailable)?
-            .into_iter()
-            .find(|stored| stored.digest == digest)
-            .ok_or(Rejection::Unknown)?;
-        if found.info.expires.is_some_and(|expiry| expiry <= now()) {
+        let keys = self.read().map_err(|_| {
+            self.update_live(&[]);
+            Rejection::Unavailable
+        })?;
+        self.update_live(&keys);
+        self.check(&digest)?;
+        let found = keys.into_iter().find(|stored| stored.digest == digest).ok_or(Rejection::Unknown)?;
+        Ok(Access(found.info.models, Some(digest)))
+    }
+
+    fn update_live(&self, keys: &[StoredKey]) {
+        let next = keys.iter().map(|key| (key.digest, key.info.expires)).collect();
+        *self.live.lock().unwrap_or_else(|error| error.into_inner()) = next;
+    }
+
+    fn check(&self, digest: &[u8; 32]) -> Result<(), Rejection> {
+        let expiry = self.live.lock().unwrap_or_else(|error| error.into_inner()).get(digest).copied().ok_or(Rejection::Unknown)?;
+        if expiry.is_some_and(|expiry| expiry <= now()) {
             return Err(Rejection::Expired);
         }
-        Ok(Access(found.info.models))
+        Ok(())
+    }
+
+    pub fn revalidate(&self, access: &Access) -> Result<(), Rejection> {
+        if let Some(digest) = &access.1 {
+            self.check(digest)?;
+        }
+        Ok(())
     }
 
     async fn list(&self) -> Result<Vec<KeyInfo>, String> {
@@ -213,14 +257,16 @@ impl KeyStore {
             info: info.clone(),
         });
         self.write(&keys)?;
+        self.update_live(&keys);
         Ok(CreatedKey { key, info })
     }
 
-    async fn delete(&self, id: &str) -> Result<Vec<KeyInfo>, String> {
+    pub(crate) async fn delete(&self, id: &str) -> Result<Vec<KeyInfo>, String> {
         let _guard = self.lock.lock().await;
         let mut keys = self.read()?;
         keys.retain(|key| key.info.id != id);
         self.write(&keys)?;
+        self.update_live(&keys);
         Ok(keys.into_iter().map(|stored| stored.info).collect())
     }
 }
@@ -292,7 +338,7 @@ pub async fn create(
     if models.iter().any(|model| model.entry(&library).is_none()) {
         return Err("A selected model or alias changed in Library. Try again.".into());
     }
-    let access = Access(Some(bindings));
+    let access = Access(Some(bindings), None);
     let allowed = access
         .allowed_paths(state, &library)
         .await
@@ -347,6 +393,21 @@ pub async fn delete_api_key(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn stored_scope_requires_models_and_accepts_legacy_any_values() {
+        let mut record = serde_json::json!({
+            "id": "example", "name": "Example", "prefix": "example",
+            "created": 1, "expires": null, "digest": vec![0; 32]
+        });
+        assert!(serde_json::from_value::<StoredKey>(record.clone()).is_err());
+        for scope in [serde_json::Value::Null, serde_json::json!("any")] {
+            record["models"] = scope;
+            let key = serde_json::from_value::<StoredKey>(record.clone()).unwrap();
+            assert!(key.info.models.is_none());
+            assert!(serde_json::to_value(key).unwrap().as_object().unwrap().contains_key("models"));
+        }
+    }
 
     #[tokio::test]
     async fn api_key_file_is_private_and_hash_only_and_survives_reload() {

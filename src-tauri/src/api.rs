@@ -58,6 +58,18 @@ async fn loopback_only(State(state): State<AppState>, request: Request, next: Ne
     next.run(request).await
 }
 
+fn key_error(error: Rejection) -> ApiError {
+    match error {
+        Rejection::Unknown => ApiError(StatusCode::UNAUTHORIZED, "Unknown API key.".into()),
+        Rejection::Expired => ApiError(StatusCode::UNAUTHORIZED, "API key has expired.".into()),
+        Rejection::Unavailable => ApiError(StatusCode::SERVICE_UNAVAILABLE, "Cannot read API key file.".into()),
+    }
+}
+
+fn loaded_checksum_error() -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, "API key requires a matching loaded model checksum.".into())
+}
+
 async fn authorize(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let access = if (path == "/health" || path.starts_with("/v1/")) && state.settings.lock().await.require_api_key {
@@ -72,9 +84,7 @@ async fn authorize(State(state): State<AppState>, mut request: Request, next: Ne
         };
         match state.api_keys.authorize(key).await {
             Ok(access) => access,
-            Err(Rejection::Unknown) => return ApiError(StatusCode::UNAUTHORIZED, "Unknown API key.".into()).into_response(),
-            Err(Rejection::Expired) => return ApiError(StatusCode::UNAUTHORIZED, "API key has expired.".into()).into_response(),
-            Err(Rejection::Unavailable) => return ApiError(StatusCode::SERVICE_UNAVAILABLE, "Cannot read API key file.".into()).into_response(),
+            Err(error) => return key_error(error).into_response(),
         }
     } else {
         Access::default()
@@ -211,21 +221,23 @@ async fn infer(state: &AppState, payload: Value, access: &Access) -> Result<(Val
     };
     // `any-available` (exact) claims an idle instance of any model, waiting
     // for one when the setting says so; every other name routes as usual.
-    let result = if requested.as_deref() == Some(ANY_AVAILABLE) {
-        let claim = state.claim_any(access).await.map_err(|error| match error {
+    let claim = if requested.as_deref() == Some(ANY_AVAILABLE) {
+        state.claim_any(access).await.map_err(|error| match error {
+            AnyError::LoadedChecksum => loaded_checksum_error(),
             AnyError::NoneReady(m) | AnyError::Busy(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
-        })?;
-        state.infer_claimed(&claim, payload).await
+        })?
     } else {
         let instance = state.route(requested.as_deref(), access).await.map_err(|error| match error {
             RouteError::Missing(m) => ApiError(StatusCode::BAD_REQUEST, m),
             RouteError::Unavailable(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
             RouteError::Unknown(m) => ApiError(StatusCode::NOT_FOUND, m),
+            RouteError::LoadedChecksum => loaded_checksum_error(),
             RouteError::Forbidden => ApiError(StatusCode::FORBIDDEN, "API key does not allow this model.".into()),
             RouteError::Ambiguous(m) => ApiError(StatusCode::CONFLICT, m),
         })?;
-        state.infer_on(&instance, payload).await
+        state.claim_named(&instance)
     };
+    let result = state.infer_claimed(&claim, payload, access).await.map_err(key_error)?;
     let requested = requested.unwrap_or_default();
     let mut result = result.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e))?;
     if let Some(model) = result.get_mut("model") {
@@ -499,6 +511,115 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_keys_refuse_replaced_or_unknown_loaded_weights() {
+        use crate::{api_keys::{create, ModelSelection}, library};
+        let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        state.settings.lock().await.sha256_check = "off".into();
+        let path = dir.join("weights.gguf").to_str().unwrap().to_owned();
+        std::fs::write(&path, "initial weights").unwrap();
+        library::ensure(&state, std::slice::from_ref(&path)).await;
+        let key = serde_json::to_value(create(&state, "Restricted", None, Some(vec![
+            ModelSelection { path: path.clone(), name: "weights".into() },
+        ])).await.unwrap()).unwrap();
+        let key = key["key"].as_str().unwrap();
+        let original = library::verify(&state, &path, library::Slot::Model, library::Check::Once, "").await.unwrap().unwrap();
+        state.settings.lock().await.require_api_key = true;
+        let app = router(state.clone());
+        let first = crate::runtime::insert_test_instance(&state, &path, true).await;
+        let assert_denied = || async {
+            for name in ["weights", "any-available"] {
+                let mut payload = request();
+                payload["model"] = json!(name);
+                let (status, body) = keyed_request(&app, "/v1/systemone", Some(key), Some(payload)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body["error"]["message"], "API key requires a matching loaded model checksum.");
+            }
+            assert_eq!(keyed_request(&app, "/v1/models", Some(key), None).await.1["data"], json!([]));
+        };
+        assert_denied().await;
+        crate::runtime::unload(&state, &first.id).await.unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = dir.join("replacement.gguf");
+        std::fs::write(&replacement, "changed weights").unwrap();
+        std::fs::File::open(&replacement).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime)).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        let second = crate::runtime::insert_test_instance(&state, &path, true).await;
+        let mut settings = state.settings.lock().await.clone();
+        settings.model_path.clone_from(&path);
+        settings.sha256_check = "warn".into();
+        let actual = library::verify_load(&state, &settings, "").await.unwrap().unwrap();
+        assert_ne!(actual, original);
+        second.loaded_sha256.set(actual).unwrap();
+        assert_denied().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_requests_recheck_deleted_and_expired_keys_before_dispatch() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        state.settings.lock().await.require_api_key = true;
+        crate::runtime::set_when_busy(&state, "wait").await.unwrap();
+        let model = crate::runtime::insert_test_instance(&state, "example.gguf", true).await;
+        let app = router(state.clone());
+        for (expires, message) in [(false, "Unknown API key."), (true, "API key has expired.")] {
+            let epoch = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let expiry = expires.then(|| epoch() + 2);
+            let created = serde_json::to_value(crate::api_keys::create(&state, message, expiry, None).await.unwrap()).unwrap();
+            let held = crate::runtime::hold_test_claim(&state, &model);
+            let mut payload = request();
+            payload["model"] = json!("any-available");
+            let waiting = keyed_request(&app, "/v1/systemone", created["key"].as_str(), Some(payload));
+            tokio::pin!(waiting);
+            assert!(tokio::time::timeout(Duration::from_millis(25), &mut waiting).await.is_err());
+            if let Some(expiry) = expiry {
+                while epoch() < expiry {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            } else {
+                state.api_keys.delete(created["info"]["id"].as_str().unwrap()).await.unwrap();
+            }
+            drop(held);
+            let (status, body) = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body["error"]["message"], message);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_deleted_while_queued_on_a_named_instance_never_reaches_the_runtime() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        let (port, seen) = fake_native_runtime_after(250).await;
+        let model = crate::runtime::insert_test_instance_on(&state, "example.gguf", true, port).await;
+        state.settings.lock().await.require_api_key = true;
+        let app = router(state.clone());
+        let created = serde_json::to_value(crate::api_keys::create(&state, "Example", None, None).await.unwrap()).unwrap();
+        let generating = tokio::spawn({
+            let state = state.clone();
+            async move { state.infer_on(&model, request()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let queued = keyed_decision(&app, created["key"].as_str().unwrap(), "example");
+        tokio::pin!(queued);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut queued).await.is_err());
+        state.api_keys.delete(created["info"]["id"].as_str().unwrap()).await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), queued).await.unwrap(), StatusCode::UNAUTHORIZED);
+        generating.await.unwrap().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn api_key_switch_checks_missing_unknown_and_expired_keys_on_api_and_health() {
         let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(dir.clone()).unwrap();
@@ -550,8 +671,11 @@ pub(crate) mod tests {
         library::ensure(&state, &[sorter.clone(), other.clone()]).await;
         crate::runtime::set_aliases(&state, sorter.clone(), vec!["fast".into(), "triage".into()]).await.unwrap();
         let (port, _) = fake_native_runtime().await;
-        crate::runtime::insert_test_instance_on(&state, &sorter, true, port).await;
-        crate::runtime::insert_test_instance_on(&state, &sorter, true, port).await;
+        let sum = library::current_hash(&state, &sorter, false).await.unwrap();
+        for _ in 0..2 {
+            let instance = crate::runtime::insert_test_instance_on(&state, &sorter, true, port).await;
+            instance.loaded_sha256.set(sum.clone()).unwrap();
+        }
         crate::runtime::insert_test_instance_on(&state, &other, true, port).await;
         let pick = |name: &str| ModelSelection { path: sorter.clone(), name: name.into() };
         let picked = serde_json::to_value(create(&state, "Alias only", None, Some(vec![pick("fast")])).await.unwrap()).unwrap();
@@ -594,6 +718,10 @@ pub(crate) mod tests {
         let first = crate::runtime::insert_test_instance_on(&state, &a_path, true, a_port).await;
         let second = crate::runtime::insert_test_instance_on(&state, &a_path, true, a_port).await;
         let other = crate::runtime::insert_test_instance_on(&state, &b_path, true, b_port).await;
+        for instance in [&first, &second, &other] {
+            let sum = library::current_hash(&state, instance.path(), false).await.unwrap();
+            instance.loaded_sha256.set(sum).unwrap();
+        }
         library::ensure(&state, &[a_path.clone(), b_path.clone()]).await;
         crate::runtime::set_aliases(&state, a_path.clone(), vec!["triage".into()]).await.unwrap();
         crate::runtime::change_instance_aliases(&state, &second.id, vec!["session-alias".into()]).await.unwrap();

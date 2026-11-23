@@ -622,24 +622,46 @@ pub async fn attach(state: &AppState, companion: &str) {
 
 // ---------------------------------------------------------------- sha256
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(PartialEq)]
+pub(crate) struct FileStamp {
+    size: u64,
+    modified: u128,
+    identity: (u64, u64, i64, i64),
+}
+
+#[derive(Serialize, Deserialize)]
 struct Fingerprint {
     size: u64,
     modified: u128,
+    // Older cache records still deserialize but need one fresh hash.
+    #[serde(default)]
+    identity: Option<(u64, u64, i64, i64)>,
     sha256: String,
 }
 
-fn fingerprint(path: &str) -> Option<(u64, u128)> {
+impl Fingerprint {
+    fn matches(&self, stamp: &FileStamp) -> bool {
+        self.size == stamp.size && self.modified == stamp.modified && self.identity == Some(stamp.identity)
+    }
+}
+
+pub(crate) fn fingerprint(path: &str) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos();
-    Some((meta.len(), modified))
+    Some(FileStamp {
+        size: meta.len(),
+        modified,
+        identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+    })
 }
 
 fn read_cache(data_dir: &Path) -> BTreeMap<String, Fingerprint> {
     std::fs::read(data_dir.join(HASH_CACHE)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
 
-/// Cached sums whose file size and modification time still match.
+/// Cached sums whose file identity and timestamps still match.
 pub async fn cached_hashes(state: &AppState, paths: &[&str]) -> BTreeMap<String, String> {
     if paths.is_empty() {
         return BTreeMap::new();
@@ -648,7 +670,7 @@ pub async fn cached_hashes(state: &AppState, paths: &[&str]) -> BTreeMap<String,
     let cache = read_cache(&state.data_dir);
     paths.iter().copied().filter_map(|path| {
         let cached = cache.get(path)?;
-        (fingerprint(path) == Some((cached.size, cached.modified)))
+        fingerprint(path).is_some_and(|stamp| cached.matches(&stamp))
             .then(|| (path.to_owned(), cached.sha256.clone()))
     }).collect()
 }
@@ -686,14 +708,14 @@ impl Drop for Hashing<'_> {
     }
 }
 
-/// The file's sha256: from the cache while its size and modified time are
-/// unchanged, otherwise read in full.
+/// The file's sha256: from the cache while its identity and timestamps
+/// match, otherwise read in full.
 pub async fn current_hash(state: &AppState, path: &str, force: bool) -> Result<String, String> {
     let data_dir = state.data_dir.clone();
     let print = fingerprint(path).ok_or_else(|| format!("{path} cannot be read."))?;
     if !force {
         if let Some(cached) = read_cache(&data_dir).get(path) {
-            if (cached.size, cached.modified) == print {
+            if cached.matches(&print) {
                 return Ok(cached.sha256.clone());
             }
         }
@@ -704,9 +726,17 @@ pub async fn current_hash(state: &AppState, path: &str, force: bool) -> Result<S
     let result = tokio::task::spawn_blocking(move || hash_file(&owned)).await;
     drop(hashing);
     let sha256 = result.map_err(|e| e.to_string())?.map_err(|e| format!("Cannot read {path}: {e}"))?;
+    if !fingerprint(path).is_some_and(|after| after == print) {
+        return Err("Model file changed while hashing. Try again.".into());
+    }
     let _guard = state.hash_cache_lock.lock().await;
     let mut cache = read_cache(&data_dir);
-    cache.insert(path.to_owned(), Fingerprint { size: print.0, modified: print.1, sha256: sha256.clone() });
+    cache.insert(path.to_owned(), Fingerprint {
+        size: print.size,
+        modified: print.modified,
+        identity: Some(print.identity),
+        sha256: sha256.clone(),
+    });
     cache.retain(|path, _| Path::new(path).is_file());
     if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
         let _ = tokio::fs::write(data_dir.join(HASH_CACHE), bytes).await;
@@ -767,51 +797,51 @@ pub fn hash_missing(state: AppState) {
 /// model, and its MTP head and projector when they are the ones models.yml
 /// lists for it (a head or projector found by looking in the folder has no
 /// recorded sum).
-pub async fn verify_load(state: &AppState, settings: &crate::runtime::Settings, prefix: &str) -> Result<(), String> {
+pub async fn verify_load(state: &AppState, settings: &crate::runtime::Settings, prefix: &str) -> Result<Option<String>, String> {
     let check = Check::parse(&settings.sha256_check);
     if check == Check::Off {
-        return Ok(());
+        return Ok(None);
     }
-    verify(state, &settings.model_path, Slot::Model, check, prefix).await?;
+    let actual = verify(state, &settings.model_path, Slot::Model, check, prefix).await?;
     let entry = state.library.lock().await.entry(&settings.model_path).cloned();
-    let Some(entry) = entry else { return Ok(()) };
+    let Some(entry) = entry else { return Ok(actual) };
     for (slot, used) in [(Slot::Mtp, if settings.mtp { settings.mtp_path.as_str() } else { "" }), (Slot::Mmproj, settings.mmproj_path.as_str())] {
         if !used.is_empty() && used == entry.file(slot) {
             verify(state, &settings.model_path, slot, check, prefix).await?;
         }
     }
-    Ok(())
+    Ok(actual)
 }
 
 /// Checks one file of the entry for `model` against its recorded sha256.
-pub async fn verify(state: &AppState, model: &str, slot: Slot, check: Check, log_prefix: &str) -> Result<(), String> {
+pub async fn verify(state: &AppState, model: &str, slot: Slot, check: Check, log_prefix: &str) -> Result<Option<String>, String> {
     if check == Check::Off {
-        return Ok(());
+        return Ok(None);
     }
     refresh(state).await;
     let (file, expected) = match state.library.lock().await.entry(model) {
         Some(entry) => (entry.file(slot).to_owned(), entry.sum(slot).to_owned()),
         None if slot == Slot::Model => (model.to_owned(), String::new()),
-        None => return Ok(()),
+        None => return Ok(None),
     };
     if file.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     state.log(format!("{log_prefix}Checking the {}'s sha256…", slot.label())).await;
     let actual = current_hash(state, &file, check == Check::EveryLoad).await?;
     if expected.is_empty() {
         let _ = set_sha256(state, model, slot, &file, &actual).await;
-        return Ok(());
+        return Ok(Some(actual));
     }
     if expected == actual {
         state.mismatches.lock().await.remove(&file);
-        return Ok(());
+        return Ok(Some(actual));
     }
     let message = format!("The {}'s sha256 ({}…) does not match the one in models.yml ({}…).", slot.label(), &actual[..12], &expected[..12.min(expected.len())]);
-    state.mismatches.lock().await.insert(file, actual);
+    state.mismatches.lock().await.insert(file, actual.clone());
     if check == Check::Warn {
         state.log(format!("{log_prefix}Warning: {message} Loading anyway, as Settings allow.")).await;
-        return Ok(());
+        return Ok(Some(actual));
     }
     Err(format!("{message} If you replaced the file on purpose, accept its new sha256 in Library; otherwise check the file."))
 }

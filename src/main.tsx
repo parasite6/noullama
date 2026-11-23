@@ -30,7 +30,7 @@ import { DownloadPanel, type DownloadState } from './DownloadPanel';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { HuggingFaceLogo } from './HuggingFaceLogo';
 import { RuntimeManager, type RuntimeDownload } from './RuntimeManager';
-import { enablesKeyboardFocus, instancesOf, latestOnly, panelReplace, playModelAfterLoad, reloadSlot, visibleBanner, waitText, deviceChoice, CPU_DEVICE, type RuntimeDevice } from './ui-state';
+import { enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, reloadSlot, visibleBanner, waitText, deviceChoice, CPU_DEVICE, type RuntimeDevice } from './ui-state';
 import { containScrollChaining } from './scroll-contain';
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
@@ -106,6 +106,7 @@ function App() {
   // Unsaved edits on the Runtime tab, and in the Local API load panel.
   const [runtimeFormDirty, setRuntimeFormDirty] = useState(false);
   const [loadDirty, setLoadDirty] = useState(false);
+  const [savingGroup, setSavingGroup] = useState(false);
   // The load panel's fit badge for its current values: the fit and how many
   // loaded instances it sets memory aside for, or why there is none.
   const [panelFit, setPanelFit] = useState<{ fit: Fit; others: number } | { error: string } | null>(null);
@@ -167,8 +168,11 @@ function App() {
   const [scanWarnings, setScanWarnings] = useState<string[]>([]);
   const [session, setSession] = useState<Session | null>(null);
   const [token, setToken] = useState('');
-  const [version, setVersion] = useState('');
-  const [cpuVersion, setCpuVersion] = useState('');
+  type RuntimeProbe = { path: string; libraryPath: string; output: string };
+  const [runtimeProbe, setRuntimeProbe] = useState<RuntimeProbe | null>(null);
+  const [cpuProbe, setCpuProbe] = useState<RuntimeProbe | null>(null);
+  const version = matchingProbe(runtimeProbe, settings.runtime_path, settings.library_path);
+  const cpuVersion = matchingProbe(cpuProbe, settings.cpu_runtime_path, settings.library_path);
   // The saved GPU runtime's devices for the load panel's "Device" select,
   // with the runtime and library folders they were read for.
   const [deviceList, setDeviceList] = useState<{ key: string; devices: RuntimeDevice[]; error: string | null } | null>(null);
@@ -244,10 +248,10 @@ function App() {
   // Editing a group back to its saved values leaves nothing to save.
   useEffect(() => {
     if (!savedSettings) return;
-    const unchanged = (keys: readonly (keyof Settings)[]) => keys.every(key => settings[key] === savedSettings[key]);
+    const unchanged = (keys: readonly (keyof Settings)[]) => settingsGroupMatches(settings, savedSettings, keys, savingGroup);
     if (loadDirty && unchanged(LOAD_FIELDS)) setLoadDirty(false);
     if (runtimeFormDirty && unchanged(RUNTIME_FIELDS)) setRuntimeFormDirty(false);
-  }, [settings, savedKey, loadDirty, runtimeFormDirty]);
+  }, [settings, savedKey, loadDirty, runtimeFormDirty, savingGroup]);
   useEffect(() => { if (snapshot) setDownloadDir(snapshot.settings.download_dir); }, [snapshot?.settings.download_dir]);
   // Read when the Local API tab is shown and whenever the saved GPU runtime
   // changes; the backend keeps the list until the runtime changes.
@@ -341,12 +345,17 @@ function App() {
   // settings saved at that moment, so unsaved edits in the other place are
   // neither saved nor lost, and two saves close together both stick. The
   // refresh comes first so the form does not flash back to the old values.
-  async function saveGroup(keys: readonly (keyof Settings)[], clean: () => void) {
-    await invoke('save_settings', { settings: pick(settings, keys) });
-    await refresh(); clean();
+  async function saveGroup(keys: readonly (keyof Settings)[]) {
+    setSavingGroup(true);
+    try {
+      await invoke('save_settings', { settings: pick(settings, keys) });
+      await refresh();
+    } finally {
+      setSavingGroup(false);
+    }
   }
-  const saveLoadSettings = () => saveGroup(LOAD_FIELDS, () => setLoadDirty(false));
-  const saveRuntimeSettings = () => saveGroup(RUNTIME_FIELDS, () => setRuntimeFormDirty(false));
+  const saveLoadSettings = () => saveGroup(LOAD_FIELDS);
+  const saveRuntimeSettings = () => saveGroup(RUNTIME_FIELDS);
   async function run() {
     await action('decide', async () => {
       const payload = { ...buildRequest(questions, content, stateMode), ...(visionLoaded && images.length ? { images: images.map(image => image.url) } : {}) };
@@ -460,8 +469,8 @@ function App() {
     } catch (e) { setNotice({ text: errorText(e), error: true }); }
   }
   // Loads the selected model beside any already loaded, after saving the load
-  // panel. `replace` is the loaded instance being reloaded: only it is ejected,
-  // by id, just before the new load. `ejectOther` comes from the crowded-load
+  // panel. The backend validates the new runtime before ejecting `replace`.
+  // `ejectOther` comes from the crowded-load
   // dialog. The new instance becomes the Playground's model unless another
   // loaded model is already chosen there.
   async function loadSelected({ replace = null, ejectOther }: { replace?: string | null; ejectOther?: string } = {}) {
@@ -474,8 +483,7 @@ function App() {
       setCrowdedWarning(null);
       // It may have stopped on its own meanwhile; then there is nothing to eject.
       const slot = reloadSlot(instances, replace);
-      if (replace) await invoke('unload_model', { id: replace }).catch(() => {});
-      const id = await invoke<string>('start_runtime', { slot });
+      const id = await invoke<string>('start_runtime', { slot, replace });
       setLoadTarget(id);
       setPlayModel(current => playModelAfterLoad(current, id, instances, replace, ejectOther));
     });
@@ -507,11 +515,14 @@ function App() {
   // An instance's settings.device is the device it was loaded on. On the CPU
   // it ran the CPU runtime with 0 GPU layers, so those are what compare.
   const device = deviceChoice(settings.device, deviceList?.key === deviceKey ? deviceList.devices : null);
+  const saved = savedSettings ?? defaultSettings;
+  const savedCpuRuntime = saved.cpu_runtime_path.trim() ? saved.cpu_runtime_path : !settings.device.trim() ? saved.runtime_path : '';
   const differsFrom = (instance: Instance) => instance.path === settings.model_path && (
     (['mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size'] as const).some(key => settings[key] !== instance.settings[key])
     || (instance.settings.device !== CPU_DEVICE && settings.gpu_layers !== instance.settings.gpu_layers)
     || (device.effective !== null && device.effective !== instance.settings.device)
-    || (instance.settings.device === CPU_DEVICE ? ['cpu_runtime_path', 'library_path'] as const : ['runtime_path', 'library_path'] as const).some(key => (savedSettings ?? defaultSettings)[key] !== instance.settings[key]));
+    || (instance.settings.device === CPU_DEVICE ? savedCpuRuntime : saved.runtime_path) !== instance.runtime_path
+    || saved.library_path !== instance.settings.library_path);
   const reloadSelected = !!selectedInstance && differsFrom(selectedInstance);
   // The panel's load: a reload of the picked instance, or a fresh load.
   const replaceOnLoad = panelReplace(selectedInstance, reloadSelected);
@@ -545,12 +556,10 @@ function App() {
   const loadErrors = snapshot?.load_errors ?? [];
   const hardware = snapshot?.hardware ?? null;
   // An instance on Device CPU ran the CPU runtime, so that is the selection it is compared with.
-  const chosenRuntime = runtimeStatus(selectedInstance?.settings.device === CPU_DEVICE ? settings.cpu_runtime_path : settings.runtime_path, selectedInstance?.runtime_path ?? null, !!selectedInstance, snapshot?.data_dir ?? '');
+  const chosenRuntime = runtimeStatus(selectedInstance?.settings.device === CPU_DEVICE ? (settings.cpu_runtime_path.trim() ? settings.cpu_runtime_path : settings.runtime_path) : settings.runtime_path, selectedInstance?.runtime_path ?? null, !!selectedInstance, snapshot?.data_dir ?? '');
   const runtimeName = (path: string) => { const r = runtimeStatus(path, null, false, snapshot?.data_dir ?? ''); return path ? `${r.source} · ${r.name}` : r.name; };
   // The build a load uses: the saved one.
   const loadRuntime = runtimeName(savedSettings?.runtime_path ?? '');
-  // Loads use the saved CPU runtime, like the saved build.
-  const savedCpuRuntime = (savedSettings ?? defaultSettings).cpu_runtime_path;
   const listError = deviceList?.key === deviceKey && deviceList.error ? `The llama.cpp build in Runtime could not list its devices (${deviceList.error}).` : '';
   // The Device row's live state; the static explanation is its description.
   const deviceStatus: { tone: Tone; text: string } | null = device.effective === null ? { tone: 'pending', text: 'Checking which devices the llama.cpp build reports…' }
@@ -697,15 +706,25 @@ function App() {
           </div>
         </>}
         {tab === 'runtime' && <>
-          <RuntimeManager currentPath={settings.runtime_path} currentName={runtimeName(settings.runtime_path)} running={running} progress={snapshot?.runtime_download} onRefresh={refresh} onSelect={runtime => { edit('runtime_path', runtime.path); if (runtime.backend) edit('gpu_layers', runtime.backend === 'cpu' ? 0 : 99); }}
+          <RuntimeManager currentPath={settings.runtime_path} currentName={runtimeName(settings.runtime_path)} running={running} progress={snapshot?.runtime_download} onRefresh={refresh} onSelect={runtime => edit('runtime_path', runtime.path)}
             cpuPath={settings.cpu_runtime_path} cpuProgress={snapshot?.cpu_runtime_download} cpuName={settings.cpu_runtime_path ? runtimeName(settings.cpu_runtime_path) : 'No CPU runtime selected'} onSelectCpu={runtime => edit('cpu_runtime_path', runtime.path)}
             cpuChildren={
               <SettingRow label="Path to CPU llama-server" htmlFor="cpu-runtime-path" description="A CPU build's folder or its llama-server." more={'"Use for CPU" above fills this in. Saved with the save bar below.'}>
-                <div className="file-input-row"><input id="cpu-runtime-path" placeholder="/path/to/llama.cpp-cpu/build/bin" value={settings.cpu_runtime_path} onChange={e => edit('cpu_runtime_path', e.target.value)}/><button className="secondary" type="button" disabled={isBusy('probe-cpu') || !settings.cpu_runtime_path.trim()} onClick={() => action('probe-cpu', async () => setCpuVersion(await invoke('probe_runtime', { path: settings.cpu_runtime_path, libraryPath: settings.library_path })))}><RefreshCw size={14} className={isBusy('probe-cpu') ? 'spin' : ''}/>Check</button></div>
+                <div className="file-input-row"><input id="cpu-runtime-path" placeholder="/path/to/llama.cpp-cpu/build/bin" value={settings.cpu_runtime_path} onChange={e => edit('cpu_runtime_path', e.target.value)}/><button className="secondary" type="button" disabled={isBusy('probe-cpu') || !settings.cpu_runtime_path.trim()} onClick={() => action('probe-cpu', async () => {
+                  const path = settings.cpu_runtime_path;
+                  const libraryPath = settings.library_path;
+                  const output = await invoke<string>('probe_runtime', { path, libraryPath });
+                  setCpuProbe({ path, libraryPath, output });
+                })}><RefreshCw size={14} className={isBusy('probe-cpu') ? 'spin' : ''}/>Check</button></div>
                 {cpuVersion && <pre className="runtime-version">{cpuVersion}</pre>}
               </SettingRow>}>
             <SettingRow label="Path to llama-server" htmlFor="runtime-path" description="A runtime folder or the llama-server executable." more="Choosing a build above fills this in.">
-              <div className="file-input-row"><input id="runtime-path" placeholder="/path/to/llama.cpp/build/bin" value={settings.runtime_path} onChange={e => edit('runtime_path', e.target.value)}/><button className="secondary" type="button" disabled={isBusy('probe')} onClick={() => action('probe', async () => setVersion(await invoke('probe_runtime', { path: settings.runtime_path, libraryPath: settings.library_path })))}><RefreshCw size={14} className={isBusy('probe') ? 'spin' : ''}/>Check</button></div>
+              <div className="file-input-row"><input id="runtime-path" placeholder="/path/to/llama.cpp/build/bin" value={settings.runtime_path} onChange={e => edit('runtime_path', e.target.value)}/><button className="secondary" type="button" disabled={isBusy('probe')} onClick={() => action('probe', async () => {
+                  const path = settings.runtime_path;
+                  const libraryPath = settings.library_path;
+                  const output = await invoke<string>('probe_runtime', { path, libraryPath });
+                  setRuntimeProbe({ path, libraryPath, output });
+                })}><RefreshCw size={14} className={isBusy('probe') ? 'spin' : ''}/>Check</button></div>
               {version && <pre className="runtime-version">{version}</pre>}
             </SettingRow>
             <SettingRow label="Shared-library folders (optional)" htmlFor="runtime-library-path" description="For CUDA or other libraries the runtime cannot find." more="Separate folders with a colon. Only the runtime process sees them.">

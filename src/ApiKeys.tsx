@@ -179,7 +179,7 @@ export function ApiKeys({ active, desktop, required, models, onToggle, onCopyErr
     }}>
       <Trash2 size={24} aria-hidden="true"/>
       <h2 id="delete-api-key-title">Delete API key?</h2>
-      <p id="delete-api-key-description" style={{ overflowWrap: 'anywhere' }}>{deleteTarget?.name} (<code>{deleteTarget?.prefix}…</code>) stops working immediately. This cannot be undone.</p>
+      <p id="delete-api-key-description" style={{ overflowWrap: 'anywhere' }}>{deleteTarget?.name} (<code>{deleteTarget?.prefix}…</code>) will no longer start requests. Inference already running can finish.</p>
       {error && deleteTarget && <StatusNote tone="error"><span role="alert">{error}</span></StatusNote>}
       <div className="quit-dialog-actions">
         <button ref={cancelDelete} type="button" className="secondary" disabled={!!pending} onClick={() => setDeleteTarget(null)}>Cancel</button>

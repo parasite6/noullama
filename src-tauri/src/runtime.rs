@@ -159,8 +159,8 @@ pub struct RuntimeSession {
     /// Set when the model is read through a prompt layout instead of native
     /// decision support (see `decision.rs`).
     readout: std::sync::OnceLock<crate::decision::Readout>,
-    /// One readout request at a time on the single runtime slot.
-    readout_lock: Mutex<()>,
+    /// Queue requests here so keys can be checked before using the runtime slot.
+    dispatch_lock: Mutex<()>,
 }
 
 impl Drop for RuntimeSession {
@@ -201,7 +201,7 @@ impl RuntimeSession {
             cancel: tokio::sync::Notify::new(),
             last_output: std::sync::Mutex::new(std::time::Instant::now()),
             readout: std::sync::OnceLock::new(),
-            readout_lock: Mutex::new(()),
+            dispatch_lock: Mutex::new(()),
         }))
     }
 }
@@ -339,6 +339,7 @@ pub fn file_stem(path: &str) -> String {
 
 /// One loaded model: its own llama-server on its own private port.
 pub struct Instance {
+    pub(crate) loaded_sha256: std::sync::OnceLock<String>,
     pub id: String,
     /// Unique among loaded models; prefixes this model's log lines.
     pub label: String,
@@ -368,6 +369,10 @@ pub struct Instance {
 }
 
 impl Instance {
+    fn matches_loaded_sum(&self, access: &Access) -> bool {
+        access.allows_loaded_sum(self.path(), self.loaded_sha256.get().map(String::as_str))
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::SeqCst)
     }
@@ -461,6 +466,7 @@ impl Drop for Claim {
 
 /// Why `any-available` found no instance.
 pub enum AnyError {
+    LoadedChecksum,
     /// No loaded instance is ready.
     NoneReady(String),
     /// Every ready instance is running a request (setting "reject", or the wait ran out).
@@ -477,6 +483,7 @@ fn pick_idle(instances: &[Arc<Instance>]) -> Vec<&Arc<Instance>> {
 
 /// Why a model name could not be routed to a loaded model.
 pub enum RouteError {
+    LoadedChecksum,
     /// The request named no model.
     Missing(String),
     /// The named model is not loaded or still loading.
@@ -741,7 +748,7 @@ impl AppState {
         self.routes_with_access(&Access::default()).await.0
     }
 
-    async fn routes_with_access(&self, access: &Access) -> (Vec<Route>, Option<std::collections::HashSet<String>>) {
+    async fn routes_with_access(&self, access: &Access) -> (Vec<Route>, Option<std::collections::HashSet<String>>, Vec<Arc<Instance>>) {
         crate::library::refresh(self).await;
         let fall_through = self.settings.lock().await.fall_through_to_other_instances;
         let instances = self.instances.lock().await.clone();
@@ -756,15 +763,17 @@ impl AppState {
             .collect();
         let entries: Vec<String> = library.entries.iter().map(|e| e.path.clone()).collect();
         let routes = route_table(&table, &entries, names, fall_through);
-        (routes, access.allowed_paths(self, &library).await)
+        (routes, access.allowed_paths(self, &library).await, instances)
     }
     /// Names that reach a ready model right now, as `/v1/models` lists them:
     /// the route table's, then `any-available` when any instance is ready.
     pub async fn model_names(&self, access: &Access) -> Vec<String> {
-        let (mut routes, allowed) = self.routes_with_access(access).await;
+        let (mut routes, allowed, instances) = self.routes_with_access(access).await;
         let any_ready = if let Some(allowed) = allowed {
-            let ready = routes.iter().any(|route| route.ready && allowed.contains(&route.path));
-            routes.retain(|route| allowed.contains(&route.path) && access.allows_alias_owner(&route.base, &route.path));
+            let eligible = |instance: &Instance| allowed.contains(instance.path()) && instance.matches_loaded_sum(access);
+            let ready = instances.iter().any(|instance| instance.is_ready() && eligible(instance));
+            routes.retain(|route| access.allows_alias_owner(&route.base, &route.path)
+                && instances.iter().any(|instance| route.instance.as_deref() == Some(instance.id.as_str()) && eligible(instance)));
             ready
         } else {
             self.any_ready().await
@@ -795,7 +804,11 @@ impl AppState {
                 crate::library::refresh(self).await;
                 let library = self.library.lock().await;
                 let allowed = access.allowed_paths(self, &library).await.unwrap_or_default();
-                instances.retain(|instance| allowed.contains(instance.path()));
+                let had_ready = instances.iter().any(|instance| instance.is_ready() && allowed.contains(instance.path()));
+                instances.retain(|instance| allowed.contains(instance.path()) && instance.matches_loaded_sum(access));
+                if had_ready && !instances.iter().any(|instance| instance.is_ready()) {
+                    return Err(AnyError::LoadedChecksum);
+                }
             }
             if !instances.iter().any(|i| i.is_ready()) {
                 return Err(AnyError::NoneReady(format!("No loaded instance is ready for \"{ANY_AVAILABLE}\". Load a model in noullama, or wait for one to finish loading.")));
@@ -826,8 +839,7 @@ impl AppState {
                 format!("Set \"model\" to a loaded model's name or alias: {}.", names.join(", "))
             }));
         };
-        let (routes, allowed) = self.routes_with_access(access).await;
-        let instances = self.instances.lock().await.clone();
+        let (routes, allowed, instances) = self.routes_with_access(access).await;
         let matches: Vec<&Route> = routes.iter().filter(|r| r.name == name).collect();
         if let Some(allowed) = allowed {
             if matches.is_empty() || matches.iter().any(|route| !allowed.contains(&route.path) || !access.allows_alias_owner(&route.base, &route.path)) {
@@ -859,6 +871,7 @@ impl AppState {
                 }))
             }
             [one] => match one.instance.as_deref().and_then(|id| instances.iter().find(|i| i.id == id)) {
+                Some(instance) if instance.is_ready() && !instance.matches_loaded_sum(access) => Err(LoadedChecksum),
                 Some(instance) if instance.is_ready() => Ok(instance.clone()),
                 Some(instance) => Err(still_loading(instance)),
                 None if one.fallthrough => {
@@ -892,12 +905,24 @@ impl AppState {
     /// Keep context is on.
     /// The request counts as running on it (see `Claim`) until it ends.
     pub async fn infer_on(&self, instance: &Arc<Instance>, payload: Value) -> Result<Value, String> {
-        let claim = Claim::take(self, instance);
-        self.infer_claimed(&claim, payload).await
-    }
-    /// `infer_on` for a request that already holds its instance's claim.
-    pub async fn infer_claimed(&self, claim: &Claim, payload: Value) -> Result<Value, String> {
+        let claim = self.claim_named(instance);
+        let _slot = claim.instance.session.dispatch_lock.lock().await;
         crate::context::infer(self, &claim.instance, payload).await
+    }
+
+    pub fn claim_named(&self, instance: &Arc<Instance>) -> Claim {
+        Claim::take(self, instance)
+    }
+
+    pub async fn infer_claimed(
+        &self,
+        claim: &Claim,
+        payload: Value,
+        access: &Access,
+    ) -> Result<Result<Value, String>, crate::api_keys::Rejection> {
+        let _slot = claim.instance.session.dispatch_lock.lock().await;
+        self.api_keys.revalidate(access)?;
+        Ok(crate::context::infer(self, &claim.instance, payload).await)
     }
 
     /// One request to the runtime. `with_history` marks a state that carries
@@ -913,7 +938,6 @@ impl AppState {
             if has_images(&payload) {
                 return Err(Other("Images are not supported for this model yet: it is read through the Prompt layout (Winnow), which is text only.".into()));
             }
-            let _one_at_a_time = session.readout_lock.lock().await;
             let server = crate::decision::Server { client: &self.local_client, port: session.port, key: &session.key };
             let redact = |e: String| e.replace(&session.key, "[redacted]");
             // The Winnow layout cuts a long state short from the end, which
@@ -1558,14 +1582,19 @@ pub async fn probe_runtime(path: String, library_path: String) -> Result<String,
 
 /// Loads the selected model beside any already loaded; returns its id.
 #[tauri::command]
-pub async fn start_runtime(slot: Option<u32>, state: tauri::State<'_, AppState>) -> Result<String, String> {
-    load_model_in(state.inner(), slot).await
+pub async fn start_runtime(slot: Option<u32>, replace: Option<String>, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    load_model_replacing(state.inner(), slot, replace.as_deref()).await
 }
 
 /// `slot` is the slot of the instance a reload replaced: the new instance
 /// keeps it when it is free, so its suffixed names stay the same. Otherwise
 /// (and for fresh loads) it takes the lowest free slot.
+#[cfg(test)]
 pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String, String> {
+    load_model_replacing(state, slot, None).await
+}
+
+async fn load_model_replacing(state: &AppState, slot: Option<u32>, replace: Option<&str>) -> Result<String, String> {
     let selected = state.settings.lock().await.model_path.clone();
     if Path::new(&selected).is_file() {
         crate::library::ensure(state, &[selected]).await;
@@ -1618,14 +1647,25 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
     let devices = listed.unwrap_or_default();
     let device = devices.iter().find(|d| d.name == settings.device).map_or(settings.device.clone(), |d| d.display());
     let loaded = state.instances.lock().await.clone();
-    if let Some(reason) = load_memory_risk(&settings, loaded.iter(), (0, 0), &devices).await {
-        return Err(format!("OOM prevention: {reason} Eject another model, reduce context or GPU offload, or enable Allow force fit in Settings."));
-    }
+    let replacement = replace.and_then(|id| loaded.iter().find(|instance| instance.id == id));
+    let checked_devices = if replacement.is_some() {
+        Some(check_launch_devices(&settings).await?)
+    } else {
+        if let Some(reason) = load_memory_risk(state, &settings, loaded.iter(), (0, 0), &devices, false).await {
+            return Err(format!("OOM prevention: {reason} Eject another model, reduce context or GPU offload, or enable Allow force fit in Settings."));
+        }
+        None
+    };
     let port = free_runtime_port(state, &settings, &loaded)?;
-    let (slot, label) = slot_and_label(&loaded, &settings.model_path, slot);
+    let others: Vec<_> = loaded.iter().filter(|instance| Some(instance.id.as_str()) != replace).cloned().collect();
+    let preferred_slot = replacement.map(|instance| instance.slot).or(slot);
+    let (slot, label) = slot_and_label(&others, &settings.model_path, preferred_slot);
     let session = RuntimeSession::new(&state.data_dir, port)?;
     let instance = Arc::new(new_instance(settings, slot, label, session, device));
     state.load_errors.lock().await.retain(|e| !(e.path == instance.path() && e.slot == instance.slot));
+    if let Some(previous) = replacement {
+        state.unload_locked(&previous.id).await;
+    }
     state.instances.lock().await.push(instance.clone());
     state.instances_added.notify_one();
     state.log(instance.load_marker()).await;
@@ -1633,7 +1673,7 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
     let state = state.clone();
     tokio::spawn(async move {
         let result = tokio::select! {
-            result = tokio::time::timeout(LOAD_LIMIT, prepare_and_poll(&state, &instance)) => result,
+            result = tokio::time::timeout(LOAD_LIMIT, prepare_and_poll(&state, &instance, checked_devices)) => result,
             _ = instance.session.cancel.notified() => return,
         };
         let error = match result {
@@ -1661,6 +1701,7 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
 /// `settings.device` is the chosen device; `device` is how it is shown.
 fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<RuntimeSession>, device: String) -> Instance {
     Instance {
+        loaded_sha256: std::sync::OnceLock::new(),
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
         label,
         slot,
@@ -1815,20 +1856,11 @@ fn runtime_args(settings: &Settings, session: &RuntimeSession) -> Vec<String> {
     args
 }
 
-async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<(), String> {
-    let settings = &instance.settings;
-    let session = &instance.session;
-    let prefix = instance.prefix();
-    crate::library::verify_load(state, settings, &prefix).await?;
-    // Keep the port reserved during preflight, then verify the launch's random
-    // alias over an authenticated endpoint before ever accepting inference.
-    let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))
-        .await
-        .map_err(|e| format!("Private runtime port is unavailable: {e}"))?;
+async fn check_launch_devices(settings: &Settings) -> Result<(Vec<crate::devices::RuntimeDevice>, String), String> {
     // Detect devices with the runtime this load launches: the GPU runtime
     // must still list the chosen GPU; the CPU runtime only has to run.
     let devices = crate::devices::list_devices(&crate::devices::launch_settings(settings)).await?;
-    let device = if crate::devices::on_cpu(settings) {
+    let display = if crate::devices::on_cpu(settings) {
         crate::devices::CPU.to_owned()
     } else {
         devices
@@ -1837,7 +1869,26 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
             .map(crate::devices::RuntimeDevice::display)
             .ok_or_else(|| crate::devices::not_found(&settings.device))?
     };
-    {
+    Ok((devices, display))
+}
+
+async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>, checked_devices: Option<(Vec<crate::devices::RuntimeDevice>, String)>) -> Result<(), String> {
+    let settings = &instance.settings;
+    let session = &instance.session;
+    let prefix = instance.prefix();
+    let fingerprint = crate::library::fingerprint(instance.path());
+    let verified = crate::library::verify_load(state, settings, &prefix).await?;
+    // Keep the port reserved during preflight, then verify the launch's random
+    // alias over an authenticated endpoint before ever accepting inference.
+    let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))
+        .await
+        .map_err(|e| format!("Private runtime port is unavailable: {e}"))?;
+    let fresh_devices = checked_devices.is_none();
+    let (devices, device) = match checked_devices {
+        Some(checked) => checked,
+        None => check_launch_devices(settings).await?,
+    };
+    let (loaded_sum, launch_fingerprint) = {
         let _guard = state.lifecycle.lock().await;
         if !is_registered(state, instance).await {
             return Ok(());
@@ -1846,9 +1897,15 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
         live_settings.allow_force_fit = state.settings.lock().await.allow_force_fit;
         let loaded = state.instances.lock().await.clone();
         let others = loaded.iter().filter(|other| other.id != instance.id);
-        if let Some(reason) = load_memory_risk(&live_settings, others, (0, 0), &devices).await {
+        if let Some(reason) = load_memory_risk(state, &live_settings, others, (0, 0), &devices, fresh_devices).await {
             return Err(format!("OOM prevention: {reason}"));
         }
+        let launch_fingerprint = crate::library::fingerprint(instance.path());
+        let loaded_sum = match verified {
+            Some(sum) if fingerprint == launch_fingerprint => Some(sum),
+            Some(_) => None,
+            None => crate::library::cached_hashes(state, &[instance.path()]).await.remove(instance.path()),
+        };
         drop(reservation);
         let mut child = launch_command(settings, session)
             .stdout(Stdio::piped())
@@ -1897,7 +1954,8 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
         state
             .log(format!("{prefix}Loading {} on {device} (private port {})", settings.model_path, session.port))
             .await;
-    }
+        (loaded_sum, launch_fingerprint)
+    };
     loop {
         {
             let _guard = state.lifecycle.lock().await;
@@ -1988,6 +2046,9 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
                 }
                 if let Ok(mut model) = instance.model.lock() {
                     model.layout = Some(layout.name().into());
+                }
+                if let Some(sum) = loaded_sum.filter(|_| launch_fingerprint == crate::library::fingerprint(instance.path())) {
+                    let _ = instance.loaded_sha256.set(sum);
                 }
                 instance.ready.store(true, Ordering::SeqCst);
                 state.instance_freed.notify_waiters();
@@ -2236,16 +2297,33 @@ pub async fn set_memory_pref(state: &AppState, key: &str, value: bool) -> Result
 /// `settings.device` is the chosen device; `devices` is the GPU runtime's
 /// list, used to find that GPU's own nvidia-smi reading.
 async fn load_memory_risk<'a>(
+    state: &AppState,
     settings: &Settings,
     loaded: impl Iterator<Item = &'a Arc<Instance>>,
     freed: (u64, u64),
     devices: &[crate::devices::RuntimeDevice],
+    fresh: bool,
 ) -> Option<String> {
-    let (device, devices) = (settings.device.clone(), devices.to_vec());
-    load_memory_risk_with(settings, loaded, freed, || crate::oom::memory().map(|m| m.available), move || {
-        crate::hardware::device_memory(&device, &devices)
-    })
-    .await
+    let layers = crate::devices::gpu_layers(settings);
+    let vram = if !settings.allow_force_fit && (layers == -1 || layers >= 99) {
+        let (device, listed) = (settings.device.clone(), devices.to_vec());
+        let reading = tokio::task::spawn_blocking(move || crate::hardware::nvidia_device_memory(&device, &listed)).await.ok().flatten();
+        let reading = match reading {
+            Some(reading) => Some(reading),
+            None if fresh => crate::hardware::listed_device_memory(&settings.device, devices),
+            None => {
+                let listed = crate::devices::list_devices(settings).await.ok();
+                listed.as_deref().and_then(|list| crate::hardware::listed_device_memory(&settings.device, list))
+            }
+        };
+        if reading.is_none() {
+            state.log(format!("VRAM preflight unavailable for device {}.", settings.device)).await;
+        }
+        reading
+    } else {
+        None
+    };
+    load_memory_risk_with(settings, loaded, freed, || crate::oom::memory().map(|m| m.available), move || vram).await
 }
 
 /// `load_memory_risk` with the readings passed in: `available_ram`, and
@@ -2339,7 +2417,7 @@ pub async fn crowded_warning_in(state: &AppState, replace: Option<String>) -> Re
         names.push(json!({"id": instance.id, "name": format!("{name}{}", instance.suffix())}));
     }
     let devices = listed.unwrap_or_default();
-    Ok(load_memory_risk(&settings, others.into_iter(), (freed_vram, freed_ram), &devices).await.map(|reason| json!({ "reason": reason, "models": names })))
+    Ok(load_memory_risk(state, &settings, others.into_iter(), (freed_vram, freed_ram), &devices, false).await.map(|reason| json!({ "reason": reason, "models": names })))
 }
 
 /// Supervises loaded models once a second: notices runtimes that exited and
@@ -3248,7 +3326,7 @@ mod tests {
         let settings = loaded.settings.lock().await;
         assert!(settings.allow_force_fit && settings.hide_crowded_load_warning);
         drop(settings);
-        assert!(load_memory_risk(&loaded.settings.lock().await.clone(), std::iter::empty(), (0, 0), &[]).await.is_none());
+        assert!(load_memory_risk(&loaded, &loaded.settings.lock().await.clone(), std::iter::empty(), (0, 0), &[], false).await.is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3367,7 +3445,7 @@ mod tests {
     /// `--list-devices` stdout of a CUDA build with one GPU, as a fake GPU
     /// runtime prints it.
     #[cfg(unix)]
-    const GPU_LIST: &str = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 3080 (10240 MiB, 9800 MiB free)\n";
+    const GPU_LIST: &str = "Available devices:\n  CUDA0: Example GPU (8192 MiB, 7168 MiB free)\n";
 
     /// A fake runtime that lists `devices` and, when launched, writes its
     /// arguments beside itself and waits.
@@ -3502,7 +3580,7 @@ mod tests {
         }
         let first = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
         assert_eq!(first.settings.device, "CUDA0");
-        assert_eq!(first.model().device, "CUDA0 · NVIDIA GeForce RTX 3080");
+        assert_eq!(first.model().device, "CUDA0 · Example GPU");
         let args = launched_args(&state, &gpu).await;
         assert_eq!(flag(&args, "--device"), Some("CUDA0"));
         assert_eq!(flag(&args, "--split-mode"), Some("none"));
@@ -3567,6 +3645,26 @@ mod tests {
 
     /// A reload asks for the crowded-load warning before it ejects the
     /// instance it replaces; a device the load would refuse stops it there.
+    #[tokio::test]
+    async fn reload_with_a_missing_runtime_keeps_the_ready_instance() {
+        let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        let path = dir.join("weights.gguf").to_str().unwrap().to_owned();
+        std::fs::write(&path, "example weights").unwrap();
+        let previous = insert_test_instance(&state, &path, true).await;
+        {
+            let mut settings = state.settings.lock().await;
+            settings.model_path = path;
+            settings.device = crate::devices::CPU.into();
+            settings.cpu_runtime_path = dir.join("missing").to_string_lossy().into_owned();
+        }
+        let error = load_model_replacing(&state, None, Some(&previous.id)).await.unwrap_err();
+        assert!(error.contains("selected llama.cpp build is missing"));
+        assert!(state.instance(&previous.id).await.unwrap().is_ready());
+        assert_eq!(state.instances.lock().await.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn the_crowded_check_refuses_a_device_before_a_reload_ejects_anything() {
         let base = std::env::temp_dir().join(format!("noullama-crowded-device-{}", uuid::Uuid::new_v4()));

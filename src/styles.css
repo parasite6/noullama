@@ -799,7 +799,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .runtime-current code { font-size: var(--text-sm); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .runtime-current .identity-line strong { font-size: var(--text-lg); }
 .runtime-current .copy-button { opacity: 0; transition: opacity .15s; }
-.runtime-current:hover .copy-button, .runtime-current .copy-button.copied { opacity: 1; }
+.runtime-current:hover .copy-button, .keyboard-nav .runtime-current .copy-button:focus, .runtime-current .copy-button.copied { opacity: 1; }
 .runtime-current > .setting-help { padding-top: var(--space-3); border-top: 1px solid var(--line); }
 
 /* Installed builds: list rows share the control column's right edge. */
