@@ -36,7 +36,7 @@ pub struct Settings {
     // Where a load runs: "" (the first GPU the GPU runtime lists, else the
     // CPU), "CPU", a llama.cpp device name such as "CUDA0", or a split across
     // GPUs: "gpus:all" or a comma list such as "CUDA0,CUDA1". Saved by the
-    // Local API load panel. See devices.rs.
+    // Loading tab load panel. See devices.rs.
     pub device: String,
     // For a split only: "layer" or "row" (`--split-mode`), and an optional
     // ratio such as "3,1", one number per GPU in listed order
@@ -62,7 +62,7 @@ pub struct Settings {
     // Keep context for new loads: whether a new instance starts carrying
     // earlier decisions into each request's state (see context.rs). Each
     // loaded instance then has its own switch (Instance::keeps_context).
-    // Saved by the Local API load panel.
+    // Saved by the Loading tab load panel.
     pub keep_context: bool,
     pub allow_force_fit: bool,
     pub hide_crowded_load_warning: bool,
@@ -136,7 +136,7 @@ pub struct AppState {
     pub api_keys: Arc<KeyStore>,
     // models.yml, and the sha256 work around it.
     pub library: Arc<Mutex<crate::library::Library>>,
-    pub hashing: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    pub hashing: Arc<crate::library::HashJobs>,
     // Model paths whose file no longer matches its recorded sha256, with the new sum.
     pub mismatches: Arc<Mutex<BTreeMap<String, String>>>,
     pub hash_worker: Arc<AtomicBool>,
@@ -377,6 +377,8 @@ pub struct Instance {
     in_flight: AtomicUsize,
     /// `request_seq` when it last started a request; 0 when it never has.
     last_started: AtomicU64,
+    /// Set while the load checks its files' sha256 values, before launch.
+    verifying: AtomicBool,
 }
 
 impl Instance {
@@ -907,7 +909,7 @@ impl AppState {
                     "'{name}' is the name of {} loaded models ({}). {}",
                     many.len(),
                     many.iter().map(|r| if r.slot > 1 { format!("{} instance {}", r.path, r.slot) } else { r.path.clone() }).collect::<Vec<_>>().join(", "),
-                    if instance_alias { "Remove the instance alias in Local API, or give them different names in Library." } else if suffixed { "Give them different names in Library, or change the instance suffix in Local API." } else { "Give them different names in Library." }
+                    if instance_alias { "Remove the instance alias in Loading, or give them different names in Library." } else if suffixed { "Give them different names in Library, or change the instance suffix in Loading." } else { "Give them different names in Library." }
                 )))
             }
         }
@@ -1277,6 +1279,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let instances = state.instances.lock().await.clone();
     let routes = state.routes().await;
     let library = crate::library::snapshot(state).await;
+    let jobs = state.hashing.lock().unwrap_or_else(|error| error.into_inner()).clone();
     let mut loaded = Vec::new();
     for instance in &instances {
         let model = instance.model();
@@ -1292,7 +1295,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
             "path": model.path, "device": model.device, "runtime_path": model.runtime_path,
             "projector": model.projector, "mmproj_path": instance.settings.mmproj_path,
             "mtp": model.mtp, "mtp_path": instance.settings.mtp_path, "layout": model.layout,
-            "ready": instance.is_ready(), "context_size": instance.settings.context_size,
+            "ready": instance.is_ready(), "verifying": verifying_status(instance, &jobs), "context_size": instance.settings.context_size,
             "gpu_layers": crate::devices::gpu_layers(&instance.settings), "required_bytes": required,
             "context": {"entries": history.len(), "last_flushed": history.last_flushed}, "keep_context": instance.keeps_context(),
             "settings": instance.settings,
@@ -1330,7 +1333,7 @@ fn instance_extras(settings: &Settings) -> Vec<String> {
     extras
 }
 
-/// Saves the Local API load panel, the Runtime tab or the download
+/// Saves the Loading tab load panel, the Runtime tab or the download
 /// directory. `settings` holds only the fields that form changes; the rest
 /// stay as they are saved now.
 #[tauri::command]
@@ -1695,7 +1698,7 @@ async fn load_model_replacing(state: &AppState, slot: Option<u32>, replace: Opti
                 _ => return Err("The chosen MTP file is not an MTP head. Choose a head file made only of MTP layers, or turn MTP off.".into()),
             }
         } else if !crate::gguf::info(&settings.model_path).is_some_and(|i| i.has_built_in_mtp()) {
-            return Err("This model has no built-in MTP layers. Choose an mtp- head file in Local API, or turn MTP off.".into());
+            return Err("This model has no built-in MTP layers. Choose an mtp- head file in Loading, or turn MTP off.".into());
         }
     }
     let unchanged = |a: &Settings, b: &Settings| (&a.runtime_path, &a.library_path, &a.device) == (&b.runtime_path, &b.library_path, &b.device);
@@ -1787,7 +1790,42 @@ fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<Runti
         aliases: Default::default(),
         in_flight: Default::default(),
         last_started: Default::default(),
+        verifying: Default::default(),
     }
+}
+
+/// Clears `Instance::verifying` however the check ends, cancelled included.
+struct Verifying<'a>(&'a AtomicBool);
+
+impl Drop for Verifying<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The load's sha256 check, marked on the instance while it runs.
+async fn verify_instance(state: &AppState, instance: &Instance) -> Result<Option<String>, String> {
+    instance.verifying.store(true, Ordering::SeqCst);
+    let _verifying = Verifying(&instance.verifying);
+    crate::library::verify_load(state, &instance.settings, &instance.prefix()).await
+}
+
+/// The file a loading instance is hashing right now, with its progress, or
+/// null. Only hashes the load runs count: a sum the cache already had, or
+/// a background hash after the check, shows nothing.
+fn verifying_status(instance: &Instance, jobs: &BTreeMap<String, crate::library::HashJob>) -> Value {
+    if instance.is_ready() || !instance.verifying.load(Ordering::SeqCst) {
+        return Value::Null;
+    }
+    let settings = &instance.settings;
+    let mtp = if settings.mtp { settings.mtp_path.as_str() } else { "" };
+    [("model", settings.model_path.as_str()), ("mtp", mtp), ("mmproj", settings.mmproj_path.as_str())]
+        .into_iter()
+        .find_map(|(slot, file)| {
+            let job = jobs.get(file).filter(|_| !file.is_empty())?;
+            Some(json!({"file": file, "slot": slot, "done_bytes": job.done_bytes, "total_bytes": job.total_bytes}))
+        })
+        .unwrap_or(Value::Null)
 }
 
 /// The slot and log label a new instance of `path` gets beside `loaded`:
@@ -1940,7 +1978,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>, checked_de
     let session = &instance.session;
     let prefix = instance.prefix();
     let fingerprint = crate::library::fingerprint(instance.path());
-    let verified = crate::library::verify_load(state, settings, &prefix).await?;
+    let verified = verify_instance(state, instance).await?;
     // Keep the port reserved during preflight, then verify the launch's random
     // alias over an authenticated endpoint before ever accepting inference.
     let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))
@@ -2070,10 +2108,10 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>, checked_de
                     Some(crate::decision::Layout::Winnow) => crate::decision::Layout::Winnow,
                     _ if native => crate::decision::Layout::Native,
                     Some(crate::decision::Layout::Native) => {
-                        return Err("Runtime did not advertise built-in decision support. Use a decision GGUF and a compatible llama.cpp build, or set Decision mode to Auto in Local API.".into());
+                        return Err("Runtime did not advertise built-in decision support. Use a decision GGUF and a compatible llama.cpp build, or set Decision mode to Auto in Loading.".into());
                     }
                     None => {
-                        return Err("This model has no built-in decision support, and Noullama has no prompt layout for it. Winnow GGUFs are read through the Prompt layout (Winnow); if this is a Winnow model under another name, set Decision mode to Prompt layout in Local API.".into());
+                        return Err("This model has no built-in decision support, and Noullama has no prompt layout for it. Winnow GGUFs are read through the Prompt layout (Winnow); if this is a Winnow model under another name, set Decision mode to Prompt layout in Loading.".into());
                     }
                 };
                 if layout == crate::decision::Layout::Winnow && session.readout.get().is_none() {
@@ -2817,6 +2855,45 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(find_servers(&wide).len() <= 1);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_shows_the_pre_load_sha256_check_and_clears_it() {
+        let base = std::env::temp_dir().join(format!("noullama-verifying-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let model = base.join("m.gguf");
+        // Three 4 MiB reads, each slowed down for the test.
+        std::fs::write(&model, vec![0u8; 12 << 20]).unwrap();
+        let path = model.to_str().unwrap().to_owned();
+        crate::library::SLOW_HASH.lock().unwrap().insert(path.clone());
+        state.settings.lock().await.sha256_check = "every_load".into();
+        let instance = insert_test_instance(&state, &path, false).await;
+        let check = tokio::spawn({
+            let (state, instance) = (state.clone(), instance.clone());
+            async move { verify_instance(&state, &instance).await }
+        });
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = state_snapshot(&state).await.unwrap();
+                let verifying = snapshot["instances"][0]["verifying"].clone();
+                if !verifying.is_null() {
+                    return verifying;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the snapshot never showed the check");
+        assert_eq!(seen["slot"], "model");
+        assert_eq!(seen["file"], path.as_str());
+        assert_eq!(seen["total_bytes"], 12u64 << 20);
+        check.await.unwrap().unwrap();
+        let snapshot = state_snapshot(&state).await.unwrap();
+        assert!(snapshot["instances"][0]["verifying"].is_null());
+        assert!(!instance.verifying.load(Ordering::SeqCst));
+        crate::library::SLOW_HASH.lock().unwrap().remove(&path);
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
@@ -3627,7 +3704,7 @@ mod tests {
         }
         assert_eq!(load_model_in(&state, None).await.unwrap_err(), "Device CPU needs a CPU runtime. Choose or download one under CPU runtime in Runtime.");
         state.settings.lock().await.device = "CUDA1".into();
-        assert_eq!(load_model_in(&state, None).await.unwrap_err(), "Device CUDA1 was not found: the llama.cpp build in Runtime does not report it. Choose another device in Local API.");
+        assert_eq!(load_model_in(&state, None).await.unwrap_err(), "Device CUDA1 was not found: the llama.cpp build in Runtime does not report it. Choose another device in Loading.");
         // A GPU runtime that cannot list its devices finds none of them either.
         let broken = fake_runtime(&base, "broken-runtime", "#!/bin/sh\nexit 1\n");
         {

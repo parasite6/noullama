@@ -63,7 +63,7 @@ export function ModelRouting({ loadedCount, anyReady, whenBusy, waitMs, routes, 
   return <section className="panel model-names">
     <div className="panel-heading"><span>Model routing</span><span className="muted normal-weight">Every request sends one of these names as "model"</span></div>
     <div className="model-names-body">
-      <p className="hint">{loadedCount === 0 ? 'Load a model to route requests to it. Several can be loaded at once; each answers to its name and aliases from Library.' : 'Each loaded model answers to the names on its card under Loaded.'}</p>
+      <p className="hint">{loadedCount === 0 ? 'Load a model to route requests to it. Several can be loaded at once; each answers to its name and aliases from Library.' : 'Each loaded model answers to the names on its card under Loaded, on the Loading tab.'}</p>
       <div className="route-group">
         <div className="route-model"><span className={`status-dot ${anyReady ? 'green' : ''}`}/><strong>Any free instance</strong><small>{anyReady ? 'Reaches a ready instance now' : 'Answers 503 until an instance is ready'}</small></div>
         <div className="model-name-list"><Name value={ANY_AVAILABLE} note="Any model" onError={onError}/></div>

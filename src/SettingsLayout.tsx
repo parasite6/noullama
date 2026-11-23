@@ -1,7 +1,7 @@
 import React, { useId, useState } from 'react';
 import { CircleAlert, CircleCheck, CircleHelp, Info, LoaderCircle, TriangleAlert } from 'lucide-react';
 
-// The shared settings layout used by the Local API load panel, the Runtime tab
+// The shared settings layout used by the Loading tab load panel, the Runtime tab
 // and the Settings tab. A section groups rows under a title; a row has its
 // label and one short description on the left and its control in a fixed
 // control column on the right, so every control lines up on one edge. Extra

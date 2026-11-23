@@ -4,11 +4,14 @@ import { AuthorLogo } from './AuthorLogo';
 import { CopyButton } from './CopyButton';
 import { ModelAliases, Name, type Route } from './ModelNames';
 import { KeepContext } from './KeepContext';
+import { verifyingText, type Verifying } from './model-state';
 
 // What a card needs from one loaded instance. Everything shown is what the
 // instance was loaded with; edits in the load panel only reach it by reloading.
 export type CardInstance = {
   id: string; name: string; path: string; device: string; ready: boolean;
+  // The file it is hashing before launch, while it does.
+  verifying: Verifying | null;
   slot: number; suffix: string; default_suffix: string;
   // Exact extra names for this instance only, held while it is loaded.
   instance_aliases: string[];
@@ -25,7 +28,7 @@ const basename = (path: string) => path.split(/[\\/]/).pop() || path;
 export const modeLabels: Record<string, string> = { auto: 'Auto', native: 'Built-in', winnow: 'Prompt layout' };
 const layoutLabel = (layout: string) => layout === 'native' ? 'Built-in' : layout === 'winnow-v1' ? 'Prompt layout (Winnow)' : layout;
 
-// One loaded instance in the Local API tab: status, load-time settings, the
+// One loaded instance on the Loading tab: status, load-time settings, the
 // names the API routes to it, and its own Reload and Eject. Keyed by instance
 // id so two instances of one file stay apart.
 const errorText = (e: unknown) => e instanceof Error ? e.message : String(e);
@@ -104,7 +107,7 @@ export function InstanceCard({ instance, account, runtime, aliases, routes, disp
         <span className="identity-line"><strong title={instance.path}>{displayName}</strong><CopyButton value={displayName} label={`Copy model name ${displayName}`} size={12} onError={onError}/></span>
         <small>{instance.ready ? instance.device : 'Loading…'} · Instance {instance.slot}</small>
       </span>
-      <span className={`chip ${instance.ready ? 'success' : ''}`}><span className={`status-dot ${instance.ready ? 'green' : 'amber'}`}/>{instance.ready ? 'Ready' : 'Loading'}</span>
+      <span className={`chip ${instance.ready ? 'success' : ''}`}><span className={`status-dot ${instance.ready ? 'green' : 'amber'}`}/>{instance.ready ? 'Ready' : verifyingText(instance.verifying) ?? 'Loading'}</span>
       {canReload && <button className="secondary compact" disabled={reloadDisabled} title="Eject this model and load it again with the load panel's settings" onClick={onReload}>{starting ? <RefreshCw className="spin" size={13}/> : <Play size={13}/>}{starting ? 'Starting…' : 'Reload'}</button>}
       <button className="secondary compact" disabled={ejecting} title={instance.ready ? `Unload ${displayName}; other loaded models keep running` : undefined} onClick={onEject}>{instance.ready ? <><Unplug size={13}/>Eject</> : <><Square size={13}/>Cancel loading</>}</button>
     </div>

@@ -1224,7 +1224,7 @@ pub(crate) mod tests {
         set(second.id.clone(), &["qwen-fast", "billing"]).await.unwrap();
         assert_eq!(crate::runtime::change_suffix(&state, &third.id, "-fast").await.unwrap_err(), "\"qwen-fast\" already reaches instance 2 of qwen. Choose another suffix.");
         assert_eq!(crate::runtime::change_suffix(&state, &second.id, "-fast").await.unwrap_err(), "\"qwen-fast\" already reaches instance 2 of qwen. Choose another suffix.");
-        assert_eq!(crate::runtime::set_aliases(&state, other.path().into(), vec!["Billing".into()]).await.unwrap_err(), "\"Billing\" is an instance alias of instance 2 of qwen (\"billing\"). Remove it from that instance in Local API, or choose another name.");
+        assert_eq!(crate::runtime::set_aliases(&state, other.path().into(), vec!["Billing".into()]).await.unwrap_err(), "\"Billing\" is an instance alias of instance 2 of qwen (\"billing\"). Remove it from that instance in Loading, or choose another name.");
         let revision = state.library.lock().await.revision;
         let mut entries = state.library.lock().await.entries.clone();
         entries.iter_mut().find(|e| e.path == other.path()).unwrap().name = "qwen-fast".into();
@@ -1236,7 +1236,7 @@ pub(crate) mod tests {
         assert_eq!(again.slot, 3);
         let (status, message) = status_and_message(&app, "qwen-i-3").await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert!(message.ends_with("Remove the instance alias in Local API, or give them different names in Library."), "{message}");
+        assert!(message.ends_with("Remove the instance alias in Loading, or give them different names in Library."), "{message}");
         assert!(!listed(&app).await.contains(&"qwen-i-3".to_owned()));
         // Ejecting forgets them.
         crate::runtime::unload(&state, &second.id).await.unwrap();

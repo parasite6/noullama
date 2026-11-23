@@ -644,7 +644,7 @@ label small { font-weight: 400; line-height: 1.6; }
 /* An instance's own Keep context switch, Clear and status */
 .instance-keep { padding-left: 46px; }
 .instance-keep .keep-context-row { justify-content: flex-start; }
-/* Sidebar: stored load errors, linking to the Local API tab */
+/* Sidebar: stored load errors, linking to the Loading tab */
 .nav-item.load-error-nav, .nav-item.load-error-nav svg { color: var(--bad); }
 @media (max-width: 760px) {
   .row-aliases, .loaded-model .model-aliases, .instance-settings, .instance-names-label { padding-left: 4px; }

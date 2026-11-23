@@ -28,7 +28,7 @@ pub const BAD_RATIO: &str = "Split ratio takes numbers of 0 or more separated by
 pub const ZERO_RATIO: &str = "Split ratio needs at least one number above 0.";
 
 pub fn all_gpus_too_few(count: usize) -> String {
-    format!("All GPUs needs at least 2 GPUs, but the llama.cpp build in Runtime reports {count}. Choose another device in Local API.")
+    format!("All GPUs needs at least 2 GPUs, but the llama.cpp build in Runtime reports {count}. Choose another device in Loading.")
 }
 
 pub fn ratio_count(gpus: usize, numbers: usize) -> String {
@@ -93,7 +93,7 @@ pub fn check_split_settings(settings: &Settings) -> Result<(), String> {
 }
 
 pub fn not_found(device: &str) -> String {
-    format!("Device {device} was not found: the llama.cpp build in Runtime does not report it. Choose another device in Local API.")
+    format!("Device {device} was not found: the llama.cpp build in Runtime does not report it. Choose another device in Loading.")
 }
 
 /// One device line of `llama-server --list-devices`, such as
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn a_saved_device_that_is_not_listed_is_refused_not_replaced() {
         let one = parse_list_devices(ONE_GPU);
-        assert_eq!(choose_device(&settings("CUDA1", "/cpu/llama-server"), Some(&one)).unwrap_err(), "Device CUDA1 was not found: the llama.cpp build in Runtime does not report it. Choose another device in Local API.");
+        assert_eq!(choose_device(&settings("CUDA1", "/cpu/llama-server"), Some(&one)).unwrap_err(), "Device CUDA1 was not found: the llama.cpp build in Runtime does not report it. Choose another device in Loading.");
         assert_eq!(choose_device(&settings("CUDA0", "/cpu/llama-server"), None).unwrap_err(), not_found("CUDA0"));
     }
 

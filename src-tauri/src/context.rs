@@ -159,7 +159,7 @@ pub async fn infer(state: &AppState, instance: &Arc<Instance>, payload: Value) -
 /// One loaded instance's Keep context switch (instance cards and the
 /// Playground rail). Off empties that instance's history only. Lives until
 /// the instance is unloaded and is never saved; new loads start from the
-/// `keep_context` setting, which the Local API load panel saves.
+/// `keep_context` setting, which the Loading tab load panel saves.
 #[tauri::command]
 pub async fn set_instance_keep_context(id: String, on: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
     set_keep(state.inner(), &id, on).await

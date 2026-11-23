@@ -1,7 +1,7 @@
 import React from 'react';
 import { Toggle } from './Toggle';
 
-// One loaded instance's Keep context switch, used on its Local API card and
+// One loaded instance's Keep context switch, used on its Loading tab card and
 // in the Playground rail (for the Playground's instance). Each instance keeps
 // its own history, which every decision it makes, from either place, reads
 // and adds to. `scope` names whose history the counts describe.

@@ -548,7 +548,7 @@ fn instance_alias_clash(before: &[Entry], next: &[Entry], owners: &[(String, Str
             continue;
         }
         if let Some((alias, owner)) = owners.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(value)) {
-            return Err(format!("\"{value}\" is an instance alias of {owner} (\"{alias}\"). Remove it from that instance in Local API, or choose another name."));
+            return Err(format!("\"{value}\" is an instance alias of {owner} (\"{alias}\"). Remove it from that instance in Loading, or choose another name."));
         }
     }
     Ok(())
@@ -675,33 +675,62 @@ pub async fn cached_hashes(state: &AppState, paths: &[&str]) -> BTreeMap<String,
     }).collect()
 }
 
-fn hash_file(path: &str) -> std::io::Result<String> {
+/// Bytes between progress reports are not counted per read: `progress` gets
+/// the bytes read so far at most every 250 ms, and once at the end.
+fn hash_file(path: &str, mut progress: impl FnMut(u64)) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 4 << 20];
+    let mut done = 0u64;
+    let mut reported = std::time::Instant::now();
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        done += read as u64;
+        if reported.elapsed() >= std::time::Duration::from_millis(250) {
+            progress(done);
+            reported = std::time::Instant::now();
+        }
+        #[cfg(test)]
+        if SLOW_HASH.lock().unwrap().contains(path) {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
     }
+    progress(done);
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Files a test wants hashed slowly, so it can see the progress.
+#[cfg(test)]
+pub static SLOW_HASH: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A file being hashed: how many hashes of it are running, and how far the
+/// latest one has read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HashJob {
+    pub count: usize,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
+
+pub type HashJobs = std::sync::Mutex<BTreeMap<String, HashJob>>;
+
 struct Hashing<'a> {
-    paths: &'a std::sync::Mutex<BTreeMap<String, usize>>,
+    paths: &'a HashJobs,
     path: &'a str,
 }
 
 impl Drop for Hashing<'_> {
     fn drop(&mut self) {
         let mut paths = self.paths.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(count) = paths.get_mut(self.path) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+        if let Some(job) = paths.get_mut(self.path) {
+            job.count = job.count.saturating_sub(1);
+            if job.count == 0 {
                 paths.remove(self.path);
             }
         }
@@ -720,10 +749,23 @@ pub async fn current_hash(state: &AppState, path: &str, force: bool) -> Result<S
             }
         }
     }
-    *state.hashing.lock().unwrap_or_else(|error| error.into_inner()).entry(path.to_owned()).or_default() += 1;
+    {
+        let mut jobs = state.hashing.lock().unwrap_or_else(|error| error.into_inner());
+        let job = jobs.entry(path.to_owned()).or_default();
+        job.count += 1;
+        job.done_bytes = 0;
+        job.total_bytes = print.size;
+    }
     let hashing = Hashing { paths: &state.hashing, path };
-    let owned = path.to_owned();
-    let result = tokio::task::spawn_blocking(move || hash_file(&owned)).await;
+    let (owned, jobs) = (path.to_owned(), state.hashing.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        hash_file(&owned, |done| {
+            if let Some(job) = jobs.lock().unwrap_or_else(|error| error.into_inner()).get_mut(&owned) {
+                job.done_bytes = done;
+            }
+        })
+    })
+    .await;
     drop(hashing);
     let sha256 = result.map_err(|e| e.to_string())?.map_err(|e| format!("Cannot read {path}: {e}"))?;
     if !fingerprint(path).is_some_and(|after| after == print) {
@@ -1296,7 +1338,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.gguf");
         std::fs::write(&file, b"abc").unwrap();
-        assert_eq!(hash_file(file.to_str().unwrap()).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(hash_file(file.to_str().unwrap(), |_| {}).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

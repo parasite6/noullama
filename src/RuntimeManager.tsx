@@ -116,7 +116,7 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
     <div className="panel-heading"><span><Cpu size={16}/> CPU runtime</span><span className="muted">For Device CPU</span></div>
     <div className="settings-body">
       <Current kicker="Selected CPU build" name={cpuName} path={cpuPath} copyLabel="Copy CPU runtime path" onCopyError={setCpuError}
-        description="Used by loads on Device CPU, with GPU layers 0." more="Loads whose Device is CPU in Local API run this llama-server, with GPU layers 0. Loads on a GPU use the llama.cpp build above."
+        description="Used by loads on Device CPU, with GPU layers 0." more="Loads whose Device is CPU in Loading run this llama-server, with GPU layers 0. Loads on a GPU use the llama.cpp build above."
         status={!cpuPath && <StatusNote tone="warn">Choose a CPU build below, enter its path, or download the official one.</StatusNote>}/>
       <SettingSection title="CPU builds" description="CPU builds among the installed builds above.">
         {cpuBuilds.length > 0 ? <div className="runtime-build-list">{cpuBuilds.map(runtime => buildRow(runtime, cpuPath, 'Use for CPU', onSelectCpu, setCpuError))}</div>

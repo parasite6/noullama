@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as stateHelpers from './presets.ts';
-import { modelStatus } from './model-state.ts';
+import { modelStatus, verifyingText } from './model-state.ts';
 import { visibleBanner, waitText } from './ui-state.ts';
 import { runtimeStatus } from './runtime-state.ts';
 import { authorImageSources } from './author-image.ts';
@@ -116,4 +116,15 @@ test('unchanged polling retains displayed state and stale replies cannot overwri
 
 test('the any-available wait reads as seconds when whole, as the 503 message does', () => {
   assert.deepEqual([1, 999, 1000, 1500, 60000, 120000, 600000].map(waitText), ['1 ms', '999 ms', '1 second', '1500 ms', '60 seconds', '120 seconds', '600 seconds']);
+});
+
+test('a load that is checking sha256 says so, with progress', () => {
+  assert.equal(verifyingText(null), null);
+  assert.equal(verifyingText({ file:'/models/m.gguf', slot:'model', done_bytes:42, total_bytes:100 }), 'Checking sha256… 42%');
+  assert.equal(verifyingText({ file:'/models/h.gguf', slot:'mtp', done_bytes:0, total_bytes:100 }), 'Checking sha256 of head… 0%');
+  assert.equal(verifyingText({ file:'/models/p.gguf', slot:'mmproj', done_bytes:100, total_bytes:100 }), 'Checking sha256 of projector… 100%');
+  assert.equal(verifyingText({ file:'/models/e.gguf', slot:'model', done_bytes:0, total_bytes:0 }), 'Checking sha256…');
+  const loading = { path:'/models/m.gguf', device:'CPU', ready:false, verifying:{ file:'/models/m.gguf', slot:'model' as const, done_bytes:1, total_bytes:4 } };
+  assert.equal(modelStatus('/models/m.gguf', loading).label, 'Checking sha256… 25%');
+  assert.equal(modelStatus('/models/m.gguf', { ...loading, verifying:null }).label, 'Loading');
 });
