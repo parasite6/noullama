@@ -13,6 +13,8 @@
     "tauri": "tauri",
     "desktop": "tauri dev -- --target-dir target/dev",
     "desktop:build": "tauri build",
+    "build:fedora": "tauri build --bundles rpm",
+    "build:debian": "tauri build --bundles deb",
     "test": "node --experimental-strip-types --test src/presets.test.ts src/ui-state.test.ts"
   },
   "dependencies": {
