@@ -111,6 +111,9 @@ nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-item:hover:not(:disabled) { background: var(--surface); color: var(--text); }
 .nav-item.active, .nav-item[aria-pressed="true"] { background: var(--surface-2); color: var(--text); }
 .nav-item.active svg, .nav-item[aria-pressed="true"] svg { color: var(--text); }
+.sidebar-tabs > .nav-item { touch-action: none; }
+.sidebar-tabs.reordering > .nav-item { transition: transform 120ms ease-out; }
+.sidebar-tabs.reordering > .nav-item.dragging { position: relative; z-index: 1; cursor: grabbing; background: var(--surface-2); transition: none; }
 .sidebar-bottom { margin-top: auto; display: flex; flex-direction: column; gap: 2px; }
 .runtime-card { margin-top: 10px; width: 100%; justify-content: flex-start; text-align: left; gap: 11px; padding: 10px; border-radius: 12px; background: var(--surface); }
 .runtime-card:hover { background: var(--surface-2); }

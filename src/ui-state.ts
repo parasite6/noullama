@@ -249,3 +249,17 @@ export function matchingProbe(result: { path: string; libraryPath: string; outpu
 export function settingsGroupMatches<T>(draft: T, saved: T, fields: readonly (keyof T)[], saving: boolean) {
   return !saving && fields.every(key => draft[key] === saved[key]);
 }
+
+export function sanitizeTabOrder<T extends string>(stored: unknown, defaults: readonly T[]): T[] {
+  const known = new Set<unknown>(defaults);
+  const saved = Array.isArray(stored) ? stored.filter((id): id is T => known.has(id)) : [];
+  return [...new Set([...saved, ...defaults])];
+}
+
+export function moveTab<T>(order: readonly T[], from: number, to: number): readonly T[] {
+  if (from === to || from < 0 || to < 0 || from >= order.length || to >= order.length) return order;
+  const moved = [...order];
+  const [tab] = moved.splice(from, 1);
+  moved.splice(to, 0, tab);
+  return moved;
+}

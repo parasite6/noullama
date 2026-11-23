@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, ALL_GPUS, CHOOSE_GPUS, chosenGpus, deviceChoice, ratioError, splitLabel, toggleGpu, enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
+import { sanitizeTabOrder, moveTab, apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, ALL_GPUS, CHOOSE_GPUS, chosenGpus, deviceChoice, ratioError, splitLabel, toggleGpu, enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
 
 const file = '/models/acme/qwen.gguf';
 const first = { id: 'a1', slot: 1, path: file };
@@ -275,4 +275,20 @@ test('the split ratio takes one number of 0 or more per GPU', () => {
   assert.equal(ratioError('3,1,1', 2), 'Split ratio needs one number per GPU: 2 GPUs are in use, but it has 3.');
   for (const bad of ['3,-1', '3,x', '3,,1', 'Infinity,1', '0x10,1', '1e39,1', '3e38,3e38', '1e-40,1']) assert.equal(ratioError(bad, 2), 'Split ratio takes numbers of 0 or more separated by commas, such as 3,1.', bad);
   assert.equal(ratioError('0,0', 2), 'Split ratio needs at least one number above 0.');
+});
+
+test('stored tab order drops unknown and duplicate entries and appends missing tabs in default order', () => {
+  const defaults = ['playground', 'models', 'hub', 'settings'] as const;
+  assert.deepEqual(sanitizeTabOrder(['hub', 'gone', null, 'hub', 'models'], defaults), ['hub', 'models', 'playground', 'settings']);
+  assert.deepEqual(sanitizeTabOrder({ order: ['hub'] }, defaults), defaults);
+  assert.deepEqual(sanitizeTabOrder(null, defaults), defaults);
+});
+
+test('moving a tab inserts it at the destination without mutating the original order', () => {
+  const order = Object.freeze(['a', 'b', 'c', 'd']);
+  assert.deepEqual(moveTab(order, 0, 2), ['b', 'c', 'a', 'd']);
+  assert.deepEqual(moveTab(order, 3, 1), ['a', 'd', 'b', 'c']);
+  assert.equal(moveTab(order, 0, -1), order);
+  assert.equal(moveTab(order, 3, 4), order);
+  assert.equal(moveTab(order, 1, 1), order);
 });

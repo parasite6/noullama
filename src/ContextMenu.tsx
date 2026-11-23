@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ClipboardPaste, Copy, Scissors, TextSelect } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { RotateCcw, ClipboardPaste, Copy, Scissors, TextSelect } from 'lucide-react';
 
-type Target = { element: HTMLElement | null; editable: boolean; text: string; x: number; y: number };
+type Target = { element: HTMLElement | null; editable: boolean; tabOrder?: boolean; text: string; x: number; y: number };
 type Item = { label: string; icon: typeof Copy; shortcut: string; disabled: boolean; run: () => Promise<void> | void };
 
 const isMac = navigator.platform.toLowerCase().includes('mac');
@@ -27,7 +28,7 @@ function selectedText(element: HTMLElement | null) {
 // The webview's own menu offers Back and Reload, which mean nothing here, and is
 // drawn in the system theme. This one covers the edit actions instead. Hold
 // Shift while right-clicking to get the native menu (for Inspect Element).
-export function ContextMenu() {
+export function ContextMenu({ onResetTabOrder }: { onResetTabOrder: (element: HTMLElement | null) => void }) {
   const [target, setTarget] = useState<Target | null>(null);
   const [active, setActive] = useState(0);
   const menu = useRef<HTMLDivElement>(null);
@@ -38,6 +39,13 @@ export function ContextMenu() {
       if (event.shiftKey || event.defaultPrevented) return;
       event.preventDefault();
       if (event.target instanceof Element && event.target.closest('dialog[open]')) { setTarget(null); return; }
+      if (event.target instanceof Element && event.target.closest('.sidebar-tabs')) {
+        const element = event.target.closest<HTMLButtonElement>('button[data-tab]');
+        const { left, bottom } = element?.getBoundingClientRect() ?? { left: 8, bottom: 8 };
+        setTarget({ element, editable: false, tabOrder: true, text: '', x: event.clientX || left, y: event.clientY || bottom });
+        setActive(-1);
+        return;
+      }
       const element = editableFrom(event.target);
       const text = selectedText(element);
       if (!element && !text) { setTarget(null); return; }
@@ -69,7 +77,9 @@ export function ContextMenu() {
   if (!target) return null;
   const { element, editable, text } = target;
   const finish = () => { setTarget(null); element?.focus(); };
-  const items: Item[] = [
+  const items: Item[] = target.tabOrder
+    ? [{ label: 'Reset tab order', icon: RotateCcw, shortcut: '', disabled: false, run: () => { finish(); onResetTabOrder(element); } }]
+    : [
     ...(editable ? [{ label: 'Cut', icon: Scissors, shortcut: key('X'), disabled: !text, run: async () => { await navigator.clipboard.writeText(text); finish(); document.execCommand('delete'); } }] : []),
     { label: 'Copy', icon: Copy, shortcut: key('C'), disabled: !text, run: async () => { await navigator.clipboard.writeText(text); finish(); } },
     ...(editable ? [
@@ -85,16 +95,16 @@ export function ContextMenu() {
   function onKeyDown(event: React.KeyboardEvent) {
     const at = enabled.indexOf(active);
     if (event.key === 'ArrowDown') setActive(enabled[(at + 1) % enabled.length]);
-    else if (event.key === 'ArrowUp') setActive(enabled[(at - 1 + enabled.length) % enabled.length]);
+    else if (event.key === 'ArrowUp') setActive(enabled[at < 0 ? enabled.length - 1 : (at - 1 + enabled.length) % enabled.length]);
     else if (event.key === 'Enter' && active >= 0) void items[active].run();
     else if (event.key === 'Escape') finish();
     else return;
     event.preventDefault();
   }
 
-  return <div className="context-menu" role="menu" ref={menu} tabIndex={-1} style={{ left: position.x, top: position.y }} onKeyDown={onKeyDown} onMouseDown={event => event.preventDefault()} onContextMenu={event => event.preventDefault()}>
+  return createPortal(<div className="context-menu" role="menu" ref={menu} tabIndex={-1} style={{ left: position.x, top: position.y }} onKeyDown={onKeyDown} onMouseDown={event => event.preventDefault()} onContextMenu={event => event.preventDefault()}>
     {items.map((item, index) => { const Icon = item.icon; return <button key={item.label} role="menuitem" className={index === active ? 'active' : ''} disabled={item.disabled} onPointerEnter={() => setActive(item.disabled ? -1 : index)} onClick={() => void item.run()}>
-      <Icon size={14}/><span>{item.label}</span><kbd>{item.shortcut}</kbd>
+      <Icon size={14}/><span>{item.label}</span>{item.shortcut && <kbd>{item.shortcut}</kbd>}
     </button>; })}
-  </div>;
+  </div>, document.body);
 }

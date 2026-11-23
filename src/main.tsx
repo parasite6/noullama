@@ -8,7 +8,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Toggle } from './Toggle';
 import { ModelDetails, type MemoryUse } from './ModelDetails';
 import { ImageAttachments, MAX_TOTAL_BYTES, readImages, type Attachment } from './ImageAttachments';
-import { Activity, AlertCircle, ArrowDownToLine, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, ChevronUp, CircleCheck, Code2, Copy, Cpu, Download, ExternalLink, FileJson, FlaskConical, FolderOpen, Gauge, Layers3, Mail, MemoryStick, Microchip, Network, Play, PlugZap, Plus, RefreshCw, Route, Search, Settings2, Shield, ShieldCheck, Square, Tags, Terminal, Trash2, Save, Power, Unplug, X, CircleArrowUp, Library as LibraryIcon } from 'lucide-react';
+import { Activity, AlertCircle, ArrowDownToLine, ArrowRight, BookOpen, Check, ChevronDown, ChevronRight, ChevronUp, CircleCheck, Copy, Cpu, Download, ExternalLink, FileJson, FolderOpen, Gauge, Layers3, Mail, MemoryStick, Microchip, Network, Play, Plus, RefreshCw, Route, Search, Settings2, Shield, ShieldCheck, Square, Tags, Terminal, Trash2, Save, Power, Unplug, X, CircleArrowUp } from 'lucide-react';
 import { buildRequest, convertState, presets } from './presets';
 import { QuitDialog } from './QuitDialog';
 import { DeletePresetDialog } from './DeletePresetDialog';
@@ -20,7 +20,7 @@ import { Select } from './Select';
 import { Toast } from './Toast';
 import { Library, SHA_CHECKS, type Companion, type LibraryEntry, type LibraryState } from './Library';
 import { UpdatesDialog, type UpdateView } from './UpdatesDialog';
-import { ContextMenu } from './ContextMenu';
+import { SidebarTabs } from './SidebarTabs';
 import { NumberField } from './NumberField';
 import { SettingRow, SettingSection, StatusNote, type Tone } from './SettingsLayout';
 import { runtimeStatus } from './runtime-state';
@@ -628,9 +628,7 @@ function App() {
   return <div className={`app-shell ${showDownloadToast ? 'has-toast' : ''}`} style={{ '--toast-h': `${toastHeight}px` } as React.CSSProperties}>
     <aside className="sidebar">
       <div className="brand"><img className="brand-logo" src={logoUrl} width={28} height={28} alt=""/><span>noullama</span><span className="brand-tag">Beta</span></div>
-      <nav>{[
-        ['playground', FlaskConical, 'Playground'], ['models', Layers3, 'Models'], ['loading', PlugZap, 'Loading'], ['hub', Network, 'Hub'], ['runtime', Cpu, 'Runtime'], ['api', Code2, 'Local API'], ['library', LibraryIcon, 'Library'], ['settings', Settings2, 'Settings'],
-      ].map(([id, Icon, title]) => { const I = Icon as typeof Cpu; return <button key={String(id)} className={`nav-item ${tab === id ? 'active' : ''}`} aria-current={tab === id ? 'page' : undefined} title={String(title)} onClick={() => setTab(String(id))}><I size={18}/><span>{String(title)}</span></button>; })}</nav>
+      <SidebarTabs tab={tab} onSelect={setTab}/>
       <div className="sidebar-bottom">
         {loadErrors.length > 0 && <button className="nav-item load-error-nav" title={`${loadErrors.length === 1 ? `Load error: ${loadErrors[0].name}` : `${loadErrors.length} load errors`}. Open Loading`} aria-label={`${loadErrors.length === 1 ? '1 load error' : `${loadErrors.length} load errors`}, open Loading`} onClick={() => setTab('loading')}><AlertCircle size={18}/><span>{loadErrors.length === 1 ? 'Load error' : `${loadErrors.length} load errors`}</span></button>}
         {desktop &&<button className={`nav-item ${updates?.offer ? 'has-update' : ''}`} title={updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'} aria-haspopup="dialog" onClick={() => setUpdatesOpen(true)}><CircleArrowUp size={18}/><span>{updates?.offer ? `Update to ${updates.offer.version}` : 'Updates'}</span></button>}
@@ -900,7 +898,6 @@ function App() {
     <MemoryWarningDialog warning={crowdedWarning} pending={isBusy('memory-warning', 'start')} hide={hideCrowded} onHide={setHideCrowded}
       onCancel={() => void action('memory-warning', async () => { if (hideCrowded) await invoke('set_memory_preference', { key: 'hide_crowded_load_warning', value: true }); setCrowdedWarning(null); })}
       onEject={id => { void (async () => { try { if (hideCrowded) await invoke('set_memory_preference', { key: 'hide_crowded_load_warning', value: true }); const replace = crowdedWarning?.replace ?? null; setCrowdedWarning(null); await loadSelected({ replace, ejectOther: id }); } catch (e) { setNotice({ text: errorText(e), error: true }); } })(); }}/>
-    <ContextMenu/>
     {updates && <UpdatesDialog open={updatesOpen} view={updates} onClose={() => setUpdatesOpen(false)} onCheck={() => { void updateCommand('check_for_update'); }} onInstall={() => { void updateCommand('install_update'); }} onPrefs={(includePrereleases, checkOnLaunch) => { setUpdates(view => view && { ...view, include_prereleases: includePrereleases, check_on_launch: checkOnLaunch }); void updateCommand('set_update_prefs', { includePrereleases, checkOnLaunch }); }}/>}
     <DeletePresetDialog name={presetToDelete?.name ?? null} pending={isBusy('preset')} onCancel={() => setPresetToDelete(null)} onConfirm={() => { if (presetToDelete) void trashPreset(presetToDelete.id); }}/>
     <QuitDialog open={quitPrompt} pending={isBusy('quit') || isBusy('cancel-quit')} loaded={snapshot ? snapshot.instances.length : null} onCancel={() => { setQuitPrompt(false); void action('cancel-quit', async () => { await invoke('cancel_quit'); }); }} onConfirm={() => { void action('quit', async () => { await invoke('quit_app'); }); }}/>
