@@ -1,6 +1,7 @@
+import { Reveal } from './Reveal';
+import { busyButton, useDelayedPending } from './busy-button';
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { CheckIcon as Check } from '@phosphor-icons/react/dist/icons/Check';
 import { KeyIcon as KeyRound } from '@phosphor-icons/react/dist/icons/Key';
 import { TrashIcon as Trash2 } from '@phosphor-icons/react/dist/icons/Trash';
 import { CopyButton } from './CopyButton';
@@ -38,6 +39,7 @@ export function ApiKeys({ active, desktop, required, models, onToggle, onCopyErr
   const [selected, setSelected] = useState<string[]>([]);
   const [created, setCreated] = useState<CreatedKey | null>(null);
   const [pending, setPending] = useState<'create' | 'delete' | null>(null);
+  const visiblePending = useDelayedPending(pending);
   const [error, setError] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<KeyInfo | null>(null);
   const deleteDialog = useRef<HTMLDialogElement>(null);
@@ -116,8 +118,8 @@ export function ApiKeys({ active, desktop, required, models, onToggle, onCopyErr
     const checked = selected.includes(option.id);
     return <button key={option.id} type="button" role="checkbox" aria-checked={checked}
       aria-label={option.label} className={alias ? 'api-key-alias' : 'api-key-model'}
-      disabled={disabled} onClick={() => setSelected(current => checked ? current.filter(id => id !== option.id) : [...current, option.id])}>
-      <span className="api-key-check" aria-hidden="true">{checked && <Check size={12}/>}</span>
+      {...busyButton(!!pending, !desktop, false)} onClick={() => setSelected(current => checked ? current.filter(id => id !== option.id) : [...current, option.id])}>
+      <span className="checkbox-mark" aria-hidden="true"/>
       <span>{option.selection.name}</span>
     </button>;
   }
@@ -133,12 +135,12 @@ export function ApiKeys({ active, desktop, required, models, onToggle, onCopyErr
         <SettingSection title="New key">
           <SettingRow label="Name" htmlFor="api-key-name"
             control={<input id="api-key-name" required value={name} disabled={disabled} onChange={event => setName(event.target.value)}/>}/>
-          <SettingRow label="Expiry" control={<Select label="Expiry" value={expiry} options={[...apiKeyExpiryOptions]} onChange={setExpiry} disabled={disabled}/>}/>
-          {expiry === 'custom' && <SettingRow label="Expiry date" htmlFor="api-key-date" description="Expires at the end of this day, local time."
-            control={<input id="api-key-date" type="date" required value={date} disabled={disabled} onChange={event => setDate(event.target.value)}/>}/>}
-          <SettingRow label="Access" control={<Select label="Access" value={specific ? 'specific' : 'any'} disabled={disabled}
+          <SettingRow label="Expiry" control={<Select label="Expiry" value={expiry} options={[...apiKeyExpiryOptions]} onChange={setExpiry} busy={!!pending} disabled={!desktop}/>}/>
+          <Reveal open={expiry === 'custom'}><SettingRow label="Expiry date" htmlFor="api-key-date" description="Expires at the end of this day, local time."
+            control={<input id="api-key-date" type="date" required value={date} disabled={disabled || expiry !== 'custom'} onChange={event => setDate(event.target.value)}/>}/></Reveal>
+          <SettingRow label="Access" control={<Select label="Access" value={specific ? 'specific' : 'any'} busy={!!pending} disabled={!desktop}
             options={[{ value: 'any', label: 'Any' }, { value: 'specific', label: 'Specific models' }]} onChange={value => setSpecific(value === 'specific')}/>}/>
-          {specific && <SettingRow label="Models">
+          <Reveal open={specific}>{specific && <SettingRow label="Models">
             {groups.length > 0 ? <div className="api-key-models" role="group" aria-label="Specific models">
               {groups.map(([model, ...aliases]) => <div className="api-key-model-group" key={model.id}>
                 {modelOption(model, false)}
@@ -149,25 +151,25 @@ export function ApiKeys({ active, desktop, required, models, onToggle, onCopyErr
               <StatusNote tone="info">Aliases come from Library. These models have none yet.</StatusNote>
               <button type="button" className="ghost" onClick={onOpenLibrary}>Open Library</button>
             </div>}
-          </SettingRow>}
+          </SettingRow>}</Reveal>
           <SettingRow label=""
-            status={pending === 'create' && <StatusNote tone="pending">{specific ? 'Checking model hashes and creating key…' : 'Creating key…'}</StatusNote>}
-            control={<button type="submit" className="primary" disabled={disabled || !name.trim() || (specific && !selectedModels.length)}>Create key</button>}/>
+            status={visiblePending === 'create' && <StatusNote tone="pending">{specific ? 'Checking model hashes and creating key…' : 'Creating key…'}</StatusNote>}
+            control={<button type="submit" className="primary" {...busyButton(!!pending, !desktop || !name.trim() || (specific && !selectedModels.length), pending === 'create')}>Create key</button>}/>
         </SettingSection>
       </form>
-      {created && <SettingSection title="New API key" description="Copy this key now. You can only see it here.">
+      <Reveal open={created} className="settings-spaced">{created && <SettingSection title="New API key" description="Copy this key now. You can only see it here.">
         <SettingRow label={<code className="api-key-secret">{created.key}</code>}
           control={<><CopyButton value={created.key} label="Copy API key" onError={onCopyError}/><button type="button" className="secondary" onClick={() => setCreated(null)}>Done</button></>}/>
-      </SettingSection>}
-      {error && !deleteTarget && <StatusNote tone="error"><span role="alert">{error}</span></StatusNote>}
+      </SettingSection>}</Reveal>
+      <Reveal open={error && !deleteTarget} className="settings-spaced">{error && !deleteTarget && <StatusNote tone="error"><span role="alert">{error}</span></StatusNote>}</Reveal>
       <SettingSection title="Keys">
-        {keys?.length === 0 && <SettingRow label="No API keys"/>}
+        <Reveal open={keys?.length === 0}>{keys?.length === 0 && <SettingRow label="No API keys"/>}</Reveal>
         {keys?.map(key => {
           const expired = key.expires !== null && key.expires * 1000 <= Date.now();
           const expiryText = expired ? 'Expired' : key.expires === null ? 'Never expires' : `Expires ${dateText(key.expires)}`;
           return <SettingRow key={key.id} label={<span className="api-key-identity">{key.name}<span className={`chip ${expired ? 'warning' : ''}`} title={expired && key.expires !== null ? dateText(key.expires) : undefined}>{expiryText}</span></span>}
             description={<><span className="api-key-meta"><code>{key.prefix}…</code><span>Created {dateText(key.created)}</span></span><span className="api-key-access">{apiKeyAccessSummary(key.models)}</span></>}
-            control={<button type="button" className="secondary" aria-label={`Delete API key ${key.name}`} aria-haspopup="dialog" disabled={pending !== null} onClick={event => {
+            control={<button type="button" className="secondary" aria-label={`Delete API key ${key.name}`} aria-haspopup="dialog" {...busyButton(!!pending, false, false)} onClick={event => {
               deleteTrigger.current = event.currentTarget;
               setError('');
               setDeleteTarget(key);
@@ -182,10 +184,10 @@ export function ApiKeys({ active, desktop, required, models, onToggle, onCopyErr
       <Trash2 size={24} aria-hidden="true"/>
       <h2 id="delete-api-key-title">Delete API key?</h2>
       <p id="delete-api-key-description" style={{ overflowWrap: 'anywhere' }}>{deleteTarget?.name} (<code>{deleteTarget?.prefix}…</code>) will no longer start requests. Inference already running can finish.</p>
-      {error && deleteTarget && <StatusNote tone="error"><span role="alert">{error}</span></StatusNote>}
+      <Reveal open={error && deleteTarget}>{error && deleteTarget && <StatusNote tone="error"><span role="alert">{error}</span></StatusNote>}</Reveal>
       <div className="quit-dialog-actions">
-        <button ref={cancelDelete} type="button" className="secondary" disabled={!!pending} onClick={() => setDeleteTarget(null)}>Cancel</button>
-        <button type="button" className="danger" disabled={!!pending} onClick={() => void remove()}>{pending === 'delete' ? 'Deleting…' : 'Delete'}</button>
+        <button ref={cancelDelete} type="button" className="secondary" {...busyButton(!!pending, false, false)} onClick={() => setDeleteTarget(null)}>Cancel</button>
+        <button type="button" className="danger" {...busyButton(!!pending)} onClick={() => void remove()}>{visiblePending === 'delete' ? 'Deleting…' : 'Delete'}</button>
       </div>
     </dialog>
   </section>;

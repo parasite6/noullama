@@ -263,3 +263,7 @@ export function moveTab<T>(order: readonly T[], from: number, to: number): reado
   moved.splice(to, 0, tab);
   return moved;
 }
+
+export function libraryUsesWindow(modelCount: number): boolean {
+  return modelCount >= 60;
+}

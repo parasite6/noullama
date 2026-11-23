@@ -1,3 +1,4 @@
+import { busyButton, useDelayedPending } from './busy-button';
 import React, { useEffect, useRef } from 'react';
 import { TrashIcon as Trash2 } from '@phosphor-icons/react/dist/icons/Trash';
 
@@ -5,6 +6,7 @@ import { TrashIcon as Trash2 } from '@phosphor-icons/react/dist/icons/Trash';
 // click on the backdrop cancels.
 export function DeletePresetDialog({ name, pending, onCancel, onConfirm }: { name: string | null; pending: boolean; onCancel: () => void; onConfirm: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const visiblePending = useDelayedPending(pending);
   const cancel = useRef<HTMLButtonElement>(null);
   const open = name !== null;
   useEffect(() => {
@@ -21,6 +23,6 @@ export function DeletePresetDialog({ name, pending, onCancel, onConfirm }: { nam
     <Trash2 size={24} aria-hidden="true"/>
     <h2 id="delete-preset-title">Delete “{name}”?</h2>
     <p id="delete-preset-description">This removes the saved questions and state for this preset. It cannot be undone.</p>
-    <div className="quit-dialog-actions"><button ref={cancel} className="secondary" disabled={pending} onClick={onCancel}>Keep preset</button><button className="danger" disabled={pending} onClick={onConfirm}>{pending ? 'Deleting…' : 'Delete preset'}</button></div>
+    <div className="quit-dialog-actions"><button ref={cancel} className="secondary" {...busyButton(pending, false, false)} onClick={onCancel}>Keep preset</button><button className="danger" {...busyButton(pending)} onClick={onConfirm}>{visiblePending ? 'Deleting…' : 'Delete preset'}</button></div>
   </dialog>;
 }

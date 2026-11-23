@@ -1239,8 +1239,9 @@ pub(crate) fn runtime_command(settings: &Settings) -> Command {
 }
 
 #[tauri::command]
-pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<Value, String> {
-    state_snapshot(state.inner()).await
+pub async fn snapshot(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let snapshot = state_snapshot(state.inner()).await?;
+    serde_json::to_string(&snapshot).map_err(|error| error.to_string())
 }
 
 /// The load task reports its own failures; this catches a runtime that

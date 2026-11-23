@@ -1,5 +1,5 @@
 import { SelectionIndicator } from './SelectionIndicator';
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
 import { CodeIcon as Code2 } from '@phosphor-icons/react/dist/icons/Code';
 import { CpuIcon as Cpu } from '@phosphor-icons/react/dist/icons/Cpu';
 import { FlaskIcon as FlaskConical } from '@phosphor-icons/react/dist/icons/Flask';
@@ -50,6 +50,48 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
   const gesture = useRef<Gesture | null>(null);
   const suppressClick = useRef(false);
   const restoreFocus = useRef<Tab | null>(null);
+  const settleFrom = useRef<Map<HTMLElement, number> | null>(null);
+  const settling = useRef(new Map<HTMLElement, Animation>());
+
+  const captureReorder = useCallback(() => {
+    const container = nav.current;
+    if (!container || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    settleFrom.current = new Map(Array.from(
+      container.querySelectorAll<HTMLElement>('.nav-item, .selection-indicator'),
+      element => [element, element.getBoundingClientRect().top],
+    ));
+    container.dataset.settling = '';
+  }, []);
+
+  useLayoutEffect(() => {
+    const from = settleFrom.current;
+    const container = nav.current;
+    if (!from || !container) return;
+    settleFrom.current = null;
+    for (const animation of settling.current.values()) animation.cancel();
+    settling.current.clear();
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      delete container.dataset.settling;
+      return;
+    }
+
+    // The indicator's layout effect already measured the selected row's new slot.
+    const destinations = [...from].map(([element, top]) =>
+      [element, top - element.getBoundingClientRect().top] as const);
+    const easing = getComputedStyle(container).getPropertyValue('--ease-reorder').trim();
+    for (const [element, delta] of destinations) {
+      if (Math.abs(delta) < .01) continue;
+      const animation = element.animate(
+        [{ translate: `0 ${delta}px` }, { translate: '0 0' }],
+        { duration: 200, easing, fill: 'backwards' },
+      );
+      settling.current.set(element, animation);
+      animation.onfinish = () => {
+        if (settling.current.get(element) === animation) settling.current.delete(element);
+      };
+    }
+    delete container.dataset.settling;
+  });
 
   useLayoutEffect(() => {
     if (restoreFocus.current) {
@@ -60,7 +102,8 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
 
   useEffect(() => {
     function cancel() {
-      if (!gesture.current) return;
+      if (!gesture.current || gesture.current.canceled) return;
+      if (suppressClick.current) captureReorder();
       gesture.current.canceled = true;
       suppressClick.current = true;
       setPreview(null);
@@ -78,7 +121,7 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
       window.removeEventListener('resize', cancel);
       window.removeEventListener('blur', cancel);
     };
-  }, []);
+  }, [captureReorder]);
 
   function commit(next: readonly Tab[], message: string) {
     setOrder(next);
@@ -94,7 +137,10 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
     const next = moveTab(order, from, to);
     if (next === order) return;
     const id = order[from];
-    if (keepFocus) restoreFocus.current = id;
+    if (keepFocus) {
+      captureReorder();
+      restoreFocus.current = id;
+    }
     commit(next, `${tabs[id][1]} moved to position ${to + 1} of ${order.length}`);
   }
 
@@ -107,8 +153,10 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
 
   function onPointerDown(event: PointerEvent<HTMLButtonElement>, from: number) {
     if (!event.isPrimary || event.button !== 0 || gesture.current || !nav.current) return;
+    const listTop = nav.current.getBoundingClientRect().top;
     const slots = Array.from(nav.current.querySelectorAll('button'), button => {
-      const { top, bottom } = button.getBoundingClientRect();
+      const top = listTop + button.offsetTop;
+      const bottom = top + button.offsetHeight;
       return { top, bottom, center: (top + bottom) / 2 };
     });
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -138,6 +186,7 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
       const releasedOver = document.elementFromPoint(event.clientX, event.clientY);
       suppressClick.current = !event.currentTarget.contains(releasedOver);
     }
+    if (preview || (final && final.from !== final.to)) captureReorder();
     gesture.current = null;
     setPreview(null);
     if (final) move(final.from, final.to);
@@ -152,7 +201,7 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
 
   return <>
     <nav ref={nav} className={preview ? 'sidebar-tabs reordering' : 'sidebar-tabs'} aria-label="Pages">
-      <SelectionIndicator track={nav} selected='button[aria-current="page"]'
+      <SelectionIndicator selected='button[aria-current="page"]'
         offsetY={activeIndex < 0 ? 0 : offsetFor(order[activeIndex], activeIndex)}
         dragging={!!preview && preview.from === activeIndex}/>
       {order.map((id, index) => {
@@ -191,6 +240,7 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
     <span className="sr-only" role="status">{announcement}</span>
     <ContextMenu onResetTabOrder={element => {
       if (gesture.current || order.every((id, index) => id === defaults[index])) return;
+      captureReorder();
       restoreFocus.current = (element?.dataset.tab as Tab | undefined) ?? null;
       commit(defaults, 'Tab order reset');
     }}/>

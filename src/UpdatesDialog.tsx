@@ -1,3 +1,5 @@
+import { Reveal } from './Reveal';
+import { busyButton, useDelayedPending } from './busy-button';
 import React, { useEffect, useRef } from 'react';
 import { WarningCircleIcon as AlertCircle } from '@phosphor-icons/react/dist/icons/WarningCircle';
 import { CheckCircleIcon as CircleCheck } from '@phosphor-icons/react/dist/icons/CheckCircle';
@@ -21,13 +23,15 @@ function checkedAgo(seconds: number) {
   return minutes < 1 ? 'just now' : minutes < 60 ? `${minutes} min ago` : `${Math.round(minutes / 60)} h ago`;
 }
 
-export function UpdatesDialog({ open, view, onClose, onCheck, onInstall, onPrefs }: {
+export function UpdatesDialog({ open, view, onClose, onCheck, onInstall, onPrefs, prefsSaving }: {
   open: boolean; view: UpdateView; onClose: () => void; onCheck: () => void; onInstall: () => void;
+  prefsSaving: boolean;
   onPrefs: (includePrereleases: boolean, checkOnLaunch: boolean) => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const { status, offer } = view;
   const working = status.kind === 'checking' || status.kind === 'downloading' || status.kind === 'installing';
+  const showWorking = useDelayedPending(working);
   const installing = status.kind === 'downloading' || status.kind === 'installing';
   useEffect(() => {
     const element = dialog.current;
@@ -37,7 +41,7 @@ export function UpdatesDialog({ open, view, onClose, onCheck, onInstall, onPrefs
   }, [open]);
 
   let line: React.ReactNode;
-  if (status.kind === 'checking') line = <><RefreshCw className="spin" size={14}/>Checking for updates…</>;
+  if (status.kind === 'checking' && showWorking) line = <><RefreshCw className="spin" size={14}/>Checking for updates…</>;
   else if (status.kind === 'downloading') line = <><RefreshCw className="spin" size={14}/>Downloading {status.total ? `${Math.floor(status.received / status.total * 100)}% of ${mb(status.total)}` : mb(status.received)}…</>;
   else if (status.kind === 'installing') line = <><RefreshCw className="spin" size={14}/>Installing. Approve the system password prompt to continue.</>;
   else if (status.kind === 'error') line = <span className="update-error"><AlertCircle size={14}/>{status.message}</span>;
@@ -53,20 +57,20 @@ export function UpdatesDialog({ open, view, onClose, onCheck, onInstall, onPrefs
     <h2 id="updates-title">Updates</h2>
     <p className="updates-installed">noullama {view.current_version} is installed.</p>
     <p className="updates-status" role="status">{line}</p>
-    {offer && <div className="update-offer">
+    <Reveal open={offer}>{offer && <div className="update-offer">
       <div className="update-offer-head"><strong>noullama {offer.version}</strong>{offer.prerelease && <span className="chip">Pre-release</span>}{offer.page && <a href={offer.page} target="_blank" rel="noreferrer">Release page<ExternalLink size={12}/></a>}</div>
-      {offer.notes.trim() && <pre className="update-notes">{offer.notes.trim()}</pre>}
-    </div>}
-    {view.unsupported && <p className="update-unsupported">{view.unsupported}</p>}
+      <Reveal open={offer.notes.trim()}>{offer.notes.trim() && <pre className="update-notes">{offer.notes.trim()}</pre>}</Reveal>
+    </div>}</Reveal>
+    <Reveal open={view.unsupported}>{view.unsupported && <p className="update-unsupported">{view.unsupported}</p>}</Reveal>
     <div className="updates-prefs">
-      <Toggle checked={view.include_prereleases} disabled={working} onChange={value => onPrefs(value, view.check_on_launch)} label="Include pre-releases"/>
-      <Toggle checked={view.check_on_launch} disabled={working} onChange={value => onPrefs(view.include_prereleases, value)} label="Check when noullama starts"/>
+      <Toggle checked={view.include_prereleases} locked={working} onChange={value => onPrefs(value, view.check_on_launch)} label="Include pre-releases"/>
+      <Toggle checked={view.check_on_launch} locked={working} onChange={value => onPrefs(view.include_prereleases, value)} label="Check when noullama starts"/>
     </div>
-    {offer && !view.unsupported && <p className="updates-hint">Installing unloads the model, stops the local API, and restarts noullama.</p>}
+    <Reveal open={offer && !view.unsupported}>{offer && !view.unsupported && <p className="updates-hint">Installing unloads the model, stops the local API, and restarts noullama.</p>}</Reveal>
     <div className="quit-dialog-actions">
-      <button className="secondary" disabled={installing} onClick={onClose}>Close</button>
-      <button className="secondary" disabled={working} onClick={onCheck}>Check now</button>
-      {offer && !view.unsupported && <button className="primary" disabled={working} onClick={onInstall}>{installing ? 'Installing…' : 'Install and restart'}</button>}
+      <button className="secondary" {...busyButton(installing, false, false)} onClick={onClose}>Close</button>
+      <button className="secondary" {...busyButton(working || prefsSaving, false, status.kind === 'checking')} onClick={onCheck}>Check now</button>
+      <Reveal open={offer && !view.unsupported} className="inline-reveal">{offer && !view.unsupported && <button className="primary" {...busyButton(working || prefsSaving, false, installing)} onClick={onInstall}>{installing && showWorking ? 'Installing…' : 'Install and restart'}</button>}</Reveal>
     </div>
   </dialog>;
 }

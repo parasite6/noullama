@@ -1,3 +1,4 @@
+import { Reveal } from './Reveal';
 import React from 'react';
 import { Toggle } from './Toggle';
 
@@ -14,8 +15,8 @@ export function KeepContext({ on, entries, lastFlushed, scope, disabled, onToggl
   return <div className="keep-context">
     <div className="keep-context-row">
       <Toggle label="Keep context" title="Add this model's earlier decisions to each request's state. Its history is shared by the Playground and every local API call it answers; other loaded models keep their own. The oldest are flushed when the context window is full." checked={on} disabled={disabled} onChange={onToggle}/>
-      {on && entries > 0 && <button type="button" className="ghost" disabled={disabled} onClick={onClear}>Clear</button>}
+      <Reveal open={on && entries > 0} className="inline-reveal">{on && entries > 0 && <button type="button" className="ghost" disabled={disabled} onClick={onClear}>Clear</button>}</Reveal>
     </div>
-    <p className="keep-context-status">{status}</p>
+    <Reveal open swapKey={String(on)}><p className="keep-context-status">{status}</p></Reveal>
   </div>;
 }

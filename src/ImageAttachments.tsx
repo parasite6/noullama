@@ -1,3 +1,4 @@
+import { Reveal } from './Reveal';
 import React, { useRef } from 'react';
 import { ImageSquareIcon as ImagePlus } from '@phosphor-icons/react/dist/icons/ImageSquare';
 import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
@@ -54,7 +55,7 @@ export function ImageAttachments({ images, onFiles, onRemove, disabled }: { imag
       <button type="button" className="icon-button small image-remove" aria-label={`Remove ${image.name}`} onClick={() => onRemove(index)}><X size={12}/></button>
     </figure>)}
     <button type="button" className="image-add" disabled={disabled} onClick={() => input.current?.click()}><ImagePlus size={18}/><span>{images.length ? 'Add more' : 'Add images'}</span></button>
-    {!images.length && <small>Or drop or paste images here. They are sent with the state.</small>}
+    <Reveal open={!images.length}>{!images.length && <small>Or drop or paste images here. They are sent with the state.</small>}</Reveal>
     <input ref={input} type="file" accept="image/*" multiple hidden onChange={event => {
       const files = [...(event.target.files ?? [])];
       event.target.value = '';

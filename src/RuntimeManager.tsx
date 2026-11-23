@@ -1,3 +1,5 @@
+import { Reveal } from './Reveal';
+import { busyButton, useDelayedPending } from './busy-button';
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Select } from './Select';
@@ -85,12 +87,13 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
   const message = error ?? (progress?.error !== dismissedError ? progress?.error : null);
   const cpuMessage = cpuError ?? (cpuProgress?.error !== dismissedCpuError ? cpuProgress?.error : null);
   const cpuBuilds = installed.filter(runtime => runtime.backend === 'cpu');
-  const scanning = pending === 'scan';
+  const visiblePending = useDelayedPending(pending);
+  const scanning = visiblePending === 'scan';
   const buildRow = (runtime: LocalRuntime, chosen: string, use: string, onUse: (runtime: LocalRuntime) => void, onCopyError: (error: string) => void) => {
     const selected = isChosen(runtime, chosen);
     return <div className={`runtime-build-row ${selected ? 'selected' : ''}`} key={runtime.path}>
       <div className="runtime-build-text"><strong>{runtime.label}</strong><span className="identity-line"><code title={runtime.path}>{runtime.path}</code><CopyButton value={runtime.path} label="Copy runtime path" size={12} onError={onCopyError}/></span><small>{runtime.source}{runtime.backend ? ` / ${backendNames[runtime.backend] ?? runtime.backend}` : ''}</small></div>
-      <div className="setting-control"><button className="secondary compact" disabled={selected} onClick={() => onUse(runtime)}>{selected ? <><Check size={13}/>Selected</> : use}</button></div>
+      <div className="setting-control">{selected ? <span className="selected-badge"><Check size={15} weight="fill"/>Selected</span> : <button className="secondary compact" onClick={() => onUse(runtime)}>{use}</button>}</div>
     </div>;
   };
   return <><section className="panel runtime-manager" aria-label="GPU build">
@@ -98,9 +101,9 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
     <div className="settings-body">
       <Current kicker="Selected build" name={currentName} path={currentPath} copyLabel="Copy runtime path" onCopyError={setError}
         description="Used by loads on a GPU device." more="Automatic CPU selection uses this build when no CPU runtime is set."
-        status={<>{!currentPath && <StatusNote tone="warn">No build selected. Choose one below, enter its path, or download one.</StatusNote>}{running && <StatusNote tone="info">Loaded models keep the build they started with. A new choice applies to the next model you load.</StatusNote>}</>}/>
+        status={(!currentPath || running) && <>{!currentPath && <StatusNote tone="warn">No build selected. Choose one below, enter its path, or download one.</StatusNote>}{running && <StatusNote tone="info">Loaded models keep the build they started with. A new choice applies to the next model you load.</StatusNote>}</>}/>
       <SettingSection title="Installed builds" description="Builds found on this computer." more="Found in Noullama downloads, in the folders of the selected GPU and CPU builds, in the folder above the GPU build's folder, and on PATH."
-        aside={<button className="secondary compact" disabled={!desktop || !!pending} onClick={() => void discover()}><RefreshCw size={14} className={scanning ? 'spin' : ''}/>{scanning ? 'Scanning…' : 'Scan local builds'}</button>}>
+        aside={<button className="secondary compact" {...busyButton(!!pending, !desktop, pending === 'scan')} onClick={() => void discover()}><RefreshCw size={14} className={scanning ? 'spin' : ''}/>{scanning ? 'Scanning…' : 'Scan local builds'}</button>}>
         {installed.length > 0 ? <div className="runtime-build-list">{installed.map(runtime => buildRow(runtime, currentPath, 'Use', onSelect, setError))}</div>
           : <StatusNote tone={scanning ? 'pending' : 'info'}>{scanning ? 'Checking local runtime locations…' : 'No builds found. Download one below or enter a custom path.'}</StatusNote>}
         {scan?.warnings.map(warning => <StatusNote tone="warn" key={warning}>{warning}</StatusNote>)}
@@ -108,11 +111,11 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
       <SettingSection title="Custom path">{children}</SettingSection>
       <SettingSection title="Download a build" description="The newest nightly for a backend, plus the latest stable release as a fallback." more="Downloads the newest nightly for the backend you pick, which becomes your runtime, plus the latest official stable release for the same backend as a fallback.">
         <SettingRow label="Nightly backend" description="Checking only reads release details from GitHub." wide
-          control={<div className="file-input-row"><Select label="Nightly runtime backend" value={backend} disabled={!!pending || downloading} onChange={value => { setBackend(value); setPlan(null); }} options={(scan?.backends ?? ['cpu']).map(backend => ({ value: backend, label: backendNames[backend] ?? backend }))}/><button className="secondary" disabled={!desktop || !scan || !!pending || downloading} onClick={() => void checkReleases()}><RefreshCw size={14} className={pending === 'releases' ? 'spin' : ''}/>{pending === 'releases' ? 'Checking GitHub…' : 'Check official releases'}</button></div>}/>
-        {plan && <div className="runtime-download-plan">{[['Nightly (default)', plan.nightly], ['Official stable (fallback)', plan.fallback]].map(([label, value]) => { const build = value as Build; return <div className="runtime-plan-build" key={String(label)}><strong>{String(label)} <span className="pill">{build.release} / {build.tag} / {backendNames[build.backend]}</span></strong>{build.assets.map(asset => <div className="runtime-asset" key={asset.name}><code>{asset.name}</code><span>{size(asset.size)}</span></div>)}</div>; })}<div className="runtime-download-confirm"><span className="hint">{size(plan.total_bytes)} in total. Checked against SHA-256 and extracted locally.</span><button className="primary compact" disabled={!!pending || downloading} onClick={() => void download()}><ArrowDownToLine size={14}/>Download nightly + fallback</button></div></div>}
-        {cpuProgress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the CPU runtime download below has finished.</StatusNote>}
+          control={<div className="file-input-row"><Select label="Nightly runtime backend" value={backend} disabled={downloading} busy={!!pending} onChange={value => { setBackend(value); setPlan(null); }} options={(scan?.backends ?? ['cpu']).map(backend => ({ value: backend, label: backendNames[backend] ?? backend }))}/><button className="secondary" {...busyButton(!!pending, !desktop || !scan || downloading, pending === 'releases')} onClick={() => void checkReleases()}><RefreshCw size={14} className={visiblePending === 'releases' ? 'spin' : ''}/>{visiblePending === 'releases' ? 'Checking GitHub…' : 'Check official releases'}</button></div>}/>
+        <Reveal open={plan}>{plan && <div className="runtime-download-plan">{[['Nightly (default)', plan.nightly], ['Official stable (fallback)', plan.fallback]].map(([label, value]) => { const build = value as Build; return <div className="runtime-plan-build" key={String(label)}><strong>{String(label)} <span className="pill">{build.release} / {build.tag} / {backendNames[build.backend]}</span></strong>{build.assets.map(asset => <div className="runtime-asset" key={asset.name}><code>{asset.name}</code><span>{size(asset.size)}</span></div>)}</div>; })}<div className="runtime-download-confirm"><span className="hint">{size(plan.total_bytes)} in total. Checked against SHA-256 and extracted locally.</span><button className="primary compact" {...busyButton(!!pending, downloading, pending === 'download')} onClick={() => void download()}><ArrowDownToLine size={14}/>Download nightly + fallback</button></div></div>}</Reveal>
+        <Reveal open={cpuProgress?.active}>{cpuProgress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the CPU runtime download below has finished.</StatusNote>}</Reveal>
         <InstallStatus progress={progress} label="Runtime download progress"/>
-        {message && <div className="notice error" role="alert"><span>{message}</span><button aria-label="Dismiss runtime error" onClick={() => { setError(null); setDismissedError(progress?.error ?? null); }}><X size={16}/></button></div>}
+        <Reveal open={message}>{message && <div className="notice error" role="alert"><span>{message}</span><button aria-label="Dismiss runtime error" onClick={() => { setError(null); setDismissedError(progress?.error ?? null); }}><X size={16}/></button></div>}</Reveal>
       </SettingSection>
     </div>
   </section>
@@ -129,10 +132,10 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
       <SettingSection title="Custom path">{cpuChildren}</SettingSection>
       <SettingSection title="Download a build" description="The newest nightly CPU build, plus the latest stable one as a fallback." more="Downloads the newest nightly CPU build plus the latest official stable CPU build as a fallback, from the same official releases and with the same checks as above. Choose Use for CPU on the build you want, then save settings.">
         <SettingRow label="Official CPU build" description="Checked against SHA-256 and extracted locally." wide
-          control={<button className="primary" disabled={!desktop || !!pending || downloading} onClick={() => void downloadCpu()}><ArrowDownToLine size={14}/>{pending === 'cpu-download' ? 'Starting…' : 'Download the official CPU build'}</button>}/>
-        {progress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the download above has finished.</StatusNote>}
+          control={<button className="primary" {...busyButton(!!pending, !desktop || downloading, pending === 'cpu-download')} onClick={() => void downloadCpu()}><ArrowDownToLine size={14}/>{visiblePending === 'cpu-download' ? 'Starting…' : 'Download the official CPU build'}</button>}/>
+        <Reveal open={progress?.active}>{progress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the download above has finished.</StatusNote>}</Reveal>
         <InstallStatus progress={cpuProgress} label="CPU runtime download progress"/>
-        {cpuMessage && <div className="notice error" role="alert"><span>{cpuMessage}</span><button aria-label="Dismiss CPU runtime error" onClick={() => { setCpuError(null); setDismissedCpuError(cpuProgress?.error ?? null); }}><X size={16}/></button></div>}
+        <Reveal open={cpuMessage}>{cpuMessage && <div className="notice error" role="alert"><span>{cpuMessage}</span><button aria-label="Dismiss CPU runtime error" onClick={() => { setCpuError(null); setDismissedCpuError(cpuProgress?.error ?? null); }}><X size={16}/></button></div>}</Reveal>
       </SettingSection>
     </div>
   </section></>;
@@ -146,6 +149,6 @@ function Current({ kicker, name, path, copyLabel, onCopyError, description, more
       <div className="model-identity"><small>{kicker}</small><span className="identity-line"><strong title={path || undefined}>{name}</strong></span>{path && <span className="identity-line"><code title={path}>{path}</code><CopyButton value={path} label={copyLabel} size={12} onError={onCopyError}/></span>}</div>
     </div>
     <Help text={description} more={more} topic={kicker}/>
-    {status}
+    <Reveal open={status}>{status}</Reveal>
   </div>;
 }

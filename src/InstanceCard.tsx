@@ -1,3 +1,5 @@
+import { Reveal } from './Reveal';
+import { busyButton } from './busy-button';
 import React, { useEffect, useState } from 'react';
 import { CheckIcon as Check } from '@phosphor-icons/react/dist/icons/Check';
 import { PlayIcon as Play } from '@phosphor-icons/react/dist/icons/Play';
@@ -56,7 +58,7 @@ function SuffixEditor({ instance, disabled, onSave, onError }: { instance: CardI
     <span className="instance-names-label">Instance suffix</span>
     <input aria-label={`Suffix for instance ${instance.slot} of ${instance.name}`} placeholder={instance.default_suffix} maxLength={64} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)}/>
     <button className="secondary compact" disabled={disabled || !changed}><Check size={13}/>Save suffix</button>
-    {instance.suffix !== instance.default_suffix && <button type="button" className="ghost" disabled={disabled} title={`Go back to ${instance.default_suffix}`} onClick={() => void save(instance.default_suffix)}><RotateCcw size={13}/>Use {instance.default_suffix}</button>}
+    <Reveal open={instance.suffix !== instance.default_suffix} className="inline-reveal">{instance.suffix !== instance.default_suffix && <button type="button" className="ghost" disabled={disabled} title={`Go back to ${instance.default_suffix}`} onClick={() => void save(instance.default_suffix)}><RotateCcw size={13}/>Use {instance.default_suffix}</button>}</Reveal>
     <small>Added to each of this file's names and aliases. Kept only until this instance is ejected; loading it again starts at {instance.default_suffix}.</small>
   </form>;
 }
@@ -83,7 +85,7 @@ function InstanceAliasEditor({ instance, disabled, onSave, onError }: { instance
   </div>;
 }
 
-export function InstanceCard({ instance, account, runtime, aliases, routes, displayName, stale, canReload, starting, ejecting, reloadDisabled, namesDisabled, keepContext, onEject, onReload, onSaveAliases, onSaveSuffix, onSaveInstanceAliases, onKeepContext, onClearContext, onError }: {
+export function InstanceCard({ instance, account, runtime, aliases, routes, displayName, stale, canReload, starting, busy, ejecting, reloadDisabled, namesDisabled, keepContext, onEject, onReload, onSaveAliases, onSaveSuffix, onSaveInstanceAliases, onKeepContext, onClearContext, onError }: {
   instance: CardInstance; account: string | null; runtime: string; aliases: string[]; routes: Route[];
   // The instance's first API identifier, such as qwen-i-2.
   displayName: string;
@@ -92,7 +94,7 @@ export function InstanceCard({ instance, account, runtime, aliases, routes, disp
   // The switch as shown: the snapshot's value, or the one just chosen while it saves.
   keepContext: boolean; onKeepContext: (on: boolean) => void; onClearContext: () => void;
   // The load panel's settings differ from this instance's (same file selected there).
-  stale: boolean; canReload: boolean; starting: boolean; ejecting: boolean; reloadDisabled: boolean; namesDisabled: boolean;
+  stale: boolean; canReload: boolean; starting: boolean; busy: boolean; ejecting: boolean; reloadDisabled: boolean; namesDisabled: boolean;
   onEject: () => void; onReload: () => void;
   onSaveAliases: (path: string, aliases: string[]) => Promise<void>; onError: (message: string) => void;
 }) {
@@ -114,11 +116,11 @@ export function InstanceCard({ instance, account, runtime, aliases, routes, disp
         <small>{instance.ready ? instance.device : 'Loading…'} · Instance {instance.slot}</small>
       </span>
       <span className={`chip ${instance.ready ? 'success' : ''}`}><span className={`status-dot ${instance.ready ? 'green' : 'amber'}`}/>{instance.ready ? 'Ready' : verifyingText(instance.verifying) ?? 'Loading'}</span>
-      {canReload && <button className="secondary compact" disabled={reloadDisabled} title="Eject this model and load it again with the load panel's settings" onClick={onReload}>{starting ? <RefreshCw className="spin" size={13}/> : <Play size={13}/>}{starting ? 'Starting…' : 'Reload'}</button>}
-      <button className="secondary compact" disabled={ejecting} title={instance.ready ? `Unload ${displayName}; other loaded models keep running` : undefined} onClick={onEject}>{instance.ready ? <><Unplug size={13}/>Eject</> : <><Square size={13}/>Cancel loading</>}</button>
+      <Reveal open={canReload} className="inline-reveal">{canReload && <button className="secondary compact" {...busyButton(busy, reloadDisabled, starting)} title="Eject this model and load it again with the load panel's settings" onClick={onReload}>{starting ? <RefreshCw className="spin" size={13}/> : <Play size={13}/>}{starting ? 'Starting…' : 'Reload'}</button>}</Reveal>
+      <button className="secondary compact" {...busyButton(ejecting)} title={instance.ready ? `Unload ${displayName}; other loaded models keep running` : undefined} onClick={onEject}>{instance.ready ? <><Unplug size={13}/>Eject</> : <><Square size={13}/>Cancel loading</>}</button>
     </div>
     <dl className="instance-settings">{settings.map(([label, value, title]) => <div key={label}><dt>{label}</dt><dd title={title}>{value}</dd></div>)}</dl>
-    {stale && <p className="instance-stale">The load panel's settings differ from the ones this model was loaded with. They apply only after a reload.</p>}
+    <Reveal open={stale}>{stale && <p className="instance-stale">The load panel's settings differ from the ones this model was loaded with. They apply only after a reload.</p>}</Reveal>
     <div className="instance-names"><span className="instance-names-label">API names</span>
       <ModelAliases path={instance.path} instance={instance.id} aliases={aliases} routes={routes} disabled={namesDisabled} onSave={onSaveAliases} onError={onError}/>
     </div>

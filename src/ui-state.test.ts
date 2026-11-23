@@ -1,7 +1,8 @@
+import { retainSnapshotSections, shouldScanModels } from './refresh-state.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { sanitizeTabOrder, moveTab, apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, ALL_GPUS, CHOOSE_GPUS, chosenGpus, deviceChoice, ratioError, splitLabel, toggleGpu, enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
+import { libraryUsesWindow, sanitizeTabOrder, moveTab, apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, ALL_GPUS, CHOOSE_GPUS, chosenGpus, deviceChoice, ratioError, splitLabel, toggleGpu, enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
 
 const file = '/models/acme/qwen.gguf';
 const first = { id: 'a1', slot: 1, path: file };
@@ -291,4 +292,44 @@ test('moving a tab inserts it at the destination without mutating the original o
   assert.equal(moveTab(order, 0, -1), order);
   assert.equal(moveTab(order, 3, 4), order);
   assert.equal(moveTab(order, 1, 1), order);
+});
+
+test('local scans follow Models visibility, newly completed downloads, and folder changes', () => {
+  const other = { models: false, folder: '/models', finished: [] };
+  const models = { ...other, models: true };
+  const finished = { ...other, finished: ['/models/new.gguf'] };
+  assert.equal(shouldScanModels(null, other), false);
+  assert.equal(shouldScanModels(other, models), true);
+  assert.equal(shouldScanModels(models, models), false);
+  assert.equal(shouldScanModels(models, other), false);
+  assert.equal(shouldScanModels(other, finished), true);
+  assert.equal(shouldScanModels(finished, other), false);
+  assert.equal(shouldScanModels(other, { ...other, folder: '/other' }), true);
+});
+
+test('the Library mounts the full list below 60 models', () => {
+  assert.equal(libraryUsesWindow(0), false);
+  assert.equal(libraryUsesWindow(59), false);
+  assert.equal(libraryUsesWindow(60), true);
+  assert.equal(libraryUsesWindow(300), true);
+});
+
+test('a changed snapshot retains equal sections and delivers status, context and download updates', () => {
+  const initial = {
+    logs: ['first'], library: { entries: [{ status: { missing: false } }] },
+    instances: [{ context: { entries: 0 } }], downloads: [{ active: true }],
+  };
+  const update = retainSnapshotSections(initial, { ...structuredClone(initial), logs: ['second'] });
+  assert.equal(update.library, initial.library);
+  assert.equal(update.instances, initial.instances);
+  assert.equal(update.downloads, initial.downloads);
+  assert.deepEqual(update.logs, ['second']);
+  const changed = structuredClone(update);
+  changed.library.entries[0].status.missing = true;
+  changed.instances[0].context.entries++;
+  changed.downloads[0].active = false;
+  const next = retainSnapshotSections(update, changed);
+  assert.equal(next.library.entries[0].status.missing, true);
+  assert.equal(next.instances[0].context.entries, 1);
+  assert.equal(next.downloads[0].active, false);
 });

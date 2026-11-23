@@ -1,3 +1,4 @@
+import { Reveal } from './Reveal';
 import React, { useState } from 'react';
 import { PlusIcon as Plus } from '@phosphor-icons/react/dist/icons/Plus';
 import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
@@ -70,14 +71,14 @@ export function ModelRouting({ loadedCount, anyReady, whenBusy, waitMs, routes, 
         <div className="model-name-list"><Name value={ANY_AVAILABLE} note="Any model" onError={onError}/></div>
         <small>Sends the request to whichever ready instance, of any model, is not running a request; the one idle longest goes first. When every instance is busy it {whenBusy === 'wait' ? `waits up to ${waitText(waitMs)} for the first to finish` : 'gets 503'} (When every instance is busy, in Settings). Each instance keeps its own Keep context history.</small>
       </div>
-      {unloaded.length > 0 && <div className="route-group">
+      <Reveal open={unloaded.length > 0}>{unloaded.length > 0 && <div className="route-group">
         <div className="route-model"><span className="status-dot"/><strong>Not loaded</strong><small>These names answer 503 until their model is loaded</small></div>
         <div className="model-name-list">{unloaded.map(route => <Name key={`${route.path}:${route.name}`} value={route.name} note={route.kind === 'name' ? 'Name' : `Alias of ${unloaded.find(r => r.path === route.path && r.kind === 'name')?.name ?? stemOf(route.path)}`} disabled={disabled} onRemove={route.kind === 'alias' ? () => void onSave(route.path, aliasesFor(route.path).filter(other => other !== route.name)).catch(e => onError(errorText(e))) : undefined} onError={onError}/>)}</div>
-      </div>}
-      {withoutFirst.length > 0 && <div className="route-group">
+      </div>}</Reveal>
+      <Reveal open={withoutFirst.length > 0}>{withoutFirst.length > 0 && <div className="route-group">
         <div className="route-model"><span className="status-dot amber"/><strong>Instance 1 not loaded</strong><small>These plain names answer 503 while other instances of their file are loaded. Fall through to another instance in Settings sends them to the lowest-numbered one.</small></div>
         <div className="model-name-list">{withoutFirst.map(route => <Name key={`${route.path}:${route.name}`} value={route.name} note={route.kind === 'name' ? 'Name' : 'Alias'} onError={onError}/>)}</div>
-      </div>}
+      </div>}</Reveal>
       <small>"model" is required and case-sensitive: send a name exactly as shown. A request without one gets 400; an unknown name gets 404. Names and aliases live in models.yml (Library); each belongs to one model file. A second instance of a file answers to the same names with its suffix, such as -i-2. /v1/models lists the names that reach a ready model; responses echo the name you sent.</small>
     </div>
   </section>;

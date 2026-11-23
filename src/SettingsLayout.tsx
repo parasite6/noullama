@@ -1,3 +1,4 @@
+import { Reveal } from './Reveal';
 import React, { useId, useState } from 'react';
 import { WarningCircleIcon as CircleAlert } from '@phosphor-icons/react/dist/icons/WarningCircle';
 import { CheckCircleIcon as CircleCheck } from '@phosphor-icons/react/dist/icons/CheckCircle';
@@ -24,13 +25,13 @@ export function StatusNote({ tone, children }: { tone: Tone; children: React.Rea
 
 // One short line of description, with the rest of the explanation behind a
 // button that shows it inline (keyboard reachable, not a hover tooltip).
-export function Help({ text, more, topic }: { text?: React.ReactNode; more?: React.ReactNode; topic: string }) {
+export function Help({ text, more, topic, descriptionKey }: { descriptionKey?: string; text?: React.ReactNode; more?: React.ReactNode; topic: string }) {
   const [open, setOpen] = useState(false);
   const id = useId();
   if (!text && !more) return null;
   return <div className="setting-help">
-    <p className="setting-description">{text}{more && <button type="button" className="icon-button small more-button" aria-expanded={open} aria-controls={id} aria-label={`${open ? 'Hide' : 'Show'} more about ${topic}`} title={open ? 'Show less' : 'Show more'} onClick={() => setOpen(!open)}><CircleHelp size={14}/></button>}</p>
-    {more && <p className="setting-more" id={id} hidden={!open}>{more}</p>}
+    <Reveal open swapKey={descriptionKey}><p className="setting-description">{text}{more && <button type="button" className="icon-button small more-button" aria-expanded={open} aria-controls={id} aria-label={`${open ? 'Hide' : 'Show'} more about ${topic}`} title={open ? 'Show less' : 'Show more'} onClick={() => setOpen(!open)}><CircleHelp size={14}/></button>}</p></Reveal>
+    {more && <Reveal id={id} open={open}><p className="setting-more">{more}</p></Reveal>}
   </div>;
 }
 
@@ -48,15 +49,15 @@ export function SettingSection({ title, description, more, aside, children, clas
 // `control` goes in the control column; `wide` gives it more room (Device).
 // `children` span the full row under the label (paths, file pickers).
 // `htmlFor` makes the label a <label> for a text input in the row.
-export function SettingRow({ label, htmlFor, description, more, status, control, wide, children, className }: { label: React.ReactNode; htmlFor?: string; description?: React.ReactNode; more?: React.ReactNode; status?: React.ReactNode; control?: React.ReactNode; wide?: boolean; children?: React.ReactNode; className?: string }) {
+export function SettingRow({ label, htmlFor, description, descriptionKey, more, status, statusKey, control, wide, children, className }: { label: React.ReactNode; htmlFor?: string; description?: React.ReactNode; more?: React.ReactNode; descriptionKey?: string; status?: React.ReactNode; statusKey?: string; control?: React.ReactNode; wide?: boolean; children?: React.ReactNode; className?: string }) {
   const topic = typeof label === 'string' ? label : 'this setting';
   return <div className={`setting-row ${wide ? 'wide' : ''} ${control ? '' : 'no-control'} ${className ?? ''}`}>
     <div className="setting-text">
       {htmlFor ? <label className="setting-label" htmlFor={htmlFor}>{label}</label> : <span className="setting-label">{label}</span>}
-      <Help text={description} more={more} topic={topic}/>
+      <Help text={description} descriptionKey={descriptionKey} more={more} topic={topic}/>
     </div>
     {control && <div className="setting-control">{control}</div>}
-    {children && <div className="setting-full">{children}</div>}
-    {status && <div className="setting-status">{status}</div>}
+    <Reveal className="setting-full" open={children}>{children && <div className="setting-fields">{children}</div>}</Reveal>
+    <Reveal open={status} swapKey={statusKey}>{status && <div className="setting-status">{status}</div>}</Reveal>
   </div>;
 }
