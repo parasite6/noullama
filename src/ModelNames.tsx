@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { Plus, X } from 'lucide-react';
+import { PlusIcon as Plus } from '@phosphor-icons/react/dist/icons/Plus';
+import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
 import { CopyButton } from './CopyButton';
 import { waitText } from './ui-state';
 

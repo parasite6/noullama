@@ -1,5 +1,6 @@
 import React, { useRef } from 'react';
-import { ImagePlus, X } from 'lucide-react';
+import { ImageSquareIcon as ImagePlus } from '@phosphor-icons/react/dist/icons/ImageSquare';
+import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
 
 export type Attachment = { name: string; url: string; bytes: number };
 
@@ -50,7 +51,7 @@ export function ImageAttachments({ images, onFiles, onRemove, disabled }: { imag
   return <div className="image-strip">
     {images.map((image, index) => <figure className="image-thumb" key={`${image.name}-${index}`} title={image.name}>
       <img src={image.url} alt={image.name}/>
-      <button type="button" className="image-remove" aria-label={`Remove ${image.name}`} onClick={() => onRemove(index)}><X size={12}/></button>
+      <button type="button" className="icon-button small image-remove" aria-label={`Remove ${image.name}`} onClick={() => onRemove(index)}><X size={12}/></button>
     </figure>)}
     <button type="button" className="image-add" disabled={disabled} onClick={() => input.current?.click()}><ImagePlus size={18}/><span>{images.length ? 'Add more' : 'Add images'}</span></button>
     {!images.length && <small>Or drop or paste images here. They are sent with the state.</small>}

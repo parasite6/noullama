@@ -1,6 +1,8 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Check, KeyRound, Trash2 } from 'lucide-react';
+import { CheckIcon as Check } from '@phosphor-icons/react/dist/icons/Check';
+import { KeyIcon as KeyRound } from '@phosphor-icons/react/dist/icons/Key';
+import { TrashIcon as Trash2 } from '@phosphor-icons/react/dist/icons/Trash';
 import { CopyButton } from './CopyButton';
 import type { LibraryEntry } from './Library';
 import { Select } from './Select';
@@ -145,7 +147,7 @@ export function ApiKeys({ active, desktop, required, models, onToggle, onCopyErr
             </div> : <StatusNote tone="info">Add a model to Library first.</StatusNote>}
             {groups.length > 0 && models.every(model => model.aliases.length === 0) && <div className="api-key-library">
               <StatusNote tone="info">Aliases come from Library. These models have none yet.</StatusNote>
-              <button type="button" className="text-button" onClick={onOpenLibrary}>Open Library</button>
+              <button type="button" className="ghost" onClick={onOpenLibrary}>Open Library</button>
             </div>}
           </SettingRow>}
           <SettingRow label=""

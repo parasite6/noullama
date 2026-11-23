@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Trash2 } from 'lucide-react';
+import { TrashIcon as Trash2 } from '@phosphor-icons/react/dist/icons/Trash';
 
 // Asks before deleting a saved custom preset. Cancel has focus, and Escape or a
 // click on the backdrop cancels.

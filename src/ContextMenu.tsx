@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { RotateCcw, ClipboardPaste, Copy, Scissors, TextSelect } from 'lucide-react';
+import { ArrowCounterClockwiseIcon as RotateCcw } from '@phosphor-icons/react/dist/icons/ArrowCounterClockwise';
+import { ClipboardIcon as ClipboardPaste } from '@phosphor-icons/react/dist/icons/Clipboard';
+import { CopyIcon as Copy } from '@phosphor-icons/react/dist/icons/Copy';
+import { ScissorsIcon as Scissors } from '@phosphor-icons/react/dist/icons/Scissors';
+import { SelectionAllIcon as TextSelect } from '@phosphor-icons/react/dist/icons/SelectionAll';
 
 type Target = { element: HTMLElement | null; editable: boolean; tabOrder?: boolean; text: string; x: number; y: number };
 type Item = { label: string; icon: typeof Copy; shortcut: string; disabled: boolean; run: () => Promise<void> | void };

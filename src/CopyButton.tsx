@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { CheckIcon as Check } from '@phosphor-icons/react/dist/icons/Check';
+import { CopyIcon as Copy } from '@phosphor-icons/react/dist/icons/Copy';
 
 // Most text in the app is not selectable, so identifiers worth reusing (model
 // names, paths, repository ids, URLs) get one of these instead.
@@ -14,7 +15,7 @@ export function CopyButton({ value, label, size = 14, className = '', onError }:
       setCopied(true); clearTimeout(timer.current); timer.current = setTimeout(() => setCopied(false), 1800);
     } catch (e) { onError?.(`Could not copy: ${e instanceof Error ? e.message : String(e)}`); }
   }
-  return <button type="button" className={`icon-button copy-button ${copied ? 'copied' : ''} ${className}`} aria-label={copied ? 'Copied' : label} title={copied ? 'Copied' : label} onClick={copy}>
+  return <button type="button" className={`icon-button small copy-button ${copied ? 'copied' : ''} ${className}`} aria-label={copied ? 'Copied' : label} title={copied ? 'Copied' : label} onClick={copy}>
     {copied ? <Check size={size}/> : <Copy size={size}/>}
   </button>;
 }

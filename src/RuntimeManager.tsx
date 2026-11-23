@@ -2,7 +2,11 @@ import React, { useEffect, useRef, useState } from 'react';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { Select } from './Select';
 import { CopyButton } from './CopyButton';
-import { ArrowDownToLine, Check, Cpu, RefreshCw, X } from 'lucide-react';
+import { DownloadSimpleIcon as ArrowDownToLine } from '@phosphor-icons/react/dist/icons/DownloadSimple';
+import { CheckIcon as Check } from '@phosphor-icons/react/dist/icons/Check';
+import { CpuIcon as Cpu } from '@phosphor-icons/react/dist/icons/Cpu';
+import { ArrowsClockwiseIcon as RefreshCw } from '@phosphor-icons/react/dist/icons/ArrowsClockwise';
+import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
 import { Help, SettingRow, SettingSection, StatusNote } from './SettingsLayout';
 
 export type LocalRuntime = { path: string; label: string; backend: string | null; source: string };

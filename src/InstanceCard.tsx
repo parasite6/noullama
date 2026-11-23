@@ -1,5 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Play, Plus, RefreshCw, RotateCcw, Square, Unplug } from 'lucide-react';
+import { CheckIcon as Check } from '@phosphor-icons/react/dist/icons/Check';
+import { PlayIcon as Play } from '@phosphor-icons/react/dist/icons/Play';
+import { PlusIcon as Plus } from '@phosphor-icons/react/dist/icons/Plus';
+import { ArrowsClockwiseIcon as RefreshCw } from '@phosphor-icons/react/dist/icons/ArrowsClockwise';
+import { ArrowCounterClockwiseIcon as RotateCcw } from '@phosphor-icons/react/dist/icons/ArrowCounterClockwise';
+import { SquareIcon as Square } from '@phosphor-icons/react/dist/icons/Square';
+import { PlugsIcon as Unplug } from '@phosphor-icons/react/dist/icons/Plugs';
 import { AuthorLogo } from './AuthorLogo';
 import { CopyButton } from './CopyButton';
 import { ModelAliases, Name, type Route } from './ModelNames';
@@ -50,7 +56,7 @@ function SuffixEditor({ instance, disabled, onSave, onError }: { instance: CardI
     <span className="instance-names-label">Instance suffix</span>
     <input aria-label={`Suffix for instance ${instance.slot} of ${instance.name}`} placeholder={instance.default_suffix} maxLength={64} value={draft} disabled={disabled} onChange={event => setDraft(event.target.value)}/>
     <button className="secondary compact" disabled={disabled || !changed}><Check size={13}/>Save suffix</button>
-    {instance.suffix !== instance.default_suffix && <button type="button" className="text-button" disabled={disabled} title={`Go back to ${instance.default_suffix}`} onClick={() => void save(instance.default_suffix)}><RotateCcw size={13}/>Use {instance.default_suffix}</button>}
+    {instance.suffix !== instance.default_suffix && <button type="button" className="ghost" disabled={disabled} title={`Go back to ${instance.default_suffix}`} onClick={() => void save(instance.default_suffix)}><RotateCcw size={13}/>Use {instance.default_suffix}</button>}
     <small>Added to each of this file's names and aliases. Kept only until this instance is ejected; loading it again starts at {instance.default_suffix}.</small>
   </form>;
 }

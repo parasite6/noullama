@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Power } from 'lucide-react';
+import { PowerIcon as Power } from '@phosphor-icons/react/dist/icons/Power';
 import { quitText } from './ui-state';
 
 // `loaded` is the number of loaded instances, or null before the first snapshot.

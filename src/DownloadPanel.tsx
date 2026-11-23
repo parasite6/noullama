@@ -1,4 +1,7 @@
-import { Download, FolderOpen, ArrowRight, X } from 'lucide-react';
+import { DownloadIcon as Download } from '@phosphor-icons/react/dist/icons/Download';
+import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/icons/FolderOpen';
+import { ArrowRightIcon as ArrowRight } from '@phosphor-icons/react/dist/icons/ArrowRight';
+import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
 import { CopyButton } from './CopyButton';
 
 export type DownloadState = { id: string; active: boolean; cancelled: boolean; repo: string; file: string; message: string; path: string | null; error: string | null; progress: number | null; downloaded_bytes: number; transferred_bytes: number; total_bytes: number | null };

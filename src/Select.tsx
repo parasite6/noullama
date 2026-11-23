@@ -1,5 +1,6 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
-import { Check, ChevronDown } from 'lucide-react';
+import { CheckIcon as Check } from '@phosphor-icons/react/dist/icons/Check';
+import { CaretDownIcon as ChevronDown } from '@phosphor-icons/react/dist/icons/CaretDown';
 
 // The native <select> popup is drawn by GTK in the desktop build and ignores
 // the app's styles, so this draws its own listbox.

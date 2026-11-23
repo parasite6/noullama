@@ -16,26 +16,26 @@ const colors = HighlightStyle.define([
   { tag: tags.invalid, color: '#ff5f5f', textDecoration: 'underline wavy' },
 ]);
 const theme = EditorView.theme({
-  '&': { backgroundColor: '#19191b', color: '#c9c9cf', height: '100%', fontSize: '13px' },
-  '.cm-scroller': { fontFamily: '"Geist Mono Variable", "SFMono-Regular", Consolas, monospace', lineHeight: '1.7', overflow: 'auto', overscrollBehavior: 'contain' },
-  '.cm-content': { padding: '12px 0', caretColor: '#ececee' },
+  '&': { backgroundColor: 'var(--well)', color: 'var(--text-secondary)', height: '100%', fontSize: '13px' },
+  '.cm-scroller': { fontFamily: 'var(--mono)', lineHeight: '1.7', overflow: 'auto', overscrollBehavior: 'contain' },
+  '.cm-content': { padding: '12px 0', caretColor: 'var(--text)' },
   '.cm-line': { padding: '0 12px' },
-  '.cm-gutters': { backgroundColor: '#19191b', color: '#5a5a61', borderRight: '0' },
-  '.cm-activeLineGutter': { backgroundColor: '#232325', color: '#b6b6bd' },
-  '.cm-cursor': { borderLeftColor: '#ececee' },
+  '.cm-gutters': { backgroundColor: 'var(--well)', color: 'var(--faint)', borderRight: '0' },
+  '.cm-activeLineGutter': { backgroundColor: 'var(--card)', color: 'var(--text-secondary)' },
+  '.cm-cursor': { borderLeftColor: 'var(--text)' },
   '&.cm-focused': { outline: 'none' },
   // Drawn by drawSelection(), so it shows in WebKitGTK where the native selection does not.
   '.cm-selectionBackground': { backgroundColor: '#2a3a55' },
   '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': { backgroundColor: '#33507d' },
   '.cm-selectionMatch': { backgroundColor: '#24324a' },
   '.cm-matchingBracket, &.cm-focused .cm-matchingBracket': { backgroundColor: '#2d3b2a', color: '#e0e6e3' },
-  '.cm-tooltip': { backgroundColor: '#2b2b2e', color: '#ececee', border: '1px solid #46464c', borderRadius: '8px' },
+  '.cm-tooltip': { backgroundColor: 'var(--floating)', color: 'var(--text)', border: '1px solid var(--edge-floating)', borderRadius: 'var(--r-small)', boxShadow: 'var(--elevation-menu)' },
   '.cm-diagnostic': { fontSize: '11px' },
   '.cm-foldGutter .cm-gutterElement': { padding: '0 4px 0 2px', cursor: 'pointer' },
-  '.cm-fold-marker': { display: 'inline-flex', verticalAlign: 'middle', color: '#6a6a72', transition: 'transform .15s' },
-  '.cm-fold-marker:hover': { color: '#ececee' },
+  '.cm-fold-marker': { display: 'inline-flex', verticalAlign: 'middle', color: 'var(--muted)', transition: 'transform var(--motion-fast) var(--ease-out)' },
+  '.cm-fold-marker:hover': { color: 'var(--text)' },
   '.cm-fold-marker.open': { transform: 'rotate(90deg)' },
-  '.cm-foldPlaceholder': { backgroundColor: '#2b2b2e', border: '0', borderRadius: '6px', color: '#b6b6bd', padding: '0 6px' },
+  '.cm-foldPlaceholder': { backgroundColor: 'var(--raised)', border: '0', borderRadius: '6px', color: 'var(--text-secondary)', padding: '0 6px' },
 }, { dark: true });
 
 // The default fold markers are tiny text glyphs; draw the app's chevron instead.

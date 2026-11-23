@@ -1,5 +1,8 @@
 import React, { useEffect, useRef } from 'react';
-import { AlertCircle, CircleCheck, ExternalLink, RefreshCw } from 'lucide-react';
+import { WarningCircleIcon as AlertCircle } from '@phosphor-icons/react/dist/icons/WarningCircle';
+import { CheckCircleIcon as CircleCheck } from '@phosphor-icons/react/dist/icons/CheckCircle';
+import { ArrowSquareOutIcon as ExternalLink } from '@phosphor-icons/react/dist/icons/ArrowSquareOut';
+import { ArrowsClockwiseIcon as RefreshCw } from '@phosphor-icons/react/dist/icons/ArrowsClockwise';
 import { Toggle } from './Toggle';
 
 export type UpdateStatus =

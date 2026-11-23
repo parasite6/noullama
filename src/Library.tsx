@@ -1,5 +1,13 @@
 import React, { useEffect, useState } from 'react';
-import { AlertCircle, ArchiveRestore, FileCog, FolderOpen, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { WarningCircleIcon as AlertCircle } from '@phosphor-icons/react/dist/icons/WarningCircle';
+import { ArchiveIcon as ArchiveRestore } from '@phosphor-icons/react/dist/icons/Archive';
+import { FileCodeIcon as FileCog } from '@phosphor-icons/react/dist/icons/FileCode';
+import { FolderOpenIcon as FolderOpen } from '@phosphor-icons/react/dist/icons/FolderOpen';
+import { PlusIcon as Plus } from '@phosphor-icons/react/dist/icons/Plus';
+import { ArrowsClockwiseIcon as RefreshCw } from '@phosphor-icons/react/dist/icons/ArrowsClockwise';
+import { FloppyDiskIcon as Save } from '@phosphor-icons/react/dist/icons/FloppyDisk';
+import { TrashIcon as Trash2 } from '@phosphor-icons/react/dist/icons/Trash';
+import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { CopyButton } from './CopyButton';
 import { ComboInput } from './Select';
@@ -41,8 +49,8 @@ function ShaRow({ label, sum, status, canRecord, blocked, pending, onRecord, onC
   return <div className="sha-row">{sum ? <><code title={sum}>{sum.slice(0, 16)}…{sum.slice(-8)}</code><CopyButton value={sum} label={`Copy sha256 of ${label}`} size={12} onError={onError}/></> : <span className="muted">{status?.hashing ? 'Reading the file…' : 'Not recorded yet'}</span>}
     {status?.mismatch
       ? <button type="button" className="secondary compact" disabled={!!blocked || pending} title={blocked ?? `Record ${status.mismatch} as the expected sha256`} onClick={onRecord}>Accept new sha256</button>
-      : <button type="button" className="text-button" disabled={!!blocked || pending || !canRecord} title={blocked ?? 'Read the whole file and record its sha256'} onClick={onRecord}>{pending ? 'Reading…' : sum ? 'Recompute' : 'Record now'}</button>}
-    {sum && <button type="button" className="text-button" title="Forget the recorded sha256" onClick={onClear}>Clear</button>}
+      : <button type="button" className="ghost" disabled={!!blocked || pending || !canRecord} title={blocked ?? 'Read the whole file and record its sha256'} onClick={onRecord}>{pending ? 'Reading…' : sum ? 'Recompute' : 'Record now'}</button>}
+    {sum && <button type="button" className="ghost" title="Forget the recorded sha256" onClick={onClear}>Clear</button>}
   </div>;
 }
 
@@ -113,7 +121,7 @@ export function Library({ library, loadedPaths, companions, desktop, onSave, onR
         <button className="secondary compact" disabled={!desktop || !!pending} onClick={() => void run('add', addModel)}><Plus size={13}/>Add model</button>
         <button className="secondary compact" disabled={!desktop || !!pending} title="Open models.yml in your default editor" onClick={() => void run('open', onOpenFile)}><FolderOpen size={13}/>Edit models.yml</button>
         <button className="secondary compact" disabled={!desktop || !!pending} title="A copy is kept before every change; the newest 20 stay" onClick={() => void run('backups', onOpenBackups)}><ArchiveRestore size={13}/>Backups</button>
-        <button className="text-button" disabled={!desktop || !!pending || dirty} title={dirty ? 'Save or discard your changes first' : 'Read models.yml again'} onClick={() => void run('reload', onReload)}><RefreshCw size={13} className={pending === 'reload' ? 'spin' : ''}/>Reload</button>
+        <button className="ghost" disabled={!desktop || !!pending || dirty} title={dirty ? 'Save or discard your changes first' : 'Read models.yml again'} onClick={() => void run('reload', onReload)}><RefreshCw size={13} className={pending === 'reload' ? 'spin' : ''}/>Reload</button>
       </div>
     </section>
     {library?.error && <div className="load-error" role="alert"><AlertCircle size={18}/><div><strong>models.yml has an error</strong><pre>{library.error}</pre></div></div>}
@@ -156,7 +164,7 @@ export function Library({ library, loadedPaths, companions, desktop, onSave, onR
         </div>
       </section>;
     })}</div>
-    <div className={`save-bar ${dirty ? 'dirty' : ''}`}><span className="hint">{dirty ? 'Unsaved changes to models.yml. Saving backs up the current file first.' : 'models.yml is up to date. Edits made in a text editor appear here when saved.'}</span><span className="save-actions">{dirty && <button className="text-button" onClick={discard}>Discard</button>}<button className={dirty ? 'primary' : 'secondary'} disabled={!dirty || !desktop || !!pending} onClick={save}><Save size={14}/>Save models.yml</button></span></div>
+    <div className={`save-bar ${dirty ? 'dirty' : ''}`}><span className="hint">{dirty ? 'Unsaved changes to models.yml. Saving backs up the current file first.' : 'models.yml is up to date. Edits made in a text editor appear here when saved.'}</span><span className="save-actions">{dirty && <button className="ghost" onClick={discard}>Discard</button>}<button className={dirty ? 'primary' : 'secondary'} disabled={!dirty || !desktop || !!pending} onClick={save}><Save size={14}/>Save models.yml</button></span></div>
   </div>;
 }
 

@@ -1,5 +1,10 @@
 import React, { useId, useState } from 'react';
-import { CircleAlert, CircleCheck, CircleHelp, Info, LoaderCircle, TriangleAlert } from 'lucide-react';
+import { WarningCircleIcon as CircleAlert } from '@phosphor-icons/react/dist/icons/WarningCircle';
+import { CheckCircleIcon as CircleCheck } from '@phosphor-icons/react/dist/icons/CheckCircle';
+import { QuestionIcon as CircleHelp } from '@phosphor-icons/react/dist/icons/Question';
+import { InfoIcon as Info } from '@phosphor-icons/react/dist/icons/Info';
+import { SpinnerGapIcon as LoaderCircle } from '@phosphor-icons/react/dist/icons/SpinnerGap';
+import { WarningIcon as TriangleAlert } from '@phosphor-icons/react/dist/icons/Warning';
 
 // The shared settings layout used by the Loading tab load panel, the Runtime tab
 // and the Settings tab. A section groups rows under a title; a row has its
@@ -24,7 +29,7 @@ export function Help({ text, more, topic }: { text?: React.ReactNode; more?: Rea
   const id = useId();
   if (!text && !more) return null;
   return <div className="setting-help">
-    <p className="setting-description">{text}{more && <button type="button" className="more-button" aria-expanded={open} aria-controls={id} aria-label={`${open ? 'Hide' : 'Show'} more about ${topic}`} title={open ? 'Show less' : 'Show more'} onClick={() => setOpen(!open)}><CircleHelp size={14}/></button>}</p>
+    <p className="setting-description">{text}{more && <button type="button" className="icon-button small more-button" aria-expanded={open} aria-controls={id} aria-label={`${open ? 'Hide' : 'Show'} more about ${topic}`} title={open ? 'Show less' : 'Show more'} onClick={() => setOpen(!open)}><CircleHelp size={14}/></button>}</p>
     {more && <p className="setting-more" id={id} hidden={!open}>{more}</p>}
   </div>;
 }

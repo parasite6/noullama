@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AlertCircle, X } from 'lucide-react';
+import { WarningCircleIcon as AlertCircle } from '@phosphor-icons/react/dist/icons/WarningCircle';
+import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
 
 type Banner = { text: string; error: boolean };
 
@@ -27,7 +28,7 @@ export function Toast({ banner, onDismiss }: { banner: Banner | null; onDismiss:
   return <div className="toast-region">
     <div key={shown.text} className={`notice toast ${shown.error ? 'error' : ''} ${leaving ? 'leaving' : ''}`} role={shown.error ? 'alert' : 'status'}>
       <span className="notice-text">{shown.error && <AlertCircle size={16}/>}<span>{shown.text}</span></span>
-      <button aria-label="Dismiss notification" onClick={() => dismiss.current()}><X size={16}/></button>
+      <button className="icon-button small" aria-label="Dismiss notification" onClick={() => dismiss.current()}><X size={16}/></button>
     </div>
   </div>;
 }

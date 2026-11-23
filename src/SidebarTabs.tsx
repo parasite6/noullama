@@ -1,5 +1,13 @@
+import { SelectionIndicator } from './SelectionIndicator';
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react';
-import { Code2, Cpu, FlaskConical, Layers3, Library, Network, PlugZap, Settings2 } from 'lucide-react';
+import { CodeIcon as Code2 } from '@phosphor-icons/react/dist/icons/Code';
+import { CpuIcon as Cpu } from '@phosphor-icons/react/dist/icons/Cpu';
+import { FlaskIcon as FlaskConical } from '@phosphor-icons/react/dist/icons/Flask';
+import { StackIcon as Layers3 } from '@phosphor-icons/react/dist/icons/Stack';
+import { BooksIcon as Library } from '@phosphor-icons/react/dist/icons/Books';
+import { GraphIcon as Network } from '@phosphor-icons/react/dist/icons/Graph';
+import { PlugChargingIcon as PlugZap } from '@phosphor-icons/react/dist/icons/PlugCharging';
+import { SlidersHorizontalIcon as Settings2 } from '@phosphor-icons/react/dist/icons/SlidersHorizontal';
 import { ContextMenu } from './ContextMenu';
 import { moveTab, sanitizeTabOrder } from './ui-state';
 
@@ -136,14 +144,21 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
   }
 
   const previewOrder = preview ? moveTab(order, preview.from, preview.to) : order;
+  const activeIndex = order.findIndex(id => id === tab);
+  function offsetFor(id: Tab, index: number) {
+    if (!preview) return 0;
+    return preview.from === index ? preview.delta : preview.tops[previewOrder.indexOf(id)] - preview.tops[index];
+  }
+
   return <>
     <nav ref={nav} className={preview ? 'sidebar-tabs reordering' : 'sidebar-tabs'} aria-label="Pages">
+      <SelectionIndicator track={nav} selected='button[aria-current="page"]'
+        offsetY={activeIndex < 0 ? 0 : offsetFor(order[activeIndex], activeIndex)}
+        dragging={!!preview && preview.from === activeIndex}/>
       {order.map((id, index) => {
         const [Icon, label] = tabs[id];
         const dragging = preview?.from === index;
-        const offset = preview
-          ? dragging ? preview.delta : preview.tops[previewOrder.indexOf(id)] - preview.tops[index]
-          : 0;
+        const offset = offsetFor(id, index);
         return <button
           key={id}
           type="button"
@@ -170,7 +185,7 @@ export function SidebarTabs({ tab, onSelect }: { tab: string; onSelect: (tab: Ta
           onPointerUp={event => finishPointer(event, true)}
           onPointerCancel={event => finishPointer(event, false)}
           onLostPointerCapture={event => finishPointer(event, false)}
-        ><Icon size={18}/><span>{label}</span></button>;
+        ><span className="nav-tile"><Icon size={19} weight={tab === id ? 'fill' : 'duotone'}/></span><span>{label}</span></button>;
       })}
     </nav>
     <span className="sr-only" role="status">{announcement}</span>
