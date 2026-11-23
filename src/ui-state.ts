@@ -55,20 +55,87 @@ export function deviceLabel(device: RuntimeDevice): { label: string; detail: str
     : { label: device.name, detail: size };
 }
 
+// Saved `device` values that split a model across GPUs (devices.rs): every
+// GPU listed at load time, or a comma list such as "CUDA0,CUDA1". A chosen
+// set with fewer than 2 GPUs keeps a comma ("CUDA0,") so it stays a set.
+export const ALL_GPUS = 'gpus:all';
+// The Device select's value for a chosen set; never saved.
+export const CHOOSE_GPUS = 'gpus:choose';
+export const SPLIT_MODES = [['layer', 'Layer'], ['row', 'Row']] as const;
+export const isSplit = (device: string) => device.trim() === ALL_GPUS || device.includes(',');
+export const splitNames = (device: string) => device.split(',').map(name => name.trim()).filter(Boolean);
+
+// A chosen set as saved: the checked names in listed order.
+export function chosenGpus(names: readonly string[], devices: readonly RuntimeDevice[]): string {
+  const ordered = devices.map(d => d.name).filter(name => names.includes(name));
+  return ordered.length < 2 ? `${ordered.join(',')},` : ordered.join(',');
+}
+
+// A chosen set with `name` checked or unchecked.
+export function toggleGpu(saved: string, name: string, devices: readonly RuntimeDevice[]): string {
+  const names = splitNames(saved);
+  return chosenGpus(names.includes(name) ? names.filter(n => n !== name) : [...names, name], devices);
+}
+
+// How a split is shown, as the instance card shows it: "CUDA0 + CUDA1" or
+// "All GPUs (2)", with the GPUs' summed memory when each reports it.
+export function splitLabel(gpus: readonly string[], all: boolean, devices: readonly RuntimeDevice[]): string {
+  const label = all ? `All GPUs (${gpus.length})` : gpus.join(' + ');
+  const totals = gpus.map(name => devices.find(d => d.name === name)?.total_mib ?? null);
+  return totals.every(mib => mib !== null) && totals.length ? `${label} · ${Math.round(totals.reduce<number>((a, b) => a + (b ?? 0), 0) / 1024)} GB` : label;
+}
+
+// What is wrong with a split ratio for `count` GPUs, as the backend says it;
+// null when it is empty (shared by free memory) or valid.
+export function ratioError(text: string, count: number): string | null {
+  if (!text.trim()) return null;
+  const parts = text.split(',').map(part => part.trim());
+  const weights = parts.map(Number);
+  const maxFloat = Math.fround(3.4028234663852886e38);
+  if (!parts.every(part => /^\+?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(part))
+      || weights.some(weight => weight !== 0 && weight < 2 ** -126)
+      || weights.reduce((sum, weight) => sum + weight, 0) > maxFloat) return 'Split ratio takes numbers of 0 or more separated by commas, such as 3,1.';
+  if (parts.length !== count) return `Split ratio needs one number per GPU: ${count} GPUs are in use, but it has ${parts.length}.`;
+  if (weights.every(weight => weight === 0)) return 'Split ratio needs at least one number above 0.';
+  return null;
+}
+
 // The load panel's "Device" select for the saved `device` value. `devices`
 // is the GPU runtime's list, or null until it has been read. `effective` is
 // the device a load would use (an empty value means the first GPU, else the
-// CPU), or null while the list is unknown. A saved GPU the runtime does not
-// report stays selected and is marked "(not found)"; the load refuses it.
+// CPU; a split is its GPUs as a comma list in listed order), or null while
+// the list is unknown. A saved GPU the runtime does not report stays
+// selected and is marked "(not found)"; the load refuses it. With 2 or more
+// GPUs listed there are two ways to split: All GPUs and Choose GPUs….
+// `split` is the split in use, if any, and `problem` why it cannot load.
 export function deviceChoice(saved: string, devices: readonly RuntimeDevice[] | null) {
   const listed = devices ?? [];
+  const names = listed.map(d => d.name);
+  const canSplit = listed.length >= 2;
+  const options: { value: string; label: string; detail?: string }[] = [...listed.map(d => ({ value: d.name, ...deviceLabel(d) }))];
+  if (canSplit) options.push({ value: ALL_GPUS, label: 'All GPUs', detail: splitLabel(names, true, listed) }, { value: CHOOSE_GPUS, label: 'Choose GPUs…', detail: '2 or more' });
+  options.push({ value: CPU_DEVICE, label: 'CPU', detail: 'CPU runtime' });
+  if (isSplit(saved)) {
+    const all = saved.trim() === ALL_GPUS;
+    const wanted = all ? names : splitNames(saved);
+    const unlisted = wanted.filter(name => !names.includes(name));
+    const gpus = names.filter(name => wanted.includes(name));
+    const value = all ? ALL_GPUS : CHOOSE_GPUS;
+    const problem = !devices ? null
+      : all && !canSplit ? `All GPUs needs at least 2 GPUs, but the llama.cpp build in Runtime reports ${listed.length}. Choose another device.`
+      : unlisted.length ? `${unlisted.join(', ')} ${unlisted.length === 1 ? 'was' : 'were'} not found: the llama.cpp build in Runtime does not report ${unlisted.length === 1 ? 'it' : 'them'}. Loads are refused until you choose other GPUs.`
+      : gpus.length < 2 ? 'Choose at least 2 GPUs to split a model.' : null;
+    if (!canSplit) options.unshift({ value, label: all ? 'All GPUs (not available)' : `${splitNames(saved).join(' + ') || 'Chosen GPUs'} (not found)` });
+    if (!devices) options.unshift({ value: '', label: 'Checking devices…' });
+    const effective = devices ? gpus.join(',') : null;
+    return { value: devices ? value : '', effective, missing: unlisted.length > 0 && !!devices, options, split: { all, gpus, label: splitLabel(gpus, all, listed) }, problem, canSplit };
+  }
   const effective = saved || (devices ? listed[0]?.name ?? CPU_DEVICE : null);
   const known = !saved || saved === CPU_DEVICE || listed.some(d => d.name === saved);
   const missing = !!devices && !known;
-  const options: { value: string; label: string; detail?: string }[] = [...listed.map(d => ({ value: d.name, ...deviceLabel(d) })), { value: CPU_DEVICE, label: 'CPU', detail: 'CPU runtime' }];
   if (!known) options.unshift({ value: saved, label: devices ? `${saved} (not found)` : saved });
   if (effective === null) options.unshift({ value: '', label: 'Checking devices…' });
-  return { value: effective ?? '', effective, missing, options };
+  return { value: effective ?? '', effective, missing, options, split: null, problem: null, canSplit };
 }
 
 // The instance the load panel's main load button replaces: the "Instance"

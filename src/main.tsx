@@ -30,7 +30,7 @@ import { DownloadPanel, type DownloadState } from './DownloadPanel';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { HuggingFaceLogo } from './HuggingFaceLogo';
 import { RuntimeManager, type RuntimeDownload } from './RuntimeManager';
-import { enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, reloadSlot, visibleBanner, waitText, deviceChoice, CPU_DEVICE, type RuntimeDevice } from './ui-state';
+import { enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, reloadSlot, visibleBanner, waitText, deviceChoice, deviceLabel, CPU_DEVICE, CHOOSE_GPUS, SPLIT_MODES, isSplit, chosenGpus, toggleGpu, ratioError, type RuntimeDevice } from './ui-state';
 import { containScrollChaining } from './scroll-contain';
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
@@ -40,7 +40,7 @@ import './styles.css';
 // decoded to 3.7 MB of bitmap for the sidebar.
 const logoUrl = new URL('./logo-96.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; cpu_runtime_path: string; api_port: number; require_api_key: boolean; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; split_mode: string; tensor_split: string; cpu_runtime_path: string; api_port: number; require_api_key: boolean; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
 
 // One loaded model, with the settings it was loaded with.
 type Instance = { id: string; name: string; label: string; slot: number; suffix: string; default_suffix: string; api_names: string[]; instance_aliases: string[]; path: string; device: string; runtime_path: string; projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null; ready: boolean; context_size: number; gpu_layers: number; required_bytes: number | null; context: { entries: number; last_flushed: number }; keep_context: boolean; settings: Settings };
@@ -61,12 +61,12 @@ const WHEN_BUSY = [
 ] as const;
 // "Wait up to (ms)": the backend accepts 1–600000 (set_wait_ms in runtime.rs).
 const WAIT_MS = { min: 1, max: 600000, step: 1000 };
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', cpu_runtime_path: '', api_port: 11435, require_api_key: false, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', split_mode: 'layer', tensor_split: '', cpu_runtime_path: '', api_port: 11435, require_api_key: false, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
 // The form is edited in two places, each saved on its own: the Local API
 // load panel (settings a load uses) and the Runtime tab (build and ports).
 // keep_context is the default a new instance starts with; loaded instances
 // have their own switch, so it is not compared for Reload.
-const LOAD_FIELDS = ['model_path', 'mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size', 'gpu_layers', 'device', 'keep_context'] as const;
+const LOAD_FIELDS = ['model_path', 'mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size', 'gpu_layers', 'device', 'split_mode', 'tensor_split', 'keep_context'] as const;
 // Decision mode: stored value, UI label, hint under the segmented control.
 const DECISION_MODES = [
   ['auto', 'Auto', 'Uses Prompt layout for Winnow GGUFs, otherwise Built-in when the model and runtime support it.'],
@@ -474,6 +474,7 @@ function App() {
   // dialog. The new instance becomes the Playground's model unless another
   // loaded model is already chosen there.
   async function loadSelected({ replace = null, ejectOther }: { replace?: string | null; ejectOther?: string } = {}) {
+    if (splitBlocked) return;
     await action('start', async () => {
       await saveLoadSettings();
       if (ejectOther) await invoke('unload_model', { id: ejectOther });
@@ -514,6 +515,7 @@ function App() {
   // are not used by a load).
   // An instance's settings.device is the device it was loaded on. On the CPU
   // it ran the CPU runtime with 0 GPU layers, so those are what compare.
+  const deviceListed = deviceList?.key === deviceKey ? deviceList.devices : [];
   const device = deviceChoice(settings.device, deviceList?.key === deviceKey ? deviceList.devices : null);
   const saved = savedSettings ?? defaultSettings;
   const savedCpuRuntime = saved.cpu_runtime_path.trim() ? saved.cpu_runtime_path : !settings.device.trim() ? saved.runtime_path : '';
@@ -521,6 +523,7 @@ function App() {
     (['mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size'] as const).some(key => settings[key] !== instance.settings[key])
     || (instance.settings.device !== CPU_DEVICE && settings.gpu_layers !== instance.settings.gpu_layers)
     || (device.effective !== null && device.effective !== instance.settings.device)
+    || (isSplit(instance.settings.device) && (settings.split_mode !== instance.settings.split_mode || settings.tensor_split.trim() !== instance.settings.tensor_split.trim()))
     || (instance.settings.device === CPU_DEVICE ? savedCpuRuntime : saved.runtime_path) !== instance.runtime_path
     || saved.library_path !== instance.settings.library_path);
   const reloadSelected = !!selectedInstance && differsFrom(selectedInstance);
@@ -562,7 +565,15 @@ function App() {
   const loadRuntime = runtimeName(savedSettings?.runtime_path ?? '');
   const listError = deviceList?.key === deviceKey && deviceList.error ? `The llama.cpp build in Runtime could not list its devices (${deviceList.error}).` : '';
   // The Device row's live state; the static explanation is its description.
+  // A split runs on 2 or more GPUs; its ratio has one number per GPU.
+  const splitting = !!device.split && device.split.gpus.length >= 2;
+  const splitRatioError = splitting ? ratioError(settings.tensor_split, device.split!.gpus.length) : null;
+  const splitModeError = splitting && !SPLIT_MODES.some(([mode]) => mode === settings.split_mode);
+  // A split that cannot load as set blocks the load buttons.
+  const splitBlocked = !!device.split && (device.effective === null || !!device.problem || !!splitRatioError || splitModeError);
   const deviceStatus: { tone: Tone; text: string } | null = device.effective === null ? { tone: 'pending', text: 'Checking which devices the llama.cpp build reports…' }
+    : device.problem ? { tone: 'error', text: device.problem }
+    : device.split ? { tone: 'info', text: `Splits the model across ${device.split.label}.` }
     : device.missing ? { tone: 'error', text: `${settings.device} was not found: the llama.cpp build in Runtime does not report it. Loads are refused until you choose another device.` }
     : device.effective === CPU_DEVICE
       ? savedCpuRuntime.trim() ? { tone: 'info', text: `Runs on the CPU runtime (${runtimeName(savedCpuRuntime)}) with GPU layers 0.` } : { tone: 'warn', text: 'Device CPU needs a CPU runtime. Choose or download one under CPU runtime in Runtime.' }
@@ -818,9 +829,28 @@ function App() {
               </SettingRow>
             </SettingSection>
             <SettingSection title="Hardware">
-              <SettingRow label="Device" wide description="Each instance runs on this one device; a model is never split across GPUs."
-                control={<Select label="Device" value={device.value} disabled={!device.effective} options={device.options} onChange={value => edit('device', value)}/>}
+              <SettingRow label="Device" wide description="Where each instance runs: one device, or split across GPUs."
+                control={<Select label="Device" value={device.value} disabled={device.effective === null} options={device.options} onChange={value => edit('device', value === CHOOSE_GPUS ? chosenGpus(device.split ? device.split.gpus : device.effective && device.effective !== CPU_DEVICE ? [device.effective] : [], deviceListed) : value)}/>}
                 status={(deviceStatus || listError) && <>{listError && <StatusNote tone="warn">{listError}</StatusNote>}{deviceStatus && <StatusNote tone={deviceStatus.tone}>{deviceStatus.text}</StatusNote>}</>}/>
+              {device.value === CHOOSE_GPUS && device.canSplit && <SettingRow label="GPUs" description="Choose 2 or more.">
+                <div className="api-key-models" role="group" aria-label="GPUs to split across">
+                  {deviceListed.map(gpu => {
+                    const checked = !!device.split?.gpus.includes(gpu.name);
+                    return <div className="api-key-model-group" key={gpu.name}><button type="button" role="checkbox" aria-checked={checked} className="api-key-model" onClick={() => edit('device', toggleGpu(settings.device, gpu.name, deviceListed))}>
+                      <span className="api-key-check" aria-hidden="true">{checked && <Check size={12}/>}</span>
+                      <span>{deviceLabel(gpu).label} <small>{deviceLabel(gpu).detail}</small></span>
+                    </button></div>;
+                  })}
+                </div>
+              </SettingRow>}
+              {splitting && <SettingRow label="Split mode" description="How the model is divided between the GPUs."
+                more="Layer gives each GPU whole layers and suits most setups. Row splits each layer across the GPUs, which can help with fast links between them. Passed as --split-mode."
+                status={splitModeError && <StatusNote tone="error">Choose Layer or Row.</StatusNote>}
+                control={<div className="segmented" role="group" aria-label="Split mode">{SPLIT_MODES.map(([value, label]) => <button key={value} type="button" className={settings.split_mode === value ? 'on' : ''} aria-pressed={settings.split_mode === value} onClick={() => edit('split_mode', value)}>{label}</button>)}</div>}/>}
+              {splitting && <SettingRow label="Split ratio" htmlFor="load-split-ratio" description="Empty shares by free memory."
+                more={`One number per GPU, in the listed order (${device.split!.gpus.join(', ')}). For example 3,1 puts three quarters on the first. Passed as --tensor-split.`}
+                control={<input id="load-split-ratio" placeholder="Auto" value={settings.tensor_split} aria-invalid={!!splitRatioError} onChange={e => edit('tensor_split', e.target.value)}/>}
+                status={splitRatioError && <StatusNote tone="error">{splitRatioError}</StatusNote>}/>}
               <SettingRow label="GPU layers" description="0 runs on the CPU. 99 puts every layer that fits on the GPU."
                 control={<NumberField label="GPU layers" min={-1} value={settings.gpu_layers} onChange={value => edit('gpu_layers', value)}/>}
                 status={device.effective === CPU_DEVICE && <StatusNote tone="info">Not used on Device CPU, which always loads with 0.</StatusNote>}/>
@@ -842,11 +872,11 @@ function App() {
           <div className={`save-bar load-bar ${loadDirty ? 'dirty' : ''}`}><span className="hint">{loadDirty ? 'You have unsaved changes. Loading saves them first.' : reloadSelected ? 'The selected model was loaded with other settings. Reload model applies these.' : selectedInstances.length > 1 ? `The selected model is loaded ${selectedInstances.length} times. Eject and Reload act on the instance chosen above.` : selectedInstance ? 'The selected model is loaded with these settings.' : running ? 'Settings apply when you load. Loaded models keep the settings they started with.' : 'Settings apply when you load.'}</span><div className="load-bar-actions">
             <button className="secondary" disabled={!loadDirty || modelPending} onClick={() => action('save-load', async () => { await saveLoadSettings(); setNotice({ text: 'Settings saved.', error: false }); })}>Save settings</button>
             {selectedInstance && <button className="secondary" disabled={modelPending} title={selectedInstance.ready ? `Unload ${apiName(selectedInstance)}; other loaded models keep running` : undefined} onClick={() => void eject(selectedInstance.id)}>{selectedInstance.ready ? <Unplug size={13}/> : <Square size={13}/>}{selectedInstance.ready ? 'Eject' : 'Cancel loading'}</button>}
-            {(!selectedInstance || reloadSelected) && <button className="primary" disabled={modelPending || !model.selected || model.missing || (!!selectedInstance && !selectedInstance.ready)} title={!selectedInstance && running ? 'Loads beside the models already loaded' : undefined} onClick={() => void loadSelected({ replace: replaceOnLoad })}>{isBusy('start') ? <RefreshCw className="spin" size={14}/> : <Play size={14}/>} {isBusy('start') ? 'Starting…' : selectedInstance ? 'Reload model' : running ? 'Load beside' : 'Load model'}</button>}
-            {selectedInstance && <button className={reloadSelected ? 'secondary' : 'primary'} disabled={modelPending || !model.selected || model.missing} title="Loads one more instance of this file beside the loaded one. It answers to the file's names with a suffix such as -i-2." onClick={() => void loadSelected()}>{isBusy('start') ? <RefreshCw className="spin" size={14}/> : <Plus size={14}/>} {isBusy('start') ? 'Starting…' : 'Load another instance'}</button>}
+            {(!selectedInstance || reloadSelected) && <button className="primary" disabled={modelPending || !model.selected || model.missing || splitBlocked || (!!selectedInstance && !selectedInstance.ready)} title={!selectedInstance && running ? 'Loads beside the models already loaded' : undefined} onClick={() => void loadSelected({ replace: replaceOnLoad })}>{isBusy('start') ? <RefreshCw className="spin" size={14}/> : <Play size={14}/>} {isBusy('start') ? 'Starting…' : selectedInstance ? 'Reload model' : running ? 'Load beside' : 'Load model'}</button>}
+            {selectedInstance && <button className={reloadSelected ? 'secondary' : 'primary'} disabled={modelPending || !model.selected || model.missing || splitBlocked} title="Loads one more instance of this file beside the loaded one. It answers to the file's names with a suffix such as -i-2." onClick={() => void loadSelected()}>{isBusy('start') ? <RefreshCw className="spin" size={14}/> : <Plus size={14}/>} {isBusy('start') ? 'Starting…' : 'Load another instance'}</button>}
           </div></div>
           {instances.length > 0 && <><div className="section-heading"><h2>Loaded</h2><span>{instances.length} {instances.length === 1 ? 'model' : 'models'} · each keeps the settings it was loaded with</span></div><div className="loaded-list">{instances.map(instance => <InstanceCard key={instance.id} instance={instance} account={accountFor(instance.path)} runtime={runtimeName(instance.runtime_path || instance.settings.runtime_path)} aliases={aliasesFor(instance.path)} routes={routes} displayName={apiName(instance)}
-            stale={differsFrom(instance)} canReload={differsFrom(instance) && instance.ready} starting={isBusy('start')} ejecting={isBusy(`eject:${instance.id}`)} reloadDisabled={modelPending || model.missing} namesDisabled={!desktop}
+            stale={differsFrom(instance)} canReload={differsFrom(instance) && instance.ready} starting={isBusy('start')} ejecting={isBusy(`eject:${instance.id}`)} reloadDisabled={modelPending || model.missing || splitBlocked} namesDisabled={!desktop}
             keepContext={keepsContext(instance)} onKeepContext={on => void toggleKeepContext(instance.id, on)} onClearContext={() => void clearContext(instance.id)}
             onEject={() => void eject(instance.id)} onReload={() => void loadSelected({ replace: instance.id })} onSaveAliases={saveAliases} onSaveSuffix={suffix => saveSuffix(instance.id, suffix)} onSaveInstanceAliases={aliases => saveInstanceAliases(instance.id, aliases)} onError={copyError}/>)}</div></>}
           <ModelRouting loadedCount={instances.length} anyReady={instances.some(i => i.ready)} whenBusy={whenBusy} waitMs={savedWait} routes={routes} aliasesFor={aliasesFor} disabled={!desktop} onSave={saveAliases} onError={copyError}/>

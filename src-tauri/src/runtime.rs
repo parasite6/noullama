@@ -34,9 +34,15 @@ pub struct Settings {
     pub context_size: u32,
     pub gpu_layers: i32,
     // Where a load runs: "" (the first GPU the GPU runtime lists, else the
-    // CPU), "CPU", or a llama.cpp device name such as "CUDA0". Saved by the
+    // CPU), "CPU", a llama.cpp device name such as "CUDA0", or a split across
+    // GPUs: "gpus:all" or a comma list such as "CUDA0,CUDA1". Saved by the
     // Local API load panel. See devices.rs.
     pub device: String,
+    // For a split only: "layer" or "row" (`--split-mode`), and an optional
+    // ratio such as "3,1", one number per GPU in listed order
+    // (`--tensor-split`). Empty shares by free memory.
+    pub split_mode: String,
+    pub tensor_split: String,
     // The llama-server for loads on the CPU; resolved like `runtime_path`.
     // Saved by the Runtime tab.
     pub cpu_runtime_path: String,
@@ -85,6 +91,8 @@ impl Default for Settings {
             context_size: 8192,
             gpu_layers: 99,
             device: String::new(),
+            split_mode: "layer".into(),
+            tensor_split: String::new(),
             cpu_runtime_path: String::new(),
             api_port: 11435,
             require_api_key: false,
@@ -210,6 +218,9 @@ impl RuntimeSession {
 pub struct LoadedModel {
     pub path: String,
     pub device: String,
+    // The split was chosen as All GPUs, so it is shown as "All GPUs (N)".
+    #[serde(skip)]
+    pub all_gpus: bool,
     pub runtime_path: String,
     // Loaded with a multimodal projector, so requests may carry images.
     pub projector: bool,
@@ -1398,8 +1409,10 @@ pub async fn load_fit_in(state: &AppState, changes: serde_json::Map<String, Valu
 /// How a load with `candidate` would fit, beside the loaded `instances`
 /// other than `replace`. Returns the fit and how many instances it set
 /// memory aside for: those on the CPU for a CPU load; on a GPU load, those on
-/// the same GPU plus those on the CPU (graphics memory of other GPUs does not
-/// matter to it). The reason is returned when there is no estimate.
+/// a GPU it uses plus those on the CPU (graphics memory of other GPUs does not
+/// matter to it). A split is rated against its GPUs' summed memory, and with
+/// a ratio each GPU's share against that GPU. The reason is returned when
+/// there is no estimate.
 fn fit_for_load(
     candidate: &Settings,
     listed: Option<&[crate::devices::RuntimeDevice]>,
@@ -1419,7 +1432,16 @@ fn fit_for_load(
     let gpu_layers = crate::devices::gpu_layers(&settings);
     let on_gpu = gpu_layers != 0;
     let mut hardware = hardware.clone();
-    if on_gpu {
+    // A split's GPUs with their own total memory as the runtime reports it.
+    let mut split_gpus: Vec<(String, u64)> = Vec::new();
+    if on_gpu && crate::devices::is_split(&settings.device) {
+        for name in crate::devices::split_names(&settings.device) {
+            let total = listed.and_then(|l| l.iter().find(|d| d.name == name)).and_then(|d| d.total_mib);
+            let mib = total.ok_or_else(|| format!("{name} did not report its memory, so there is no estimate for this split."))?;
+            split_gpus.push((name.to_owned(), mib * 1024 * 1024));
+        }
+        hardware.vram_bytes = Some(split_gpus.iter().map(|(_, bytes)| bytes).sum());
+    } else if on_gpu {
         // That GPU's own memory as the runtime reports it; the machine-wide probe otherwise.
         let total = listed.and_then(|l| l.iter().find(|d| d.name == settings.device)).and_then(|d| d.total_mib);
         if let Some(mib) = total {
@@ -1428,22 +1450,55 @@ fn fit_for_load(
     } else {
         hardware.vram_bytes = None;
     }
+    let mut reserved = std::collections::HashMap::<String, u64>::new();
     let taken: Vec<(u64, bool)> = instances
         .iter()
         .filter(|i| Some(i.id.as_str()) != replace)
         .filter_map(|i| {
             let other_gpu = crate::devices::gpu_layers(&i.settings) != 0;
-            if other_gpu && !(on_gpu && i.settings.device == settings.device) {
+            if other_gpu && !(on_gpu && crate::devices::shares_gpu(&i.settings.device, &settings.device)) {
                 return None;
             }
             let bytes = crate::hardware::estimate_bytes(i.path(), &instance_extras(&i.settings), i.settings.context_size)?;
-            Some((bytes, other_gpu))
+            if !other_gpu { return Some((bytes, false)); }
+            let overlap = gpu_overlap_bytes(&i.settings, &settings.device, bytes, &mut reserved);
+            (overlap > 0).then_some((overlap, true))
         })
         .collect();
     let extras = instance_extras(&settings);
     let extras: Vec<&str> = extras.iter().map(String::as_str).collect();
-    let fit = crate::hardware::fit_beside(&settings.model_path, &extras, settings.context_size, gpu_layers, &hardware, &taken)?;
+    let mut fit = crate::hardware::fit_beside(&settings.model_path, &extras, settings.context_size, gpu_layers, &hardware, &taken)?;
+    if let Ok(Some(weights)) = crate::devices::parse_ratio(&settings.tensor_split, Some(split_gpus.len())) {
+        for (name, total) in &mut split_gpus {
+            *total = total.saturating_sub(reserved.get(name).copied().unwrap_or_default());
+        }
+        fit = crate::hardware::check_shares(fit, &split_gpus, &weights);
+    }
     Ok((fit, taken.len()))
+}
+
+/// Aggregate VRAM on the candidate's GPUs, recording known per-device shares.
+fn gpu_overlap_bytes(existing: &Settings, candidate: &str, bytes: u64, by_device: &mut std::collections::HashMap<String, u64>) -> u64 {
+    let names = crate::devices::split_names(&existing.device);
+    let target = crate::devices::split_names(candidate);
+    let weights = if names.len() == 1 {
+        Some(vec![1.0])
+    } else {
+        crate::devices::parse_ratio(&existing.tensor_split, Some(names.len())).ok().flatten()
+    };
+    let Some(weights) = weights else {
+        // Without a ratio, only the full device set has a known estimate.
+        return if names.iter().all(|name| target.contains(name)) { bytes } else { 0 };
+    };
+    let sum: f64 = weights.iter().sum();
+    let mut overlapping = 0u64;
+    for (name, weight) in names.into_iter().zip(weights).filter(|(name, _)| target.contains(name)) {
+        let share = (bytes as f64 * (weight / sum)) as u64;
+        let entry = by_device.entry(name.to_owned()).or_default();
+        *entry = entry.saturating_add(share);
+        overlapping = overlapping.saturating_add(share);
+    }
+    overlapping
 }
 
 /// Trims, checks and de-duplicates one model's aliases for the local API.
@@ -1511,6 +1566,11 @@ pub async fn update_settings(state: &AppState, change: impl FnOnce(&mut Settings
     }
     if !(512..=131072).contains(&settings.context_size) || settings.gpu_layers < -1 {
         return Err("Use a context size of 512–131072 and GPU layers of -1 or higher.".into());
+    }
+    if crate::devices::is_split(&settings.device)
+        && (&settings.device, &settings.split_mode, &settings.tensor_split) != (&current.device, &current.split_mode, &current.tensor_split)
+    {
+        crate::devices::check_split_settings(&settings)?;
     }
     if !settings.download_dir.trim().is_empty()
         && !Path::new(settings.download_dir.trim()).is_absolute()
@@ -1642,16 +1702,18 @@ async fn load_model_replacing(state: &AppState, slot: Option<u32>, replace: Opti
     if !unchanged(&settings, &listed_with) {
         listed = crate::devices::listed_for(state, &settings).await;
     }
-    // The instance keeps the device it was loaded on, never the empty default.
+    // The instance keeps the device it was loaded on, never the empty default
+    // (a split keeps its GPUs as a comma list).
+    let all_gpus = settings.device.trim() == crate::devices::ALL_GPUS;
     settings.device = crate::devices::choose_device(&settings, listed.as_deref())?;
     let devices = listed.unwrap_or_default();
-    let device = devices.iter().find(|d| d.name == settings.device).map_or(settings.device.clone(), |d| d.display());
+    let device = crate::devices::display(&settings.device, all_gpus, &devices).unwrap_or_else(|| settings.device.clone());
     let loaded = state.instances.lock().await.clone();
     let replacement = replace.and_then(|id| loaded.iter().find(|instance| instance.id == id));
     let checked_devices = if replacement.is_some() {
-        Some(check_launch_devices(&settings).await?)
+        Some(check_launch_devices(&settings, all_gpus).await?)
     } else {
-        if let Some(reason) = load_memory_risk(state, &settings, loaded.iter(), (0, 0), &devices, false).await {
+        if let Some(reason) = load_memory_risk(state, &settings, loaded.iter(), (None, 0), &devices, false).await {
             return Err(format!("OOM prevention: {reason} Eject another model, reduce context or GPU offload, or enable Allow force fit in Settings."));
         }
         None
@@ -1661,7 +1723,7 @@ async fn load_model_replacing(state: &AppState, slot: Option<u32>, replace: Opti
     let preferred_slot = replacement.map(|instance| instance.slot).or(slot);
     let (slot, label) = slot_and_label(&others, &settings.model_path, preferred_slot);
     let session = RuntimeSession::new(&state.data_dir, port)?;
-    let instance = Arc::new(new_instance(settings, slot, label, session, device));
+    let instance = Arc::new(new_instance(settings, slot, label, session, device, all_gpus));
     state.load_errors.lock().await.retain(|e| !(e.path == instance.path() && e.slot == instance.slot));
     if let Some(previous) = replacement {
         state.unload_locked(&previous.id).await;
@@ -1698,8 +1760,9 @@ async fn load_model_replacing(state: &AppState, slot: Option<u32>, replace: Opti
 
 /// A new, still loading instance in `slot`: the slot's default suffix, no
 /// instance aliases, and Keep context from the `keep_context` setting.
-/// `settings.device` is the chosen device; `device` is how it is shown.
-fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<RuntimeSession>, device: String) -> Instance {
+/// `settings.device` is the chosen device; `device` is how it is shown, and
+/// `all_gpus` whether it was chosen as All GPUs.
+fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<RuntimeSession>, device: String, all_gpus: bool) -> Instance {
     Instance {
         loaded_sha256: std::sync::OnceLock::new(),
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
@@ -1709,6 +1772,7 @@ fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<Runti
         model: std::sync::Mutex::new(LoadedModel {
             path: settings.model_path.clone(),
             device,
+            all_gpus,
             runtime_path: crate::devices::launch_settings(&settings).runtime_path,
             projector: !settings.mmproj_path.is_empty(),
             mtp: settings.mtp,
@@ -1806,7 +1870,7 @@ async fn is_registered(state: &AppState, instance: &Arc<Instance>) -> bool {
 
 /// The process a load starts: the runtime for its device (the CPU runtime
 /// with no GPU layers for "CPU"), its library folders, the launch arguments
-/// and the flags that keep it on that one device.
+/// and the flags that keep it on its device or split.
 fn launch_command(settings: &Settings, session: &RuntimeSession) -> Command {
     let launch = crate::devices::launch_settings(settings);
     let mut command = runtime_command(&launch);
@@ -1856,18 +1920,17 @@ fn runtime_args(settings: &Settings, session: &RuntimeSession) -> Vec<String> {
     args
 }
 
-async fn check_launch_devices(settings: &Settings) -> Result<(Vec<crate::devices::RuntimeDevice>, String), String> {
+async fn check_launch_devices(settings: &Settings, all_gpus: bool) -> Result<(Vec<crate::devices::RuntimeDevice>, String), String> {
     // Detect devices with the runtime this load launches: the GPU runtime
-    // must still list the chosen GPU; the CPU runtime only has to run.
+    // must still list each chosen GPU; the CPU runtime only has to run.
     let devices = crate::devices::list_devices(&crate::devices::launch_settings(settings)).await?;
-    let display = if crate::devices::on_cpu(settings) {
-        crate::devices::CPU.to_owned()
-    } else {
-        devices
-            .iter()
-            .find(|d| d.name == settings.device)
-            .map(crate::devices::RuntimeDevice::display)
-            .ok_or_else(|| crate::devices::not_found(&settings.device))?
+    let display = match crate::devices::display(&settings.device, all_gpus, &devices) {
+        Some(display) => display,
+        None => {
+            let names = crate::devices::split_names(&settings.device);
+            let missing = names.iter().find(|name| !devices.iter().any(|d| d.name == **name)).copied().unwrap_or(&settings.device);
+            return Err(crate::devices::not_found(missing));
+        }
     };
     Ok((devices, display))
 }
@@ -1886,7 +1949,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>, checked_de
     let fresh_devices = checked_devices.is_none();
     let (devices, device) = match checked_devices {
         Some(checked) => checked,
-        None => check_launch_devices(settings).await?,
+        None => check_launch_devices(settings, instance.model().all_gpus).await?,
     };
     let (loaded_sum, launch_fingerprint) = {
         let _guard = state.lifecycle.lock().await;
@@ -1897,7 +1960,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>, checked_de
         live_settings.allow_force_fit = state.settings.lock().await.allow_force_fit;
         let loaded = state.instances.lock().await.clone();
         let others = loaded.iter().filter(|other| other.id != instance.id);
-        if let Some(reason) = load_memory_risk(state, &live_settings, others, (0, 0), &devices, fresh_devices).await {
+        if let Some(reason) = load_memory_risk(state, &live_settings, others, (None, 0), &devices, fresh_devices).await {
             return Err(format!("OOM prevention: {reason}"));
         }
         let launch_fingerprint = crate::library::fingerprint(instance.path());
@@ -2292,34 +2355,44 @@ pub async fn set_memory_pref(state: &AppState, key: &str, value: bool) -> Result
     .await
 }
 
-/// `freed_vram` and `freed_ram`: memory a loaded instance being replaced
+/// `freed_gpu` and `freed_ram`: memory a loaded instance being replaced
 /// holds now, counted as available because it is unloaded before the load.
-/// `settings.device` is the chosen device; `devices` is the GPU runtime's
-/// list, used to find that GPU's own nvidia-smi reading.
+/// `settings.device` is the chosen device (one GPU or a split's GPUs);
+/// `devices` is the GPU runtime's list, used to find each GPU's own
+/// nvidia-smi reading. A split with any GPU unread skips the check and logs
+/// which one, rather than guessing from another GPU.
 async fn load_memory_risk<'a>(
     state: &AppState,
     settings: &Settings,
     loaded: impl Iterator<Item = &'a Arc<Instance>>,
-    freed: (u64, u64),
+    freed: (Option<(&Settings, u64)>, u64),
     devices: &[crate::devices::RuntimeDevice],
     fresh: bool,
 ) -> Option<String> {
     let layers = crate::devices::gpu_layers(settings);
     let vram = if !settings.allow_force_fit && (layers == -1 || layers >= 99) {
-        let (device, listed) = (settings.device.clone(), devices.to_vec());
-        let reading = tokio::task::spawn_blocking(move || crate::hardware::nvidia_device_memory(&device, &listed)).await.ok().flatten();
-        let reading = match reading {
-            Some(reading) => Some(reading),
-            None if fresh => crate::hardware::listed_device_memory(&settings.device, devices),
-            None => {
-                let listed = crate::devices::list_devices(settings).await.ok();
-                listed.as_deref().and_then(|list| crate::hardware::listed_device_memory(&settings.device, list))
+        let names: Vec<String> = crate::devices::split_names(&settings.device).into_iter().map(str::to_owned).collect();
+        let listed = devices.to_vec();
+        let wanted = names.clone();
+        let mut readings: Vec<Option<(u64, u64)>> = tokio::task::spawn_blocking(move || {
+            wanted.iter().map(|name| crate::hardware::nvidia_device_memory(name, &listed)).collect()
+        }).await.unwrap_or_else(|_| vec![None; names.len()]);
+        if readings.iter().any(Option::is_none) {
+            let relisted = if fresh { None } else { crate::devices::list_devices(settings).await.ok() };
+            let list = if fresh { Some(devices) } else { relisted.as_deref() };
+            for (reading, name) in readings.iter_mut().zip(&names) {
+                if reading.is_none() {
+                    *reading = list.and_then(|list| crate::hardware::listed_device_memory(name, list));
+                }
             }
-        };
-        if reading.is_none() {
-            state.log(format!("VRAM preflight unavailable for device {}.", settings.device)).await;
         }
-        reading
+        let missing: Vec<&str> = names.iter().zip(&readings).filter(|(_, r)| r.is_none()).map(|(n, _)| n.as_str()).collect();
+        if missing.is_empty() {
+            Some(names.into_iter().zip(readings.into_iter().flatten()).map(|(name, (total, used))| (name, total, used)).collect::<Vec<_>>())
+        } else {
+            state.log(format!("VRAM preflight unavailable for device {}.", missing.join(", "))).await;
+            None
+        }
     } else {
         None
     };
@@ -2327,35 +2400,45 @@ async fn load_memory_risk<'a>(
 }
 
 /// `load_memory_risk` with the readings passed in: `available_ram`, and
-/// `vram` as `(total, used)` of the GPU this load is on. Each is read only
-/// when the check needs it.
+/// `vram` as `(name, total, used)` of each GPU this load is on. Each is read
+/// only when the check needs it.
 async fn load_memory_risk_with<'a>(
     settings: &Settings,
     loaded: impl Iterator<Item = &'a Arc<Instance>>,
-    (freed_vram, freed_ram): (u64, u64),
+    (freed_gpu, freed_ram): (Option<(&Settings, u64)>, u64),
     available_ram: impl FnOnce() -> Option<u64> + Send + 'static,
-    vram: impl FnOnce() -> Option<(u64, u64)> + Send + 'static,
+    vram: impl FnOnce() -> Option<Vec<(String, u64, u64)>> + Send + 'static,
 ) -> Option<String> {
     if settings.allow_force_fit { return None; }
     let required = crate::hardware::estimate_bytes(&settings.model_path, &instance_extras(settings), settings.context_size)?;
     let gpu_layers = crate::devices::gpu_layers(settings);
     // Still-loading instances are not in the live readings yet. Graphics
-    // memory is per GPU, so only those on this load's device count there;
-    // system memory is shared by every CPU-side load.
+    // memory is per GPU, so only those sharing a GPU with this load count
+    // there; system memory is shared by every CPU-side load.
+    let mut gpu_reserved = std::collections::HashMap::new();
     let reserved = loaded
         .filter(|other| !other.is_ready())
         .filter(|other| {
             let other_gpu = crate::devices::gpu_layers(&other.settings) != 0;
-            other_gpu == (gpu_layers != 0) && (gpu_layers == 0 || other.settings.device == settings.device)
+            other_gpu == (gpu_layers != 0) && (gpu_layers == 0 || crate::devices::shares_gpu(&other.settings.device, &settings.device))
         })
-        .filter_map(|other| crate::hardware::estimate_bytes(other.path(), &instance_extras(&other.settings), other.settings.context_size))
+        .filter_map(|other| {
+            let bytes = crate::hardware::estimate_bytes(other.path(), &instance_extras(&other.settings), other.settings.context_size)?;
+            Some(if gpu_layers == 0 { bytes } else { gpu_overlap_bytes(&other.settings, &settings.device, bytes, &mut gpu_reserved) })
+        })
         .fold(0u64, u64::saturating_add);
+    let mut gpu_freed = std::collections::HashMap::new();
+    let freed_vram = freed_gpu.map_or(0, |(other, bytes)| gpu_overlap_bytes(other, &settings.device, bytes, &mut gpu_freed));
+    let weights = if crate::devices::is_split(&settings.device) {
+        crate::devices::parse_ratio(&settings.tensor_split, Some(crate::devices::split_names(&settings.device).len())).ok().flatten()
+    } else {
+        None
+    };
     tokio::task::spawn_blocking(move || {
-        if gpu_layers != 0 {
-            if let Some((total, used)) = vram() {
-                let available = total.saturating_sub(used).saturating_add(freed_vram).min(total).saturating_sub(reserved);
-                if (gpu_layers == -1 || gpu_layers >= 99) && crate::oom::clearly_exceeds(required, available) {
-                    return Some(format!("Estimated GPU allocation {:.1} GiB clearly exceeds {:.1} GiB available VRAM.", required as f64 / 1073741824., available as f64 / 1073741824.));
+        if gpu_layers == -1 || gpu_layers >= 99 {
+            if let Some(gpus) = vram() {
+                if let Some(reason) = crate::hardware::gpu_shortfall(required, &gpus, freed_vram, reserved, weights.as_deref(), &gpu_freed, &gpu_reserved) {
+                    return Some(reason);
                 }
             }
         }
@@ -2393,31 +2476,31 @@ pub async fn crowded_warning_in(state: &AppState, replace: Option<String>) -> Re
     let replaced = replace.as_deref().and_then(|id| loaded.iter().find(|i| i.id == id));
     let others: Vec<_> = loaded.iter().filter(|i| Some(i.id.as_str()) != replace.as_deref()).collect();
     if others.is_empty() { return Ok(None); }
-    let (mut freed_vram, mut freed_ram) = (0, 0);
+    let (mut freed_gpu, mut freed_ram) = (None, 0);
     if let Some(instance) = replaced.filter(|instance| instance.is_ready()) {
         let pid = instance.child.lock().await.as_ref().and_then(Child::id);
         let estimate = crate::hardware::estimate_bytes(instance.path(), &instance_extras(&instance.settings), instance.settings.context_size).unwrap_or(0);
         if crate::devices::gpu_layers(&instance.settings) == 0 {
             freed_ram = pid.and_then(crate::oom::resident_bytes).unwrap_or(estimate);
-        } else if instance.settings.device == settings.device {
-            // Its graphics memory only helps a load on the same GPU.
+        } else if crate::devices::shares_gpu(&instance.settings.device, &settings.device) {
+            // Its graphics memory only helps a load on a GPU it is on.
             // Per-process readings exist on NVIDIA only; otherwise use the estimate.
             let measured = match pid {
                 Some(pid) => tokio::task::spawn_blocking(move || crate::hardware::memory_use(&[pid])).await.ok().and_then(|u| u.processes.first().copied().flatten()),
                 None => None,
             };
-            freed_vram = measured.unwrap_or(estimate);
+            freed_gpu = Some((&instance.settings, measured.unwrap_or(estimate)));
         }
     }
     // Ejecting a model on another GPU frees nothing on this one, so a GPU
-    // load offers only the models on its own device.
+    // load offers only the models sharing a GPU with it.
     let mut names = Vec::new();
-    for instance in others.iter().filter(|i| !on_gpu || i.settings.device == settings.device) {
+    for instance in others.iter().filter(|i| !on_gpu || crate::devices::shares_gpu(&i.settings.device, &settings.device)) {
         let (name, _) = state.api_names(instance.path()).await;
         names.push(json!({"id": instance.id, "name": format!("{name}{}", instance.suffix())}));
     }
     let devices = listed.unwrap_or_default();
-    Ok(load_memory_risk(state, &settings, others.into_iter(), (freed_vram, freed_ram), &devices, false).await.map(|reason| json!({ "reason": reason, "models": names })))
+    Ok(load_memory_risk(state, &settings, others.into_iter(), (freed_gpu, freed_ram), &devices, false).await.map(|reason| json!({ "reason": reason, "models": names })))
 }
 
 /// Supervises loaded models once a second: notices runtimes that exited and
@@ -2490,7 +2573,7 @@ pub async fn insert_test_instance_on(state: &AppState, path: &str, ready: bool, 
     let loaded = state.instances.lock().await.clone();
     let (slot, label) = slot_and_label(&loaded, path, None);
     let device = if settings.device.is_empty() { crate::devices::CPU.to_owned() } else { settings.device.clone() };
-    let instance = Arc::new(new_instance(settings, slot, label, RuntimeSession::new(&state.data_dir, port).unwrap(), device));
+    let instance = Arc::new(new_instance(settings, slot, label, RuntimeSession::new(&state.data_dir, port).unwrap(), device, false));
     instance.model.lock().unwrap().layout = Some("native".into());
     instance.ready.store(ready, Ordering::SeqCst);
     state.instances.lock().await.push(instance.clone());
@@ -2658,14 +2741,14 @@ mod tests {
         let available_ram = || Some(2 * 1024 * 1024 * 1024);
         let no_gpu = || None;
         let _guard = state.lifecycle.lock().await;
-        assert!(load_memory_risk_with(&settings, std::iter::empty(), (0, 0), available_ram, no_gpu).await.is_none());
+        assert!(load_memory_risk_with(&settings, std::iter::empty(), (None, 0), available_ram, no_gpu).await.is_none());
         let first = insert_test_instance(&state, &settings.model_path, false).await;
         let loaded = state.instances.lock().await.clone();
-        assert!(load_memory_risk_with(&settings, loaded.iter(), (0, 0), available_ram, no_gpu).await.is_some());
+        assert!(load_memory_risk_with(&settings, loaded.iter(), (None, 0), available_ram, no_gpu).await.is_some());
         let force = Settings { allow_force_fit: true, ..settings.clone() };
-        assert!(load_memory_risk_with(&force, loaded.iter(), (0, 0), || panic!("force fit must skip RAM sampling"), || panic!("force fit must skip VRAM sampling")).await.is_none());
+        assert!(load_memory_risk_with(&force, loaded.iter(), (None, 0), || panic!("force fit must skip RAM sampling"), || panic!("force fit must skip VRAM sampling")).await.is_none());
         first.ready.store(true, Ordering::SeqCst);
-        assert!(load_memory_risk_with(&settings, loaded.iter(), (0, 0), available_ram, no_gpu).await.is_none());
+        assert!(load_memory_risk_with(&settings, loaded.iter(), (None, 0), available_ram, no_gpu).await.is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3326,7 +3409,7 @@ mod tests {
         let settings = loaded.settings.lock().await;
         assert!(settings.allow_force_fit && settings.hide_crowded_load_warning);
         drop(settings);
-        assert!(load_memory_risk(&loaded, &loaded.settings.lock().await.clone(), std::iter::empty(), (0, 0), &[], false).await.is_none());
+        assert!(load_memory_risk(&loaded, &loaded.settings.lock().await.clone(), std::iter::empty(), (None, 0), &[], false).await.is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3613,18 +3696,18 @@ mod tests {
         std::fs::write(&model, b"model").unwrap();
         // About 1.5 GiB estimated, against a 2 GiB card with nothing on it.
         let on = |device: &str| Settings { model_path: model.to_string_lossy().into_owned(), gpu_layers: 99, context_size: 65_536, device: device.into(), ..Settings::default() };
-        let card = || Some((2u64 << 30, 0u64));
+        let card = || Some(vec![("CUDA0".to_owned(), 2u64 << 30, 0u64)]);
         let no_ram = || panic!("a full GPU load reads no RAM");
         *state.settings.lock().await = on("CUDA0");
         let loading = insert_test_instance(&state, &on("CUDA0").model_path, false).await;
         let loaded = state.instances.lock().await.clone();
-        assert!(load_memory_risk_with(&on("CUDA0"), std::iter::empty(), (0, 0), no_ram, card).await.is_none());
-        let same = load_memory_risk_with(&on("CUDA0"), loaded.iter(), (0, 0), no_ram, card).await;
+        assert!(load_memory_risk_with(&on("CUDA0"), std::iter::empty(), (None, 0), no_ram, card).await.is_none());
+        let same = load_memory_risk_with(&on("CUDA0"), loaded.iter(), (None, 0), no_ram, card).await;
         assert!(same.is_some_and(|reason| reason.contains("available VRAM")));
-        assert!(load_memory_risk_with(&on("CUDA1"), loaded.iter(), (0, 0), no_ram, card).await.is_none());
+        assert!(load_memory_risk_with(&on("CUDA1"), loaded.iter(), (None, 0), no_ram, card).await.is_none());
         // Once ready it is in the live reading instead.
         set_test_ready(&loading, true);
-        assert!(load_memory_risk_with(&on("CUDA0"), loaded.iter(), (0, 0), no_ram, card).await.is_none());
+        assert!(load_memory_risk_with(&on("CUDA0"), loaded.iter(), (None, 0), no_ram, card).await.is_none());
         drop((loading, loaded));
         state.shutdown().await;
         remove_once_released(&base).await;
@@ -3640,6 +3723,8 @@ mod tests {
         let settings = state.settings.try_lock().unwrap().clone();
         assert_eq!((settings.device.as_str(), settings.cpu_runtime_path.as_str()), ("", ""));
         assert_eq!((settings.runtime_path.as_str(), settings.gpu_layers), ("/opt/llama/bin", 0));
+        // Settings from before splitting get llama.cpp's own split defaults.
+        assert_eq!((settings.split_mode.as_str(), settings.tensor_split.as_str()), ("layer", ""));
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3797,6 +3882,161 @@ mod tests {
         state.settings.lock().await.cpu_runtime_path = "/cpu/llama-server".into();
         assert!(load_fit_in(&state, changes(json!({})), None, None).await.unwrap_err().contains("Memory detection is still running"));
         assert!(load_fit_in(&state, changes(json!({"model_path": path, "bogus": 1})), None, Some(&hw)).await.unwrap_err().contains("Unknown setting"));
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// `--list-devices` stdout of a CUDA build with two made-up GPUs.
+    const TWO_GPU_LIST: &str = "Available devices:\n  CUDA0: Example GPU A (10240 MiB, 9000 MiB free)\n  CUDA1: Example GPU B (24576 MiB, 23000 MiB free)\n";
+
+    /// A split loads on the GPUs listed at load time: All GPUs on each of
+    /// them, a chosen set in listed order with its mode and ratio. The
+    /// instance keeps the GPUs and shows them with their summed memory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn splits_launch_across_the_chosen_gpus() {
+        let base = std::env::temp_dir().join(format!("noullama-split-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let gpu = listing_runtime(&base, "gpu-runtime", TWO_GPU_LIST);
+        let model = base.join("qwen.gguf");
+        std::fs::write(&model, "test").unwrap();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = gpu.to_string_lossy().into_owned();
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.runtime_port = 26000 + (uuid::Uuid::new_v4().as_u128() % 6000) as u16;
+            settings.allow_force_fit = true;
+            settings.device = crate::devices::ALL_GPUS.into();
+        }
+        let all = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
+        assert_eq!(all.settings.device, "CUDA0,CUDA1");
+        assert_eq!(all.model().device, "All GPUs (2) · 34 GB");
+        let args = launched_args(&state, &gpu).await;
+        assert_eq!(flag(&args, "--device"), Some("CUDA0,CUDA1"));
+        assert_eq!(flag(&args, "--split-mode"), Some("layer"));
+        assert!(!args.contains(&"--main-gpu".to_owned()) && !args.contains(&"--tensor-split".to_owned()), "{args:?}");
+        std::fs::remove_file(format!("{}.args", gpu.display())).unwrap();
+
+        {
+            let mut settings = state.settings.lock().await;
+            settings.device = "CUDA1,CUDA0".into();
+            settings.split_mode = "row".into();
+            settings.tensor_split = "3,1".into();
+        }
+        let chosen = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
+        assert_eq!(chosen.settings.device, "CUDA0,CUDA1");
+        assert_eq!(chosen.model().device, "CUDA0 + CUDA1 · 34 GB");
+        let args = launched_args(&state, &gpu).await;
+        assert_eq!(args[args.len() - 6..], ["--device", "CUDA0,CUDA1", "--split-mode", "row", "--tensor-split", "3,1"]);
+        state.shutdown().await;
+        drop((all, chosen));
+        remove_once_released(&base).await;
+    }
+
+    /// A split the load cannot run as saved is refused before anything starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_split_that_does_not_match_the_listed_gpus_is_refused() {
+        let base = std::env::temp_dir().join(format!("noullama-split-refused-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let gpu = listing_runtime(&base, "gpu-runtime", TWO_GPU_LIST);
+        let model = base.join("model.gguf");
+        std::fs::write(&model, "test").unwrap();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = gpu.to_string_lossy().into_owned();
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.device = "CUDA0,CUDA2".into();
+        }
+        assert_eq!(load_model_in(&state, None).await.unwrap_err(), crate::devices::not_found("CUDA2"));
+        state.settings.lock().await.device = "CUDA1,".into();
+        assert_eq!(load_model_in(&state, None).await.unwrap_err(), crate::devices::TOO_FEW_GPUS);
+        {
+            let mut settings = state.settings.lock().await;
+            settings.device = crate::devices::ALL_GPUS.into();
+            settings.tensor_split = "1,1,1".into();
+        }
+        assert_eq!(load_model_in(&state, None).await.unwrap_err(), crate::devices::ratio_count(2, 3));
+        assert!(state.instances.lock().await.is_empty());
+        // A save checks the mode and the numbers.
+        assert_eq!(update_settings(&state, |s| { s.split_mode = "rows".into(); Ok(()) }).await.unwrap_err(), crate::devices::BAD_SPLIT_MODE);
+        assert_eq!(update_settings(&state, |s| { s.tensor_split = "3;1".into(); Ok(()) }).await.unwrap_err(), crate::devices::BAD_RATIO);
+        update_settings(&state, |s| { s.split_mode = "row".into(); s.tensor_split = "3, 1".into(); Ok(()) }).await.unwrap();
+        update_settings(&state, |s| { s.device = "CUDA0".into(); s.tensor_split = "unfinished,".into(); Ok(()) }).await.unwrap();
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// A split's fit counts the GPUs' summed memory, and a ratio that gives
+    /// one GPU more than it holds rates it no better than Strained.
+    #[tokio::test]
+    async fn the_fit_of_a_split_sums_its_gpus_and_checks_each_share() {
+        let (base, state, _) = fit_state("split").await;
+        {
+            let mut settings = state.settings.lock().await;
+            settings.gpu_layers = 99;
+            settings.context_size = 4096;
+        }
+        // ~97 MiB needed; each GPU offers 54 MiB of its 60.
+        let gpus = crate::devices::parse_list_devices("Available devices:\n  CUDA0: Example GPU A (60 MiB, 50 MiB free)\n  CUDA1: Example GPU B (60 MiB, 50 MiB free)\n");
+        let hw = machine(64 * 1024, Some(100));
+        let on = |device: &str, ratio: &str| Settings { device: device.into(), tensor_split: ratio.into(), ..state.settings.try_lock().unwrap().clone() };
+        let (one, _) = fit_for_load(&on("CUDA0", ""), Some(&gpus), &[], None, Some(&hw)).unwrap();
+        assert_eq!(one.level, 3, "{}", one.detail);
+        let (both, _) = fit_for_load(&on(crate::devices::ALL_GPUS, ""), Some(&gpus), &[], None, Some(&hw)).unwrap();
+        assert_eq!(both.level, 2, "{}", both.detail);
+        let (even, _) = fit_for_load(&on("CUDA0,CUDA1", "1,1"), Some(&gpus), &[], None, Some(&hw)).unwrap();
+        assert_eq!(even.level, 2, "{}", even.detail);
+        let (lopsided, _) = fit_for_load(&on("CUDA0,CUDA1", "1,0"), Some(&gpus), &[], None, Some(&hw)).unwrap();
+        assert_eq!(lopsided.level, 3, "{}", lopsided.detail);
+        assert!(lopsided.detail.contains("gives CUDA0 about"), "{}", lopsided.detail);
+        // A GPU without a memory reading is named, not guessed.
+        let unread = crate::devices::parse_list_devices("Available devices:\n  CUDA0: A (60 MiB, 50 MiB free)\n  CUDA1: B\n");
+        assert_eq!(fit_for_load(&on(crate::devices::ALL_GPUS, ""), Some(&unread), &[], None, Some(&hw)).err().unwrap(), "CUDA1 did not report its memory, so there is no estimate for this split.");
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// The VRAM guard sums a split's free memory and, with a ratio, checks
+    /// each GPU's share. A loading split holds memory on each of its GPUs.
+    #[tokio::test]
+    async fn the_vram_guard_sums_a_split_and_checks_each_share() {
+        let base = std::env::temp_dir().join(format!("noullama-split-guard-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let model = base.join("model.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        // About 1.5 GiB estimated, against two cards with 0.75 GiB free each.
+        let on = |device: &str, ratio: &str| Settings { model_path: model.to_string_lossy().into_owned(), gpu_layers: 99, context_size: 65_536, device: device.into(), tensor_split: ratio.into(), ..Settings::default() };
+        let cards = || Some(vec![("CUDA0".to_owned(), 1u64 << 30, 1u64 << 28), ("CUDA1".to_owned(), 1u64 << 30, 1u64 << 28)]);
+        let card = || Some(vec![("CUDA0".to_owned(), 1u64 << 30, 1u64 << 28)]);
+        let no_ram = || panic!("a full GPU load reads no RAM");
+        let none = std::iter::empty();
+        assert!(load_memory_risk_with(&on("CUDA0", ""), none, (None, 0), no_ram, card).await.is_some_and(|r| r.contains("available VRAM.")));
+        assert!(load_memory_risk_with(&on("CUDA0,CUDA1", ""), std::iter::empty(), (None, 0), no_ram, cards).await.is_none());
+        assert!(load_memory_risk_with(&on("CUDA0,CUDA1", "1,1"), std::iter::empty(), (None, 0), no_ram, cards).await.is_none());
+        let lopsided = load_memory_risk_with(&on("CUDA0,CUDA1", "1,0"), std::iter::empty(), (None, 0), no_ram, cards).await;
+        assert!(lopsided.as_deref().is_some_and(|r| r.contains("CUDA0's share")), "{lopsided:?}");
+        // An automatic split counts in aggregate when both of its GPUs are used.
+        *state.settings.lock().await = on("CUDA0,CUDA1", "");
+        let loading = insert_test_instance(&state, &on("CUDA0", "").model_path, false).await;
+        let loaded = state.instances.lock().await.clone();
+        let crowded = load_memory_risk_with(&on("CUDA0,CUDA1", ""), loaded.iter(), (None, 0), no_ram, cards).await;
+        assert!(crowded.as_deref().is_some_and(|r| r.contains("across CUDA0 + CUDA1")), "{crowded:?}");
+        let card1 = || Some(vec![("CUDA1".to_owned(), 2u64 << 30, 0u64)]);
+        assert!(load_memory_risk_with(&on("CUDA1", ""), loaded.iter(), (None, 0), no_ram, card1).await.is_none());
+        assert!(load_memory_risk_with(&on("CUDA2", ""), loaded.iter(), (None, 0), no_ram, card1).await.is_none());
+        let previous = on("CUDA0,CUDA1", "1,3");
+        let mut shares = std::collections::HashMap::new();
+        assert_eq!(gpu_overlap_bytes(&previous, "CUDA0", 1024, &mut shares), 256);
+        assert_eq!(shares, std::collections::HashMap::from([("CUDA0".into(), 256)]));
+        let reloaded = load_memory_risk_with(&on("CUDA0,CUDA1", "0,1"), std::iter::empty(), (Some((&on("CUDA0", ""), 1 << 30)), 0), no_ram, cards).await;
+        assert!(reloaded.as_deref().is_some_and(|reason| reason.contains("CUDA1's share")), "{reloaded:?}");
+        drop((loading, loaded));
+        // A GPU of the split without a reading skips the check and says which.
+        let unread = crate::devices::parse_list_devices("Available devices:\n  CUDA0: Example GPU A (1024 MiB, 768 MiB free)\n  CUDA1: Example GPU B\n");
+        state.instances.lock().await.clear();
+        assert!(load_memory_risk(&state, &on("CUDA0,CUDA1", ""), std::iter::empty(), (None, 0), &unread, true).await.is_none());
+        assert!(state.logs.lock().await.iter().any(|line| line.contains("VRAM preflight unavailable for device CUDA1.")));
         state.shutdown().await;
         remove_once_released(&base).await;
     }

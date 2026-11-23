@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, deviceChoice, enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
+import { apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, ALL_GPUS, CHOOSE_GPUS, chosenGpus, deviceChoice, ratioError, splitLabel, toggleGpu, enablesKeyboardFocus, instancesOf, latestOnly, matchingProbe, settingsGroupMatches, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
 
 const file = '/models/acme/qwen.gguf';
 const first = { id: 'a1', slot: 1, path: file };
@@ -38,17 +38,19 @@ test('the Playground keeps its model through a load unless that model was replac
 
 // As runtime_devices returns a `--list-devices` line.
 const rtx = { name: 'CUDA0', description: 'Example GPU', total_mib: 8192, free_mib: 7168 };
-const second3060 = { name: 'CUDA1', description: 'NVIDIA GeForce RTX 3060', total_mib: 11910, free_mib: 11000 };
+const secondGpu = { name: 'CUDA1', description: 'Second example GPU', total_mib: 11910, free_mib: 11000 };
 
 test('the Device select lists every GPU plus CPU and defaults to the first GPU', () => {
-  const choice = deviceChoice('', [rtx, second3060]);
+  const choice = deviceChoice('', [rtx, secondGpu]);
   assert.deepEqual(choice.options, [
     { value: 'CUDA0', label: 'Example GPU', detail: 'CUDA0 · 8 GB' },
-    { value: 'CUDA1', label: 'NVIDIA GeForce RTX 3060', detail: 'CUDA1 · 12 GB' },
+    { value: 'CUDA1', label: 'Second example GPU', detail: 'CUDA1 · 12 GB' },
+    { value: ALL_GPUS, label: 'All GPUs', detail: 'All GPUs (2) · 20 GB' },
+    { value: CHOOSE_GPUS, label: 'Choose GPUs…', detail: '2 or more' },
     { value: 'CPU', label: 'CPU', detail: 'CPU runtime' },
   ]);
   assert.equal(choice.effective, 'CUDA0');
-  assert.equal(deviceChoice('CUDA1', [rtx, second3060]).effective, 'CUDA1');
+  assert.equal(deviceChoice('CUDA1', [rtx, secondGpu]).effective, 'CUDA1');
   assert.equal(deviceChoice('', []).effective, 'CPU', 'no GPU, or a runtime that cannot list devices, defaults to CPU');
   assert.deepEqual(deviceChoice('', []).options, [{ value: 'CPU', label: 'CPU', detail: 'CPU runtime' }]);
 });
@@ -208,4 +210,69 @@ test('focus rings start only with navigation or control activation', () => {
   for (const modifier of ['altKey', 'ctrlKey', 'metaKey']) {
     assert.equal(enablesKeyboardFocus(key('ArrowLeft', { [modifier]: true }), true), false, modifier);
   }
+});
+
+// Two made-up GPUs as runtime_devices lists them.
+const gpuA = { name: 'CUDA0', description: 'Example GPU A', total_mib: 10240, free_mib: 9000 };
+const gpuB = { name: 'CUDA1', description: 'Example GPU B', total_mib: 24576, free_mib: 23000 };
+const twoGpus = [gpuA, gpuB];
+
+test('the split options appear only with 2 or more GPUs listed', () => {
+  const values = (devices: typeof twoGpus) => deviceChoice('', devices).options.map(o => o.value);
+  assert.deepEqual(values(twoGpus), ['CUDA0', 'CUDA1', ALL_GPUS, CHOOSE_GPUS, 'CPU']);
+  assert.deepEqual(values([gpuA]), ['CUDA0', 'CPU']);
+  assert.equal(deviceChoice('', [gpuA]).canSplit, false);
+});
+
+test('All GPUs and a chosen set resolve to the listed GPUs in listed order', () => {
+  const all = deviceChoice(ALL_GPUS, twoGpus);
+  assert.equal(all.value, ALL_GPUS);
+  assert.equal(all.effective, 'CUDA0,CUDA1', 'compared with the instance device for Reload');
+  assert.deepEqual(all.split?.gpus, ['CUDA0', 'CUDA1']);
+  assert.equal(all.problem, null);
+  const chosen = deviceChoice('CUDA1,CUDA0', twoGpus);
+  assert.equal(chosen.value, CHOOSE_GPUS);
+  assert.equal(chosen.effective, 'CUDA0,CUDA1');
+  // Single devices are unchanged.
+  assert.equal(deviceChoice('CUDA1', twoGpus).split, null);
+  assert.equal(deviceChoice('CUDA1', twoGpus).effective, 'CUDA1');
+});
+
+test('the GPU checks keep a set in listed order, and fewer than 2 block the load', () => {
+  assert.equal(chosenGpus(['CUDA1', 'CUDA0'], twoGpus), 'CUDA0,CUDA1');
+  assert.equal(chosenGpus(['CUDA1'], twoGpus), 'CUDA1,', 'one GPU stays a set');
+  assert.equal(chosenGpus([], twoGpus), ',');
+  assert.equal(toggleGpu('CUDA1,', 'CUDA0', twoGpus), 'CUDA0,CUDA1');
+  assert.equal(toggleGpu('CUDA0,CUDA1', 'CUDA0', twoGpus), 'CUDA1,');
+  const few = deviceChoice('CUDA1,', twoGpus);
+  assert.equal(few.value, CHOOSE_GPUS);
+  assert.equal(few.problem, 'Choose at least 2 GPUs to split a model.');
+});
+
+test('a split is refused, not changed, when its GPUs are not listed', () => {
+  const gone = deviceChoice('CUDA0,CUDA2', twoGpus);
+  assert.equal(gone.missing, true);
+  assert.match(gone.problem ?? '', /^CUDA2 was not found/);
+  assert.deepEqual(gone.split?.gpus, ['CUDA0'], 'CUDA2 is not swapped for CUDA1');
+  const lone = deviceChoice(ALL_GPUS, [gpuA]);
+  assert.match(lone.problem ?? '', /needs at least 2 GPUs, but the llama.cpp build in Runtime reports 1/);
+  assert.deepEqual(lone.options[0], { value: ALL_GPUS, label: 'All GPUs (not available)' });
+  assert.equal(deviceChoice(ALL_GPUS, null).problem, null, 'nothing is refused before the list is read');
+  assert.equal(deviceChoice(ALL_GPUS, null).effective, null);
+});
+
+test('a split is shown by its GPUs or as All GPUs, with the summed memory', () => {
+  assert.equal(splitLabel(['CUDA0', 'CUDA1'], false, twoGpus), 'CUDA0 + CUDA1 · 34 GB');
+  assert.equal(splitLabel(['CUDA0', 'CUDA1'], true, twoGpus), 'All GPUs (2) · 34 GB');
+  assert.equal(splitLabel(['CUDA0', 'CUDA1'], false, [gpuA, { ...gpuB, total_mib: null }]), 'CUDA0 + CUDA1', 'no total without every reading');
+  assert.equal(deviceChoice('CUDA0,CUDA1', twoGpus).split?.label, 'CUDA0 + CUDA1 · 34 GB');
+});
+
+test('the split ratio takes one number of 0 or more per GPU', () => {
+  assert.equal(ratioError('', 2), null, 'empty shares by free memory');
+  assert.equal(ratioError(' 3, 1 ', 2), null);
+  assert.equal(ratioError('0.5,1.5', 2), null);
+  assert.equal(ratioError('3,1,1', 2), 'Split ratio needs one number per GPU: 2 GPUs are in use, but it has 3.');
+  for (const bad of ['3,-1', '3,x', '3,,1', 'Infinity,1', '0x10,1', '1e39,1', '3e38,3e38', '1e-40,1']) assert.equal(ratioError(bad, 2), 'Split ratio takes numbers of 0 or more separated by commas, such as 3,1.', bad);
+  assert.equal(ratioError('0,0', 2), 'Split ratio needs at least one number above 0.');
 });

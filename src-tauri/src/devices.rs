@@ -1,6 +1,12 @@
 // The device each load runs on: one GPU that the GPU runtime (`runtime_path`)
-// reports through `llama-server --list-devices`, or the CPU through the CPU
-// runtime (`cpu_runtime_path`). A model is never split across devices.
+// reports through `llama-server --list-devices`, several of those GPUs with
+// the model split across them, or the CPU through the CPU runtime
+// (`cpu_runtime_path`).
+//
+// A split is saved in `Settings.device` as `gpus:all` (every GPU listed at
+// load time) or as a comma list of names such as `CUDA0,CUDA1`. A load
+// resolves either to the comma list in listed order, and that is what the
+// instance keeps.
 use crate::runtime::{probe_output, resolve_server, runtime_command, AppState, Settings};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -9,7 +15,82 @@ use std::{path::PathBuf, time::Duration};
 /// The `device` value that runs a model on the CPU runtime.
 pub const CPU: &str = "CPU";
 
+/// The `device` value that splits a model across every GPU listed at load time.
+pub const ALL_GPUS: &str = "gpus:all";
+
+/// `split_mode` values: llama.cpp's `--split-mode layer|row`.
+pub const SPLIT_MODES: [&str; 2] = ["layer", "row"];
+
 pub const CPU_RUNTIME_MISSING: &str = "Device CPU needs a CPU runtime. Choose or download one under CPU runtime in Runtime.";
+pub const TOO_FEW_GPUS: &str = "Choose at least 2 GPUs to split a model, or choose one device.";
+pub const BAD_SPLIT_MODE: &str = "Split mode must be Layer or Row.";
+pub const BAD_RATIO: &str = "Split ratio takes numbers of 0 or more separated by commas, such as 3,1.";
+pub const ZERO_RATIO: &str = "Split ratio needs at least one number above 0.";
+
+pub fn all_gpus_too_few(count: usize) -> String {
+    format!("All GPUs needs at least 2 GPUs, but the llama.cpp build in Runtime reports {count}. Choose another device in Local API.")
+}
+
+pub fn ratio_count(gpus: usize, numbers: usize) -> String {
+    format!("Split ratio needs one number per GPU: {gpus} GPUs are in use, but it has {numbers}.")
+}
+
+/// Whether a `device` value splits the model across GPUs (saved or chosen).
+pub fn is_split(device: &str) -> bool {
+    let device = device.trim();
+    device == ALL_GPUS || device.contains(',')
+}
+
+/// The GPU names of a comma list, in its order, without blanks.
+pub fn split_names(device: &str) -> Vec<&str> {
+    device.split(',').map(str::trim).filter(|name| !name.is_empty()).collect()
+}
+
+/// The GPUs a chosen device runs on: none for the CPU, else its names.
+fn gpus_of(device: &str) -> Vec<&str> {
+    if device.trim() == CPU { Vec::new() } else { split_names(device) }
+}
+
+/// Whether two chosen devices have a GPU in common.
+pub fn shares_gpu(a: &str, b: &str) -> bool {
+    let b = gpus_of(b);
+    gpus_of(a).iter().any(|name| b.contains(name))
+}
+
+/// Reads `tensor_split`: `None` when empty (llama.cpp shares by free
+/// memory), else one weight per GPU. `count` is the number of GPUs in use,
+/// or `None` to check only the numbers.
+pub fn parse_ratio(text: &str, count: Option<usize>) -> Result<Option<Vec<f64>>, String> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let weights = text
+        .split(',')
+        .map(|part| part.trim().parse::<f64>().ok().filter(|w| {
+            !w.is_sign_negative() && (*w == 0.0 || (f32::MIN_POSITIVE as f64..=f32::MAX as f64).contains(w))
+        }))
+        .collect::<Option<Vec<f64>>>()
+        .ok_or(BAD_RATIO)?;
+    if weights.iter().sum::<f64>() > f32::MAX as f64 {
+        return Err(BAD_RATIO.into());
+    }
+    if let Some(count) = count.filter(|count| *count != weights.len()) {
+        return Err(ratio_count(count, weights.len()));
+    }
+    if weights.iter().all(|w| *w == 0.0) {
+        return Err(ZERO_RATIO.into());
+    }
+    Ok(Some(weights))
+}
+
+/// The split settings a save checks: the mode, and the ratio's numbers (its
+/// count depends on the GPUs listed at load time).
+pub fn check_split_settings(settings: &Settings) -> Result<(), String> {
+    if !SPLIT_MODES.contains(&settings.split_mode.as_str()) {
+        return Err(BAD_SPLIT_MODE.into());
+    }
+    parse_ratio(&settings.tensor_split, None).map(|_| ())
+}
 
 pub fn not_found(device: &str) -> String {
     format!("Device {device} was not found: the llama.cpp build in Runtime does not report it. Choose another device in Local API.")
@@ -68,9 +149,13 @@ pub fn parse_list_devices(stdout: &str) -> Vec<RuntimeDevice> {
 /// The device a load runs on: the saved `device`, or for an empty one the
 /// first GPU listed, else the CPU. `listed` is `None` when the GPU runtime
 /// could not list its devices. A CPU load needs a CPU runtime; a saved GPU
-/// that is not listed is refused rather than replaced.
+/// that is not listed is refused rather than replaced. A split comes back
+/// as a comma list in listed order, with its mode and ratio checked.
 pub fn choose_device(settings: &Settings, listed: Option<&[RuntimeDevice]>) -> Result<String, String> {
     let saved = settings.device.trim();
+    if is_split(saved) {
+        return choose_split(settings, listed.unwrap_or(&[]));
+    }
     let device = match saved {
         "" => listed.and_then(|l| l.first()).map_or(CPU.to_owned(), |d| d.name.clone()),
         CPU => CPU.to_owned(),
@@ -83,6 +168,51 @@ pub fn choose_device(settings: &Settings, listed: Option<&[RuntimeDevice]>) -> R
         return Err(CPU_RUNTIME_MISSING.into());
     }
     Ok(device)
+}
+
+/// `choose_device` for a saved split: every listed GPU for `gpus:all`, else
+/// the saved names, each of which must still be listed.
+fn choose_split(settings: &Settings, listed: &[RuntimeDevice]) -> Result<String, String> {
+    let saved = settings.device.trim();
+    let names: Vec<&str> = if saved == ALL_GPUS {
+        if listed.len() < 2 {
+            return Err(all_gpus_too_few(listed.len()));
+        }
+        listed.iter().map(|d| d.name.as_str()).collect()
+    } else {
+        let wanted = split_names(saved);
+        if let Some(name) = wanted.iter().find(|name| !listed.iter().any(|d| d.name == **name)) {
+            return Err(not_found(name));
+        }
+        listed.iter().map(|d| d.name.as_str()).filter(|name| wanted.contains(name)).collect()
+    };
+    if names.len() < 2 {
+        return Err(TOO_FEW_GPUS.into());
+    }
+    if !SPLIT_MODES.contains(&settings.split_mode.as_str()) {
+        return Err(BAD_SPLIT_MODE.into());
+    }
+    parse_ratio(&settings.tensor_split, Some(names.len()))?;
+    Ok(names.join(","))
+}
+
+/// How the load panel and the instance card show a chosen device: a GPU
+/// with its description, "CUDA0 + CUDA1" or "All GPUs (2)" for a split
+/// with the GPUs' summed memory, or "CPU". `None` when a GPU is not listed.
+pub fn display(chosen: &str, all_gpus: bool, listed: &[RuntimeDevice]) -> Option<String> {
+    if chosen == CPU {
+        return Some(CPU.to_owned());
+    }
+    let names = split_names(chosen);
+    let gpus = names.iter().map(|name| listed.iter().find(|d| d.name == *name)).collect::<Option<Vec<_>>>()?;
+    if gpus.len() == 1 {
+        return Some(gpus[0].display());
+    }
+    let label = if all_gpus { format!("All GPUs ({})", gpus.len()) } else { names.join(" + ") };
+    Some(match gpus.iter().map(|d| d.total_mib).sum::<Option<u64>>() {
+        Some(mib) => format!("{label} · {} GB", (mib as f64 / 1024.0).round()),
+        None => label,
+    })
 }
 
 /// Whether a load runs on the CPU runtime. Takes settings whose `device` is
@@ -111,10 +241,18 @@ pub fn launch_settings(settings: &Settings) -> Settings {
 }
 
 /// Restricts llama-server to the chosen device: one GPU with no splitting,
-/// or none at all on the CPU.
+/// several GPUs with the saved split mode and ratio (none means llama.cpp
+/// shares by free memory), or none at all on the CPU.
 pub fn device_args(settings: &Settings) -> Vec<String> {
     if on_cpu(settings) {
         vec!["--device".into(), "none".into()]
+    } else if is_split(&settings.device) {
+        let mut args = vec!["--device".into(), split_names(&settings.device).join(","), "--split-mode".into(), settings.split_mode.clone()];
+        if let Ok(Some(weights)) = parse_ratio(&settings.tensor_split, None) {
+            let ratio: Vec<String> = weights.iter().map(ToString::to_string).collect();
+            args.extend(["--tensor-split".into(), ratio.join(",")]);
+        }
+        args
     } else {
         vec!["--device".into(), settings.device.clone(), "--split-mode".into(), "none".into(), "--main-gpu".into(), "0".into()]
     }
@@ -258,5 +396,84 @@ mod tests {
         let one = parse_list_devices(ONE_GPU);
         assert_eq!(choose_device(&settings("CUDA1", "/cpu/llama-server"), Some(&one)).unwrap_err(), "Device CUDA1 was not found: the llama.cpp build in Runtime does not report it. Choose another device in Local API.");
         assert_eq!(choose_device(&settings("CUDA0", "/cpu/llama-server"), None).unwrap_err(), not_found("CUDA0"));
+    }
+
+    /// Two made-up GPUs, as a CUDA build lists them.
+    const TWO_GPUS: &str = "Available devices:\n  CUDA0: Example GPU A (10240 MiB, 9000 MiB free)\n  CUDA1: Example GPU B (24576 MiB, 23000 MiB free)\n";
+
+    fn split(device: &str, mode: &str, ratio: &str) -> Settings {
+        Settings { device: device.into(), split_mode: mode.into(), tensor_split: ratio.into(), ..Settings::default() }
+    }
+
+    #[test]
+    fn a_split_resolves_to_the_listed_gpus_in_listed_order() {
+        let two = parse_list_devices(TWO_GPUS);
+        assert_eq!(choose_device(&split(ALL_GPUS, "layer", ""), Some(&two)).unwrap(), "CUDA0,CUDA1");
+        assert_eq!(choose_device(&split("CUDA1, CUDA0", "row", "3,1"), Some(&two)).unwrap(), "CUDA0,CUDA1");
+        // A split needs no CPU runtime.
+        assert!(split(ALL_GPUS, "layer", "").cpu_runtime_path.is_empty());
+    }
+
+    #[test]
+    fn a_split_is_refused_rather_than_changed() {
+        let two = parse_list_devices(TWO_GPUS);
+        let one = parse_list_devices(ONE_GPU);
+        // Every saved name must still be listed; none is swapped for another.
+        assert_eq!(choose_device(&split("CUDA0,CUDA2", "layer", ""), Some(&two)).unwrap_err(), not_found("CUDA2"));
+        assert_eq!(choose_device(&split("CUDA0,CUDA1", "layer", ""), None).unwrap_err(), not_found("CUDA0"));
+        // Fewer than 2 GPUs chosen, or listed for All GPUs.
+        for few in ["CUDA0,", ",", "CUDA0,CUDA0"] {
+            assert_eq!(choose_device(&split(few, "layer", ""), Some(&two)).unwrap_err(), TOO_FEW_GPUS, "{few}");
+        }
+        assert_eq!(choose_device(&split(ALL_GPUS, "layer", ""), Some(&one)).unwrap_err(), all_gpus_too_few(1));
+        assert_eq!(choose_device(&split(ALL_GPUS, "layer", ""), None).unwrap_err(), all_gpus_too_few(0));
+        // The ratio needs one number per GPU, all 0 or more, not all 0.
+        assert_eq!(choose_device(&split(ALL_GPUS, "layer", "3,1,1"), Some(&two)).unwrap_err(), "Split ratio needs one number per GPU: 2 GPUs are in use, but it has 3.");
+        assert_eq!(choose_device(&split(ALL_GPUS, "layer", "3"), Some(&two)).unwrap_err(), ratio_count(2, 1));
+        for bad in ["3,-1", "3,x", "3,,1", "inf,1", "1e39,1", "3e38,3e38", "1e-40,1"] {
+            assert_eq!(choose_device(&split(ALL_GPUS, "layer", bad), Some(&two)).unwrap_err(), BAD_RATIO, "{bad}");
+        }
+        assert_eq!(choose_device(&split(ALL_GPUS, "layer", "0,0"), Some(&two)).unwrap_err(), ZERO_RATIO);
+        assert_eq!(choose_device(&split(ALL_GPUS, "tensor", ""), Some(&two)).unwrap_err(), BAD_SPLIT_MODE);
+        // A single GPU ignores the split settings.
+        assert_eq!(choose_device(&split("CUDA1", "bogus", "1,2,3"), Some(&two)).unwrap(), "CUDA1");
+    }
+
+    #[test]
+    fn split_arguments_name_every_gpu_and_never_a_main_gpu() {
+        let args = device_args(&split("CUDA0,CUDA1", "layer", ""));
+        assert_eq!(args, ["--device", "CUDA0,CUDA1", "--split-mode", "layer"]);
+        let args = device_args(&split("CUDA0,CUDA1", "row", " 3, 1 "));
+        assert_eq!(args, ["--device", "CUDA0,CUDA1", "--split-mode", "row", "--tensor-split", "3,1"]);
+        let args = device_args(&split("CUDA0,CUDA1", "row", "1e-999,1"));
+        assert_eq!(args, ["--device", "CUDA0,CUDA1", "--split-mode", "row", "--tensor-split", "0,1"]);
+        // One GPU and the CPU launch exactly as before, whatever the split settings say.
+        assert_eq!(device_args(&split("CUDA1", "row", "3,1")), ["--device", "CUDA1", "--split-mode", "none", "--main-gpu", "0"]);
+        assert_eq!(device_args(&split(CPU, "row", "3,1")), ["--device", "none"]);
+        let old: Settings = serde_json::from_str(r#"{"device":"CUDA1"}"#).unwrap();
+        assert_eq!(old.split_mode, "layer");
+        assert!(old.tensor_split.is_empty());
+        assert_eq!(device_args(&old), device_args(&split("CUDA1", "row", "3,1")));
+    }
+
+    #[test]
+    fn a_split_is_shown_by_its_gpus_with_their_summed_memory() {
+        let two = parse_list_devices(TWO_GPUS);
+        assert_eq!(display("CUDA0,CUDA1", false, &two).unwrap(), "CUDA0 + CUDA1 · 34 GB");
+        assert_eq!(display("CUDA0,CUDA1", true, &two).unwrap(), "All GPUs (2) · 34 GB");
+        assert_eq!(display("CUDA1", false, &two).unwrap(), "CUDA1 · Example GPU B");
+        assert_eq!(display(CPU, false, &[]).unwrap(), "CPU");
+        assert!(display("CUDA0,CUDA2", false, &two).is_none());
+        let unread = parse_list_devices("Available devices:\n  CUDA0: A\n  CUDA1: B (1024 MiB, 1000 MiB free)\n");
+        assert_eq!(display("CUDA0,CUDA1", false, &unread).unwrap(), "CUDA0 + CUDA1");
+    }
+
+    #[test]
+    fn devices_share_a_gpu_when_any_name_is_in_both() {
+        assert!(shares_gpu("CUDA0", "CUDA0"));
+        assert!(shares_gpu("CUDA0,CUDA1", "CUDA1"));
+        assert!(!shares_gpu("CUDA0", "CUDA1"));
+        assert!(!shares_gpu(CPU, CPU));
+        assert!(!shares_gpu("CUDA0,CUDA1", CPU));
     }
 }

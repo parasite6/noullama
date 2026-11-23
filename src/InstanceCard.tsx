@@ -14,7 +14,7 @@ export type CardInstance = {
   instance_aliases: string[];
   projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null;
   context_size: number; gpu_layers: number;
-  // settings.device: the device it was loaded on ("CPU" or a name such as CUDA0); `device` is how it is shown.
+  // settings.device: the device it was loaded on ("CPU", a name such as CUDA0, or a split such as CUDA0,CUDA1); `device` is how it is shown ("All GPUs (2) · 34 GB").
   settings: { decision_mode: string; device: string };
   // This instance's own Keep context switch and history counts.
   keep_context: boolean; context: { entries: number; last_flushed: number };

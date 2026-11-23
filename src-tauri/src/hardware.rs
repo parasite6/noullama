@@ -81,6 +81,69 @@ pub fn fit_beside(path: &str, extras: &[&str], context_size: u32, gpu_layers: i3
     fit_model_bytes(bytes, context_size, gpu_layers, &hardware).ok_or(NO_SYSTEM_MEMORY)
 }
 
+/// A split with a fixed ratio: each GPU in `gpus` (name, total bytes) takes
+/// its `weights` share of the estimate. When one share does not fit that
+/// GPU's graphics memory, the fit is rated no better than "Strained" and
+/// says which GPU. The summed memory alone cannot show this.
+pub fn check_shares(mut fit: Fit, gpus: &[(String, u64)], weights: &[f64]) -> Fit {
+    let sum: f64 = weights.iter().sum();
+    if fit.level >= 3 || sum <= 0.0 {
+        return fit;
+    }
+    for ((name, total), weight) in gpus.iter().zip(weights) {
+        let share = (fit.required_bytes as f64 * weight / sum) as u64;
+        let room = (*total as f64 * 0.9) as u64;
+        if share > room {
+            fit.level = 3;
+            fit.label = "Strained";
+            fit.detail = format!("About {} needed, but this split ratio gives {name} about {}, more than its {} of graphics memory.", gb(fit.required_bytes), gb(share), gb(room));
+            break;
+        }
+    }
+    fit
+}
+
+/// Why a full GPU load clearly does not fit, or `None`. `gpus` are the
+/// `(name, total, used)` readings of the GPUs it runs on: one, or each GPU
+/// of a split, whose free memory is summed. `freed` is memory an instance
+/// being replaced holds there now and `reserved` what still-loading
+/// instances will take. With a split ratio (`weights`), each GPU must also
+/// hold its share. The maps contain only credits and reservations whose
+/// placement is known, by device name.
+pub fn gpu_shortfall(
+    required: u64, gpus: &[(String, u64, u64)], freed: u64, reserved: u64, weights: Option<&[f64]>,
+    gpu_freed: &std::collections::HashMap<String, u64>, gpu_reserved: &std::collections::HashMap<String, u64>,
+) -> Option<String> {
+    let gib = |bytes: u64| bytes as f64 / 1073741824.;
+    let total: u64 = gpus.iter().map(|(_, total, _)| total).sum();
+    let credit = |name: &str| gpu_freed.get(name).copied().unwrap_or_default();
+    let free: u64 = gpus.iter().map(|(name, total, used)| total.saturating_sub(used.saturating_sub(credit(name)))).sum();
+    let unplaced_credit = freed.saturating_sub(gpu_freed.values().copied().sum());
+    let available = free.saturating_add(unplaced_credit).min(total).saturating_sub(reserved);
+    if crate::oom::clearly_exceeds(required, available) {
+        let across = if gpus.len() > 1 {
+            format!(" across {}", gpus.iter().map(|(name, ..)| name.as_str()).collect::<Vec<_>>().join(" + "))
+        } else {
+            String::new()
+        };
+        return Some(format!("Estimated GPU allocation {:.1} GiB clearly exceeds {:.1} GiB available VRAM{across}.", gib(required), gib(available)));
+    }
+    let weights = weights.filter(|w| w.len() == gpus.len())?;
+    let sum: f64 = weights.iter().sum();
+    if sum <= 0.0 {
+        return None;
+    }
+    for ((name, total, used), weight) in gpus.iter().zip(weights) {
+        let part = |bytes: u64| (bytes as f64 * weight / sum) as u64;
+        let available = total.saturating_sub(used.saturating_sub(credit(name)))
+            .saturating_sub(gpu_reserved.get(name).copied().unwrap_or_default());
+        if crate::oom::clearly_exceeds(part(required), available) {
+            return Some(format!("With this split ratio, {name}'s share of the estimated GPU allocation, {:.1} GiB, clearly exceeds its {:.1} GiB available VRAM.", gib(part(required)), gib(available)));
+        }
+    }
+    None
+}
+
 #[derive(Serialize, Default, Debug, PartialEq)]
 pub struct MemoryUse {
     /// Graphics memory held by all the runtime processes (NVIDIA only).
