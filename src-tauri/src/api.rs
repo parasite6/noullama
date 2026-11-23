@@ -1125,6 +1125,7 @@ pub(crate) mod tests {
             {
                 let mut settings = state.settings.lock().await;
                 settings.runtime_path = std::env::var("NOULLAMA_TEST_RUNTIME").unwrap_or_default();
+                settings.cpu_runtime_path = settings.runtime_path.clone();
                 settings.model_path = std::env::var(model).unwrap_or_else(|_| panic!("Set {model}"));
                 settings.gpu_layers = env_layers(layers);
                 settings.context_size = 2048;
@@ -1189,6 +1190,7 @@ pub(crate) mod tests {
         {
             let mut settings = state.settings.lock().await;
             settings.runtime_path = runtime;
+            settings.cpu_runtime_path = settings.runtime_path.clone();
             settings.model_path = model;
             settings.gpu_layers = std::env::var("NOULLAMA_TEST_GPU_LAYERS")
                 .ok()

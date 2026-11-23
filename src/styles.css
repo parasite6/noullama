@@ -614,6 +614,9 @@ label small { font-weight: 400; line-height: 1.6; }
    open menu shows it whole. */
 .load-instance { flex: 0 1 300px; min-width: 180px; margin-left: auto; }
 .load-instance .select-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The load panel's Device select: wide enough for "CUDA0 · <GPU name> (8 GB)". */
+.load-device { flex: 0 1 380px; min-width: 160px; }
+.load-device .select-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .instance-card .model-aliases { padding-left: 46px; }
 /* An instance's own Keep context switch, Clear and status */
 .instance-keep { padding-left: 46px; }

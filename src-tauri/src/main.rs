@@ -4,6 +4,7 @@ mod library;
 mod desktop;
 mod files;
 mod decision;
+mod devices;
 mod gguf;
 mod hardware;
 mod oom;
@@ -65,6 +66,8 @@ fn main() {
             runtimes::discover_runtimes,
             runtimes::runtime_releases,
             runtimes::download_runtimes,
+            runtimes::download_cpu_runtime,
+            devices::runtime_devices,
             runtime::snapshot,
             runtime::save_settings,
             runtime::probe_runtime,
@@ -82,6 +85,7 @@ fn main() {
             library::set_sha256_check,
             runtime::set_memory_preference,
             runtime::crowded_load_warning,
+            runtime::load_fit,
             runtime::dismiss_load_error,
             runtime::set_instance_suffix,
             runtime::set_fall_through,

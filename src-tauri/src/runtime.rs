@@ -32,6 +32,13 @@ pub struct Settings {
     pub decision_mode: String,
     pub context_size: u32,
     pub gpu_layers: i32,
+    // Where a load runs: "" (the first GPU the GPU runtime lists, else the
+    // CPU), "CPU", or a llama.cpp device name such as "CUDA0". Saved by the
+    // Local API load panel. See devices.rs.
+    pub device: String,
+    // The llama-server for loads on the CPU; resolved like `runtime_path`.
+    // Saved by the Runtime tab.
+    pub cpu_runtime_path: String,
     pub api_port: u16,
     pub runtime_port: u16,
     pub hf_path: String,
@@ -75,6 +82,8 @@ impl Default for Settings {
             decision_mode: "auto".into(),
             context_size: 8192,
             gpu_layers: 99,
+            device: String::new(),
+            cpu_runtime_path: String::new(),
             api_port: 11435,
             runtime_port: 11436,
             hf_path: "hf".into(),
@@ -130,6 +139,8 @@ pub struct AppState {
     /// Wakes `any-available` requests waiting for an instance: one when a
     /// request finishes or an instance becomes ready, all when one unloads.
     pub instance_freed: Arc<tokio::sync::Notify>,
+    /// The GPU runtime's `--list-devices`, until the runtime changes.
+    pub devices: Arc<Mutex<crate::devices::DeviceCache>>,
 }
 
 // A launch owns its credentials until all its requests and polling tasks finish.
@@ -639,6 +650,7 @@ impl AppState {
             instances_added: Default::default(),
             request_seq: Default::default(),
             instance_freed: Default::default(),
+            devices: Default::default(),
             local_client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(120))
@@ -1145,7 +1157,7 @@ fn has_cuda_runtime(directory: &Path) -> bool {
     })
 }
 
-fn runtime_command(settings: &Settings) -> Command {
+pub(crate) fn runtime_command(settings: &Settings) -> Command {
     let binary = server_binary(&settings.runtime_path);
     let mut command = Command::new(&binary);
     if let Ok(paths) = std::env::join_paths(runtime_library_dirs(settings, &binary)) {
@@ -1196,19 +1208,11 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let routes = state.routes().await;
     let library = crate::library::snapshot(state).await;
     let mut loaded = Vec::new();
-    let mut taken = Vec::new();
-    // The fit leaves out one instance of the selected file: the one a reload replaces.
-    let replaced = instances.iter().find(|i| i.path() == settings.model_path).map(|i| i.id.clone());
     for instance in &instances {
         let model = instance.model();
         let history = instance.context.lock().await;
         let extras = instance_extras(&instance.settings);
         let required = crate::hardware::estimate_bytes(instance.path(), &extras, instance.settings.context_size);
-        if Some(&instance.id) != replaced.as_ref() {
-            if let Some(bytes) = required {
-                taken.push((bytes, instance.settings.gpu_layers != 0));
-            }
-        }
         let (name, _) = state.api_names(instance.path()).await;
         let api_names: Vec<&str> = routes.iter().filter(|r| r.instance.as_deref() == Some(&instance.id) && !r.fallthrough).map(|r| r.name.as_str()).collect();
         loaded.push(json!({
@@ -1219,7 +1223,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
             "projector": model.projector, "mmproj_path": instance.settings.mmproj_path,
             "mtp": model.mtp, "mtp_path": instance.settings.mtp_path, "layout": model.layout,
             "ready": instance.is_ready(), "context_size": instance.settings.context_size,
-            "gpu_layers": instance.settings.gpu_layers, "required_bytes": required,
+            "gpu_layers": crate::devices::gpu_layers(&instance.settings), "required_bytes": required,
             "context": {"entries": history.len(), "last_flushed": history.last_flushed}, "keep_context": instance.keeps_context(),
             "settings": instance.settings,
         }));
@@ -1232,23 +1236,17 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let api_notice = state.api_notice.lock().await.clone();
     let load_errors = state.load_errors.lock().await.clone();
     let runtime_download = state.runtimes.progress.lock().await.clone();
+    let cpu_runtime_download = state.runtimes.cpu_progress.lock().await.clone();
     // The probe runs in the background from startup; until it finishes the
     // snapshot reports no hardware rather than waiting on nvidia-smi.
+    // The load panel's fit comes from `load_fit`, for its unsaved values.
     let hardware = crate::hardware::cached();
-    // The selected model's fit, beside the memory other loaded models hold.
-    let fit = crate::hardware::fit_beside(
-        &settings.model_path,
-        &instance_extras(&settings).iter().map(String::as_str).collect::<Vec<_>>(),
-        settings.context_size,
-        settings.gpu_layers,
-        &taken,
-    );
     Ok(
         json!({"settings": settings, "running": running, "ready": ready,
         "instances": loaded, "default_model": default.map(|i| i.id.clone()), "routes": routes, "library": library,
         "logs": logs, "downloads": downloads, "loaded_model": loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
-        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_errors": load_errors, "runtime_download": runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware, "fit": fit,
+        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_errors": load_errors, "runtime_download": runtime_download, "cpu_runtime_download": cpu_runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware,
         "model_missing": !settings.model_path.is_empty() && !Path::new(&settings.model_path).is_file()}),
     )
 }
@@ -1290,25 +1288,102 @@ const SERVER_OWNED: [&str; 7] = [
 /// Applies a form's changed fields over the saved settings.
 pub async fn save_from_editor(state: &AppState, changes: serde_json::Map<String, Value>) -> Result<(), String> {
     update_settings(state, |settings| {
-        let Value::Object(mut merged) = serde_json::to_value(&*settings).map_err(|e| e.to_string())? else {
-            return Err("Settings are not an object.".into());
-        };
-        let known: Vec<String> = merged.keys().cloned().collect();
-        for (key, value) in changes {
-            if SERVER_OWNED.contains(&key.as_str()) {
-                continue;
-            }
-            if !known.contains(&key) {
-                return Err(format!("Unknown setting \"{key}\"."));
-            }
-            merged.insert(key, value);
-        }
-        let routes = std::mem::take(&mut settings.model_routes);
-        *settings = serde_json::from_value(Value::Object(merged)).map_err(|e| format!("Invalid settings: {e}"))?;
-        settings.model_routes = routes;
+        *settings = with_changes(settings, changes)?;
         Ok(())
     })
     .await
+}
+
+/// `settings` with a form's changed fields applied, as a save would store them.
+fn with_changes(settings: &Settings, changes: serde_json::Map<String, Value>) -> Result<Settings, String> {
+    let mut base = settings.clone();
+    let routes = std::mem::take(&mut base.model_routes);
+    let Value::Object(mut merged) = serde_json::to_value(&base).map_err(|e| e.to_string())? else {
+        return Err("Settings are not an object.".into());
+    };
+    let known: Vec<String> = merged.keys().cloned().collect();
+    for (key, value) in changes {
+        if SERVER_OWNED.contains(&key.as_str()) {
+            continue;
+        }
+        if !known.contains(&key) {
+            return Err(format!("Unknown setting \"{key}\"."));
+        }
+        merged.insert(key, value);
+    }
+    let mut next: Settings = serde_json::from_value(Value::Object(merged)).map_err(|e| format!("Invalid settings: {e}"))?;
+    next.model_routes = routes;
+    Ok(next)
+}
+
+/// The load panel's fit badge for its current, possibly unsaved, values
+/// (`settings`, load panel fields only; the build and shared-library folders
+/// are the saved ones, as a load uses). `replace` is the instance a reload
+/// would replace; a fresh load passes none.
+#[tauri::command]
+pub async fn load_fit(settings: serde_json::Map<String, Value>, replace: Option<String>, state: tauri::State<'_, AppState>) -> Result<Value, String> {
+    load_fit_in(state.inner(), settings, replace.as_deref(), crate::hardware::cached()).await
+}
+
+/// `load_fit` with the hardware passed in. The device comes from the same
+/// listing and rule a load uses (`listed_for`, `choose_device`).
+pub async fn load_fit_in(state: &AppState, changes: serde_json::Map<String, Value>, replace: Option<&str>, hardware: Option<&crate::hardware::Hardware>) -> Result<Value, String> {
+    let candidate = with_changes(&state.settings.lock().await.clone(), changes)?;
+    let listed = crate::devices::listed_for(state, &candidate).await;
+    let instances = state.instances.lock().await.clone();
+    let (fit, counted) = fit_for_load(&candidate, listed.as_deref(), &instances, replace, hardware)?;
+    Ok(json!({ "fit": fit, "others": counted }))
+}
+
+/// How a load with `candidate` would fit, beside the loaded `instances`
+/// other than `replace`. Returns the fit and how many instances it set
+/// memory aside for: those on the CPU for a CPU load; on a GPU load, those on
+/// the same GPU plus those on the CPU (graphics memory of other GPUs does not
+/// matter to it). The reason is returned when there is no estimate.
+fn fit_for_load(
+    candidate: &Settings,
+    listed: Option<&[crate::devices::RuntimeDevice]>,
+    instances: &[Arc<Instance>],
+    replace: Option<&str>,
+    hardware: Option<&crate::hardware::Hardware>,
+) -> Result<(crate::hardware::Fit, usize), String> {
+    if candidate.model_path.trim().is_empty() {
+        return Err("Select a model to see how it would run on this machine.".into());
+    }
+    if crate::hardware::estimate_bytes(&candidate.model_path, &[] as &[&str], 0).is_none() {
+        return Err(crate::hardware::MODEL_UNREADABLE.into());
+    }
+    let mut settings = candidate.clone();
+    settings.device = crate::devices::choose_device(&settings, listed)?;
+    let hardware = hardware.ok_or("Memory detection is still running. The estimate appears when it finishes.")?;
+    let gpu_layers = crate::devices::gpu_layers(&settings);
+    let on_gpu = gpu_layers != 0;
+    let mut hardware = hardware.clone();
+    if on_gpu {
+        // That GPU's own memory as the runtime reports it; the machine-wide probe otherwise.
+        let total = listed.and_then(|l| l.iter().find(|d| d.name == settings.device)).and_then(|d| d.total_mib);
+        if let Some(mib) = total {
+            hardware.vram_bytes = Some(mib * 1024 * 1024);
+        }
+    } else {
+        hardware.vram_bytes = None;
+    }
+    let taken: Vec<(u64, bool)> = instances
+        .iter()
+        .filter(|i| Some(i.id.as_str()) != replace)
+        .filter_map(|i| {
+            let other_gpu = crate::devices::gpu_layers(&i.settings) != 0;
+            if other_gpu && !(on_gpu && i.settings.device == settings.device) {
+                return None;
+            }
+            let bytes = crate::hardware::estimate_bytes(i.path(), &instance_extras(&i.settings), i.settings.context_size)?;
+            Some((bytes, other_gpu))
+        })
+        .collect();
+    let extras = instance_extras(&settings);
+    let extras: Vec<&str> = extras.iter().map(String::as_str).collect();
+    let fit = crate::hardware::fit_beside(&settings.model_path, &extras, settings.context_size, gpu_layers, &hardware, &taken)?;
+    Ok((fit, taken.len()))
 }
 
 /// Trims, checks and de-duplicates one model's aliases for the local API.
@@ -1459,11 +1534,15 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
     if Path::new(&selected).is_file() {
         crate::library::ensure(state, &[selected]).await;
     }
+    // Listing the GPU runtime's devices can take seconds, so it runs before
+    // the lifecycle lock (usually from the cache the load panel filled).
+    let listed_with = state.settings.lock().await.clone();
+    let mut listed = crate::devices::listed_for(state, &listed_with).await;
     let _guard = state.lifecycle.lock().await;
     if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("Noullama is shutting down.".into());
     }
-    let settings = state.settings.lock().await.clone();
+    let mut settings = state.settings.lock().await.clone();
     if !Path::new(&settings.model_path).is_file()
         || !settings.model_path.to_lowercase().ends_with(".gguf")
     {
@@ -1494,14 +1573,22 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
             return Err("This model has no built-in MTP layers. Choose an mtp- head file in Local API, or turn MTP off.".into());
         }
     }
+    let unchanged = |a: &Settings, b: &Settings| (&a.runtime_path, &a.library_path, &a.device) == (&b.runtime_path, &b.library_path, &b.device);
+    if !unchanged(&settings, &listed_with) {
+        listed = crate::devices::listed_for(state, &settings).await;
+    }
+    // The instance keeps the device it was loaded on, never the empty default.
+    settings.device = crate::devices::choose_device(&settings, listed.as_deref())?;
+    let devices = listed.unwrap_or_default();
+    let device = devices.iter().find(|d| d.name == settings.device).map_or(settings.device.clone(), |d| d.display());
     let loaded = state.instances.lock().await.clone();
-    if let Some(reason) = load_memory_risk(&settings, loaded.iter(), (0, 0)).await {
+    if let Some(reason) = load_memory_risk(&settings, loaded.iter(), (0, 0), &devices).await {
         return Err(format!("OOM prevention: {reason} Eject another model, reduce context or GPU offload, or enable Allow force fit in Settings."));
     }
     let port = free_runtime_port(state, &settings, &loaded)?;
     let (slot, label) = slot_and_label(&loaded, &settings.model_path, slot);
     let session = RuntimeSession::new(&state.data_dir, port)?;
-    let instance = Arc::new(new_instance(settings, slot, label, session));
+    let instance = Arc::new(new_instance(settings, slot, label, session, device));
     state.load_errors.lock().await.retain(|e| !(e.path == instance.path() && e.slot == instance.slot));
     state.instances.lock().await.push(instance.clone());
     state.instances_added.notify_one();
@@ -1535,7 +1622,8 @@ pub async fn load_model_in(state: &AppState, slot: Option<u32>) -> Result<String
 
 /// A new, still loading instance in `slot`: the slot's default suffix, no
 /// instance aliases, and Keep context from the `keep_context` setting.
-fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<RuntimeSession>) -> Instance {
+/// `settings.device` is the chosen device; `device` is how it is shown.
+fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<RuntimeSession>, device: String) -> Instance {
     Instance {
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_owned(),
         label,
@@ -1543,8 +1631,8 @@ fn new_instance(settings: Settings, slot: u32, label: String, session: Arc<Runti
         suffix: std::sync::Mutex::new(default_suffix(slot)),
         model: std::sync::Mutex::new(LoadedModel {
             path: settings.model_path.clone(),
-            device: String::new(),
-            runtime_path: settings.runtime_path.clone(),
+            device,
+            runtime_path: crate::devices::launch_settings(&settings).runtime_path,
             projector: !settings.mmproj_path.is_empty(),
             mtp: settings.mtp,
             layout: None,
@@ -1639,6 +1727,16 @@ async fn is_registered(state: &AppState, instance: &Arc<Instance>) -> bool {
     state.instances.lock().await.iter().any(|i| Arc::ptr_eq(i, instance))
 }
 
+/// The process a load starts: the runtime for its device (the CPU runtime
+/// with no GPU layers for "CPU"), its library folders, the launch arguments
+/// and the flags that keep it on that one device.
+fn launch_command(settings: &Settings, session: &RuntimeSession) -> Command {
+    let launch = crate::devices::launch_settings(settings);
+    let mut command = runtime_command(&launch);
+    command.args(runtime_args(&launch, session)).args(crate::devices::device_args(settings));
+    command
+}
+
 fn runtime_args(settings: &Settings, session: &RuntimeSession) -> Vec<String> {
     let mut args = vec![
         "--model".into(),
@@ -1691,48 +1789,17 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
     let reservation = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, session.port))
         .await
         .map_err(|e| format!("Private runtime port is unavailable: {e}"))?;
-    resolve_server(&settings.runtime_path)?;
-    let devices = tokio::time::timeout(
-        Duration::from_secs(15),
-        runtime_command(settings)
-            .kill_on_drop(true)
-            .arg("--list-devices")
-            .output(),
-    )
-    .await
-    .map_err(|_| "GPU detection timed out")?
-    .map_err(|e| format!("Cannot detect runtime devices: {e}"))?;
-    if !devices.status.success() {
-        return Err(
-            "Runtime device detection failed. Check the runtime path and shared libraries.".into(),
-        );
-    }
-    let devices = format!(
-        "{}{}",
-        String::from_utf8_lossy(&devices.stdout),
-        String::from_utf8_lossy(&devices.stderr)
-    );
-    let gpu = devices
-        .lines()
-        .find(|line| {
-            ["CUDA", "Vulkan", "Metal", "ROCm", "SYCL"]
-                .iter()
-                .any(|prefix| line.trim_start().starts_with(prefix))
-        })
-        .map(|line| {
-            line.trim()
-                .split(" (")
-                .next()
-                .unwrap_or(line.trim())
-                .to_owned()
-        });
-    if settings.gpu_layers != 0 && gpu.is_none() {
-        return Err("No GPU backend detected by this runtime. Set the CUDA/shared-library path in Runtime, use a compatible GPU build, or choose GPU layers = 0 for CPU inference.".into());
-    }
-    let device = if settings.gpu_layers == 0 {
-        "CPU".to_owned()
+    // Detect devices with the runtime this load launches: the GPU runtime
+    // must still list the chosen GPU; the CPU runtime only has to run.
+    let devices = crate::devices::list_devices(&crate::devices::launch_settings(settings)).await?;
+    let device = if crate::devices::on_cpu(settings) {
+        crate::devices::CPU.to_owned()
     } else {
-        gpu.unwrap_or_default()
+        devices
+            .iter()
+            .find(|d| d.name == settings.device)
+            .map(crate::devices::RuntimeDevice::display)
+            .ok_or_else(|| crate::devices::not_found(&settings.device))?
     };
     {
         let _guard = state.lifecycle.lock().await;
@@ -1743,12 +1810,11 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
         live_settings.allow_force_fit = state.settings.lock().await.allow_force_fit;
         let loaded = state.instances.lock().await.clone();
         let others = loaded.iter().filter(|other| other.id != instance.id);
-        if let Some(reason) = load_memory_risk(&live_settings, others, (0, 0)).await {
+        if let Some(reason) = load_memory_risk(&live_settings, others, (0, 0), &devices).await {
             return Err(format!("OOM prevention: {reason}"));
         }
         drop(reservation);
-        let mut child = runtime_command(settings)
-            .args(runtime_args(settings, session))
+        let mut child = launch_command(settings, session)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -1756,7 +1822,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
             .map_err(|e| {
                 format!(
                     "Could not start {}: {e}",
-                    server_binary(&settings.runtime_path).display()
+                    server_binary(&crate::devices::launch_settings(settings).runtime_path).display()
                 )
             })?;
         for pipe in [
@@ -2131,31 +2197,48 @@ pub async fn set_memory_pref(state: &AppState, key: &str, value: bool) -> Result
 
 /// `freed_vram` and `freed_ram`: memory a loaded instance being replaced
 /// holds now, counted as available because it is unloaded before the load.
+/// `settings.device` is the chosen device; `devices` is the GPU runtime's
+/// list, used to find that GPU's own nvidia-smi reading.
 async fn load_memory_risk<'a>(
     settings: &Settings,
     loaded: impl Iterator<Item = &'a Arc<Instance>>,
     freed: (u64, u64),
+    devices: &[crate::devices::RuntimeDevice],
 ) -> Option<String> {
-    load_memory_risk_with_ram(settings, loaded, freed, || crate::oom::memory().map(|m| m.available)).await
+    let (device, devices) = (settings.device.clone(), devices.to_vec());
+    load_memory_risk_with(settings, loaded, freed, || crate::oom::memory().map(|m| m.available), move || {
+        crate::hardware::device_memory(&device, &devices)
+    })
+    .await
 }
 
-async fn load_memory_risk_with_ram<'a>(
+/// `load_memory_risk` with the readings passed in: `available_ram`, and
+/// `vram` as `(total, used)` of the GPU this load is on. Each is read only
+/// when the check needs it.
+async fn load_memory_risk_with<'a>(
     settings: &Settings,
     loaded: impl Iterator<Item = &'a Arc<Instance>>,
     (freed_vram, freed_ram): (u64, u64),
-    available_ram: fn() -> Option<u64>,
+    available_ram: impl FnOnce() -> Option<u64> + Send + 'static,
+    vram: impl FnOnce() -> Option<(u64, u64)> + Send + 'static,
 ) -> Option<String> {
     if settings.allow_force_fit { return None; }
     let required = crate::hardware::estimate_bytes(&settings.model_path, &instance_extras(settings), settings.context_size)?;
-    let gpu_layers = settings.gpu_layers;
+    let gpu_layers = crate::devices::gpu_layers(settings);
+    // Still-loading instances are not in the live readings yet. Graphics
+    // memory is per GPU, so only those on this load's device count there;
+    // system memory is shared by every CPU-side load.
     let reserved = loaded
-        .filter(|other| !other.is_ready() && (other.settings.gpu_layers == 0) == (gpu_layers == 0))
+        .filter(|other| !other.is_ready())
+        .filter(|other| {
+            let other_gpu = crate::devices::gpu_layers(&other.settings) != 0;
+            other_gpu == (gpu_layers != 0) && (gpu_layers == 0 || other.settings.device == settings.device)
+        })
         .filter_map(|other| crate::hardware::estimate_bytes(other.path(), &instance_extras(&other.settings), other.settings.context_size))
         .fold(0u64, u64::saturating_add);
     tokio::task::spawn_blocking(move || {
         if gpu_layers != 0 {
-            let gpu = crate::hardware::memory_use(&[]);
-            if let (Some(total), Some(used)) = (gpu.total_bytes, gpu.used_bytes) {
+            if let Some((total, used)) = vram() {
                 let available = total.saturating_sub(used).saturating_add(freed_vram).min(total).saturating_sub(reserved);
                 if (gpu_layers == -1 || gpu_layers >= 99) && crate::oom::clearly_exceeds(required, available) {
                     return Some(format!("Estimated GPU allocation {:.1} GiB clearly exceeds {:.1} GiB available VRAM.", required as f64 / 1073741824., available as f64 / 1073741824.));
@@ -2178,8 +2261,18 @@ async fn load_memory_risk_with_ram<'a>(
 
 #[tauri::command]
 pub async fn crowded_load_warning(replace: Option<String>, state: tauri::State<'_, AppState>) -> Result<Option<Value>, String> {
-    let settings = state.settings.lock().await.clone();
+    crowded_warning_in(state.inner(), replace).await
+}
+
+/// `crowded_load_warning`. A device the load would refuse (no CPU runtime, a
+/// device that is not listed) is an error here, even with the warning hidden
+/// or force fit on, so a reload stops before it ejects the instance it replaces.
+pub async fn crowded_warning_in(state: &AppState, replace: Option<String>) -> Result<Option<Value>, String> {
+    let mut settings = state.settings.lock().await.clone();
+    let listed = crate::devices::listed_for(state, &settings).await;
+    settings.device = crate::devices::choose_device(&settings, listed.as_deref())?;
     if settings.hide_crowded_load_warning || settings.allow_force_fit { return Ok(None); }
+    let on_gpu = crate::devices::gpu_layers(&settings) != 0;
     let loaded = state.instances.lock().await.clone();
     // A reload unloads `replace` first, so it is neither another model nor
     // memory in use.
@@ -2190,23 +2283,27 @@ pub async fn crowded_load_warning(replace: Option<String>, state: tauri::State<'
     if let Some(instance) = replaced.filter(|instance| instance.is_ready()) {
         let pid = instance.child.lock().await.as_ref().and_then(Child::id);
         let estimate = crate::hardware::estimate_bytes(instance.path(), &instance_extras(&instance.settings), instance.settings.context_size).unwrap_or(0);
-        if instance.settings.gpu_layers != 0 {
+        if crate::devices::gpu_layers(&instance.settings) == 0 {
+            freed_ram = pid.and_then(crate::oom::resident_bytes).unwrap_or(estimate);
+        } else if instance.settings.device == settings.device {
+            // Its graphics memory only helps a load on the same GPU.
             // Per-process readings exist on NVIDIA only; otherwise use the estimate.
             let measured = match pid {
                 Some(pid) => tokio::task::spawn_blocking(move || crate::hardware::memory_use(&[pid])).await.ok().and_then(|u| u.processes.first().copied().flatten()),
                 None => None,
             };
             freed_vram = measured.unwrap_or(estimate);
-        } else {
-            freed_ram = pid.and_then(crate::oom::resident_bytes).unwrap_or(estimate);
         }
     }
+    // Ejecting a model on another GPU frees nothing on this one, so a GPU
+    // load offers only the models on its own device.
     let mut names = Vec::new();
-    for instance in &others {
+    for instance in others.iter().filter(|i| !on_gpu || i.settings.device == settings.device) {
         let (name, _) = state.api_names(instance.path()).await;
         names.push(json!({"id": instance.id, "name": format!("{name}{}", instance.suffix())}));
     }
-    Ok(load_memory_risk(&settings, others.into_iter(), (freed_vram, freed_ram)).await.map(|reason| json!({ "reason": reason, "models": names })))
+    let devices = listed.unwrap_or_default();
+    Ok(load_memory_risk(&settings, others.into_iter(), (freed_vram, freed_ram), &devices).await.map(|reason| json!({ "reason": reason, "models": names })))
 }
 
 /// Supervises loaded models once a second: notices runtimes that exited and
@@ -2278,12 +2375,9 @@ pub async fn insert_test_instance_on(state: &AppState, path: &str, ready: bool, 
     let settings = Settings { model_path: path.into(), ..state.settings.lock().await.clone() };
     let loaded = state.instances.lock().await.clone();
     let (slot, label) = slot_and_label(&loaded, path, None);
-    let instance = Arc::new(new_instance(settings, slot, label, RuntimeSession::new(&state.data_dir, port).unwrap()));
-    {
-        let mut model = instance.model.lock().unwrap();
-        model.device = "CPU".into();
-        model.layout = Some("native".into());
-    }
+    let device = if settings.device.is_empty() { crate::devices::CPU.to_owned() } else { settings.device.clone() };
+    let instance = Arc::new(new_instance(settings, slot, label, RuntimeSession::new(&state.data_dir, port).unwrap(), device));
+    instance.model.lock().unwrap().layout = Some("native".into());
     instance.ready.store(ready, Ordering::SeqCst);
     state.instances.lock().await.push(instance.clone());
     instance
@@ -2448,15 +2542,16 @@ mod tests {
         };
         *state.settings.lock().await = settings.clone();
         let available_ram = || Some(2 * 1024 * 1024 * 1024);
+        let no_gpu = || None;
         let _guard = state.lifecycle.lock().await;
-        assert!(load_memory_risk_with_ram(&settings, std::iter::empty(), (0, 0), available_ram).await.is_none());
+        assert!(load_memory_risk_with(&settings, std::iter::empty(), (0, 0), available_ram, no_gpu).await.is_none());
         let first = insert_test_instance(&state, &settings.model_path, false).await;
         let loaded = state.instances.lock().await.clone();
-        assert!(load_memory_risk_with_ram(&settings, loaded.iter(), (0, 0), available_ram).await.is_some());
+        assert!(load_memory_risk_with(&settings, loaded.iter(), (0, 0), available_ram, no_gpu).await.is_some());
         let force = Settings { allow_force_fit: true, ..settings.clone() };
-        assert!(load_memory_risk_with_ram(&force, loaded.iter(), (0, 0), || panic!("force fit must skip RAM sampling")).await.is_none());
+        assert!(load_memory_risk_with(&force, loaded.iter(), (0, 0), || panic!("force fit must skip RAM sampling"), || panic!("force fit must skip VRAM sampling")).await.is_none());
         first.ready.store(true, Ordering::SeqCst);
-        assert!(load_memory_risk_with_ram(&settings, loaded.iter(), (0, 0), available_ram).await.is_none());
+        assert!(load_memory_risk_with(&settings, loaded.iter(), (0, 0), available_ram, no_gpu).await.is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -2631,7 +2726,15 @@ mod tests {
     fn fake_runtime(base: &Path, name: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = base.join(name);
-        std::fs::write(&path, script).unwrap();
+        // The script is written by a child process. Had this process held it
+        // open for writing, a child another test forks at that moment would
+        // inherit the descriptor, and running the script would fail with
+        // "Text file busy" until that child execs.
+        std::fs::create_dir_all(base).unwrap();
+        let draft = base.join(format!(".{name}.draft"));
+        std::fs::write(&draft, script).unwrap();
+        assert!(std::process::Command::new("cp").arg(&draft).arg(&path).status().unwrap().success());
+        std::fs::remove_file(&draft).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
     }
@@ -2673,6 +2776,9 @@ mod tests {
             settings.model_path = model.to_string_lossy().into_owned();
             settings.runtime_port = port;
             settings.gpu_layers = 0;
+            // On the CPU, the fake runtime is the CPU runtime.
+            settings.device = "CPU".into();
+            settings.cpu_runtime_path = settings.runtime_path.clone();
         }
         let old = load_model_in(&state, None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -2732,6 +2838,9 @@ mod tests {
             settings.model_path = model.to_string_lossy().into_owned();
             settings.runtime_port = port;
             settings.gpu_layers = 0;
+            // On the CPU, the fake runtime is the CPU runtime.
+            settings.device = "CPU".into();
+            settings.cpu_runtime_path = settings.runtime_path.clone();
         }
         let id = load_model_in(&state, None).await.unwrap();
         let instance = state.instance(&id).await.unwrap();
@@ -2801,6 +2910,9 @@ mod tests {
             settings.model_path = model.to_string_lossy().into_owned();
             settings.runtime_port = port;
             settings.gpu_layers = 0;
+            // On the CPU, the fake runtime is the CPU runtime.
+            settings.device = "CPU".into();
+            settings.cpu_runtime_path = settings.runtime_path.clone();
         }
         (state, base)
     }
@@ -2904,6 +3016,7 @@ mod tests {
         {
             let mut settings = state.settings.lock().await;
             settings.runtime_path = runtime;
+            settings.cpu_runtime_path = settings.runtime_path.clone();
             settings.model_path = model;
             settings.runtime_port = port;
             settings.mtp = std::env::var("NOULLAMA_MTP_HEAD").is_ok();
@@ -3099,7 +3212,7 @@ mod tests {
         let settings = loaded.settings.lock().await;
         assert!(settings.allow_force_fit && settings.hide_crowded_load_warning);
         drop(settings);
-        assert!(load_memory_risk(&loaded.settings.lock().await.clone(), std::iter::empty(), (0, 0)).await.is_none());
+        assert!(load_memory_risk(&loaded.settings.lock().await.clone(), std::iter::empty(), (0, 0), &[]).await.is_none());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -3213,5 +3326,344 @@ mod tests {
             ("spare", "instance_alias", Some("c"), false),
         ]);
         assert_eq!(listed_names(&routes), ["qwen", "qwen-i-2", "other", "spare"]);
+    }
+
+    /// The real `--list-devices` stdout of the CUDA 13 build on this
+    /// machine's RTX 4060 Laptop GPU, as a fake GPU runtime prints it.
+    #[cfg(unix)]
+    const GPU_LIST: &str = "Available devices:\n  CUDA0: NVIDIA GeForce RTX 4060 Laptop GPU (7857 MiB, 7742 MiB free)\n";
+
+    /// A fake runtime that lists `devices` and, when launched, writes its
+    /// arguments beside itself and waits.
+    #[cfg(unix)]
+    fn listing_runtime(base: &Path, name: &str, devices: &str) -> PathBuf {
+        fake_runtime(base, name, &format!("#!/bin/sh\nif [ \"$1\" = \"--list-devices\" ]; then printf '{}'; exit 0; fi\necho \"$@\" > \"$0.args\"\nexec sleep 60\n", devices.replace('\n', "\\n")))
+    }
+
+    /// What the fake runtime was launched with; fails with the load's errors
+    /// and log if it never was.
+    #[cfg(unix)]
+    async fn launched_args(state: &AppState, runtime: &Path) -> Vec<String> {
+        let file = PathBuf::from(format!("{}.args", runtime.display()));
+        let found = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    if text.ends_with('\n') {
+                        return text.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        match found {
+            Ok(args) => args,
+            Err(_) => {
+                let errors: Vec<String> = state.load_errors.lock().await.iter().map(|e| e.message.clone()).collect();
+                let logs = state.logs.lock().await.clone();
+                panic!("{} was not launched: {errors:#?}\n{logs:#?}", runtime.display());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+        args.iter().position(|a| a == name).map(|i| args[i + 1].as_str())
+    }
+
+    /// The command a load starts, built for a GPU device and for the CPU.
+    #[cfg(unix)]
+    #[test]
+    fn launches_run_on_their_one_device_with_its_runtime() {
+        let base = std::env::temp_dir().join(format!("noullama-launch-{}", uuid::Uuid::new_v4()));
+        for dir in ["gpu", "cpu"] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+            std::fs::write(base.join(dir).join("llama-server"), "").unwrap();
+        }
+        let session = RuntimeSession::new(&base, 18442).unwrap();
+        let settings = Settings {
+            model_path: "/m/qwen.gguf".into(),
+            runtime_path: base.join("gpu").to_string_lossy().into_owned(),
+            cpu_runtime_path: base.join("cpu").to_string_lossy().into_owned(),
+            library_path: "/opt/extra".into(),
+            gpu_layers: 99,
+            mtp: true,
+            mtp_path: "/m/mtp-head.gguf".into(),
+            ..Settings::default()
+        };
+        let args = |command: &Command| command.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let gpu = launch_command(&Settings { device: "CUDA1".into(), ..settings.clone() }, &session);
+        assert_eq!(gpu.as_std().get_program(), base.join("gpu/llama-server").as_os_str());
+        let gpu_args = args(&gpu);
+        assert_eq!(gpu_args[gpu_args.len() - 6..], ["--device", "CUDA1", "--split-mode", "none", "--main-gpu", "0"]);
+        assert_eq!(flag(&gpu_args, "--n-gpu-layers"), Some("99"));
+        assert_eq!(flag(&gpu_args, "--spec-draft-ngl"), Some("99"));
+
+        let cpu = launch_command(&Settings { device: "CPU".into(), ..settings.clone() }, &session);
+        assert_eq!(cpu.as_std().get_program(), base.join("cpu/llama-server").as_os_str());
+        let cpu_args = args(&cpu);
+        assert_eq!(flag(&cpu_args, "--n-gpu-layers"), Some("0"));
+        assert_eq!(flag(&cpu_args, "--spec-draft-ngl"), Some("0"));
+        assert_eq!(cpu_args[cpu_args.len() - 2..], ["--device", "none"]);
+        assert!(!cpu_args.contains(&"--split-mode".to_owned()));
+        let library = cpu.as_std().get_envs().find(|(k, _)| *k == "LD_LIBRARY_PATH").and_then(|(_, v)| v).unwrap();
+        let library: Vec<PathBuf> = std::env::split_paths(library).collect();
+        assert_eq!(library[..2], [base.join("cpu"), PathBuf::from("/opt/extra")]);
+        assert!(!library.contains(&base.join("gpu")));
+        drop(session);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cpu_load_needs_a_cpu_runtime_and_a_saved_gpu_must_be_listed() {
+        let base = std::env::temp_dir().join(format!("noullama-device-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let gpu = listing_runtime(&base, "gpu-runtime", GPU_LIST);
+        let model = base.join("model.gguf");
+        std::fs::write(&model, "test").unwrap();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = gpu.to_string_lossy().into_owned();
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.device = "CPU".into();
+        }
+        assert_eq!(load_model_in(&state, None).await.unwrap_err(), "Device CPU needs a CPU runtime. Choose or download one under CPU runtime in Runtime.");
+        state.settings.lock().await.device = "CUDA1".into();
+        assert_eq!(load_model_in(&state, None).await.unwrap_err(), "Device CUDA1 was not found: the llama.cpp build in Runtime does not report it. Choose another device in Local API.");
+        // A GPU runtime that cannot list its devices finds none of them either.
+        let broken = fake_runtime(&base, "broken-runtime", "#!/bin/sh\nexit 1\n");
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = broken.to_string_lossy().into_owned();
+            settings.device = "CUDA0".into();
+        }
+        assert_eq!(load_model_in(&state, None).await.unwrap_err(), crate::devices::not_found("CUDA0"));
+        assert!(state.instances.lock().await.is_empty());
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// An empty device loads on the first GPU listed, on the GPU runtime;
+    /// "CPU" loads on the CPU runtime with no GPU layers. Each instance keeps its device.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loads_launch_on_the_chosen_device_and_keep_it() {
+        let base = std::env::temp_dir().join(format!("noullama-placed-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let gpu = listing_runtime(&base, "gpu-runtime", GPU_LIST);
+        let cpu = listing_runtime(&base, "cpu-runtime", "Available devices:\n  (none)\n");
+        let model = base.join("qwen.gguf");
+        std::fs::write(&model, "test").unwrap();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.runtime_path = gpu.to_string_lossy().into_owned();
+            settings.cpu_runtime_path = cpu.to_string_lossy().into_owned();
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.runtime_port = 26000 + (uuid::Uuid::new_v4().as_u128() % 6000) as u16;
+            // Memory readings are not part of this test.
+            settings.allow_force_fit = true;
+        }
+        let first = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
+        assert_eq!(first.settings.device, "CUDA0");
+        assert_eq!(first.model().device, "CUDA0 · NVIDIA GeForce RTX 4060 Laptop GPU");
+        let args = launched_args(&state, &gpu).await;
+        assert_eq!(flag(&args, "--device"), Some("CUDA0"));
+        assert_eq!(flag(&args, "--split-mode"), Some("none"));
+        assert_eq!(flag(&args, "--n-gpu-layers"), Some("99"));
+
+        state.settings.lock().await.device = "CPU".into();
+        let second = state.instance(&load_model_in(&state, None).await.unwrap()).await.unwrap();
+        assert_eq!((second.settings.device.as_str(), second.model().device.as_str()), ("CPU", "CPU"));
+        assert_eq!(second.model().runtime_path, cpu.to_string_lossy());
+        let args = launched_args(&state, &cpu).await;
+        assert_eq!(flag(&args, "--device"), Some("none"));
+        assert_eq!(flag(&args, "--n-gpu-layers"), Some("0"));
+        // The snapshot reports what each launched with.
+        let snapshot = state_snapshot(&state).await.unwrap();
+        let shown: Vec<(String, i64)> = snapshot["instances"].as_array().unwrap().iter()
+            .map(|i| (i["settings"]["device"].as_str().unwrap().to_owned(), i["gpu_layers"].as_i64().unwrap())).collect();
+        assert_eq!(shown, [("CUDA0".to_owned(), 99), ("CPU".to_owned(), 0)]);
+        assert_eq!(first.settings.device, "CUDA0", "a later load does not move an instance");
+        state.shutdown().await;
+        drop((first, second));
+        remove_once_released(&base).await;
+    }
+
+    /// A still-loading instance holds graphics memory on its own GPU only.
+    #[tokio::test]
+    async fn loading_instances_reserve_vram_only_on_their_own_gpu() {
+        let base = std::env::temp_dir().join(format!("noullama-per-gpu-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let model = base.join("model.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        // About 1.5 GiB estimated, against a 2 GiB card with nothing on it.
+        let on = |device: &str| Settings { model_path: model.to_string_lossy().into_owned(), gpu_layers: 99, context_size: 65_536, device: device.into(), ..Settings::default() };
+        let card = || Some((2u64 << 30, 0u64));
+        let no_ram = || panic!("a full GPU load reads no RAM");
+        *state.settings.lock().await = on("CUDA0");
+        let loading = insert_test_instance(&state, &on("CUDA0").model_path, false).await;
+        let loaded = state.instances.lock().await.clone();
+        assert!(load_memory_risk_with(&on("CUDA0"), std::iter::empty(), (0, 0), no_ram, card).await.is_none());
+        let same = load_memory_risk_with(&on("CUDA0"), loaded.iter(), (0, 0), no_ram, card).await;
+        assert!(same.is_some_and(|reason| reason.contains("available VRAM")));
+        assert!(load_memory_risk_with(&on("CUDA1"), loaded.iter(), (0, 0), no_ram, card).await.is_none());
+        // Once ready it is in the live reading instead.
+        set_test_ready(&loading, true);
+        assert!(load_memory_risk_with(&on("CUDA0"), loaded.iter(), (0, 0), no_ram, card).await.is_none());
+        drop((loading, loaded));
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    #[test]
+    fn settings_from_before_devices_still_read() {
+        let base = std::env::temp_dir().join(format!("noullama-old-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("settings.json"), r#"{"runtime_path":"/opt/llama/bin","gpu_layers":0,"library_path":"/usr/local/cuda/lib64"}"#).unwrap();
+        let state = AppState::new(base.clone()).unwrap();
+        assert!(state.startup_warning.is_none());
+        let settings = state.settings.try_lock().unwrap().clone();
+        assert_eq!((settings.device.as_str(), settings.cpu_runtime_path.as_str()), ("", ""));
+        assert_eq!((settings.runtime_path.as_str(), settings.gpu_layers), ("/opt/llama/bin", 0));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A reload asks for the crowded-load warning before it ejects the
+    /// instance it replaces; a device the load would refuse stops it there.
+    #[tokio::test]
+    async fn the_crowded_check_refuses_a_device_before_a_reload_ejects_anything() {
+        let base = std::env::temp_dir().join(format!("noullama-crowded-device-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let model = base.join("model.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        let replaced = insert_test_instance(&state, model.to_str().unwrap(), true).await;
+        {
+            let mut settings = state.settings.lock().await;
+            settings.model_path = model.to_string_lossy().into_owned();
+            settings.device = "CPU".into();
+            settings.hide_crowded_load_warning = true;
+        }
+        assert_eq!(crowded_warning_in(&state, Some(replaced.id.clone())).await.unwrap_err(), crate::devices::CPU_RUNTIME_MISSING);
+        state.settings.lock().await.device = "CUDA3".into();
+        assert_eq!(crowded_warning_in(&state, Some(replaced.id.clone())).await.unwrap_err(), crate::devices::not_found("CUDA3"));
+        {
+            let mut settings = state.settings.lock().await;
+            settings.device = "CPU".into();
+            settings.cpu_runtime_path = "/cpu/llama-server".into();
+        }
+        assert!(crowded_warning_in(&state, Some(replaced.id.clone())).await.unwrap().is_none());
+        drop(replaced);
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn machine(ram_mib: u64, vram_mib: Option<u64>) -> crate::hardware::Hardware {
+        crate::hardware::Hardware { ram_bytes: ram_mib * MIB, vram_bytes: vram_mib.map(|v| v * MIB), gpu: None, cpu_cores: 8 }
+    }
+
+    /// A 1 MiB model file and a state whose loads run on the CPU runtime.
+    async fn fit_state(name: &str) -> (PathBuf, AppState, String) {
+        let base = std::env::temp_dir().join(format!("noullama-fit-{name}-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        let model = base.join("model.gguf");
+        std::fs::write(&model, vec![0u8; MIB as usize]).unwrap();
+        let path = model.to_string_lossy().into_owned();
+        {
+            let mut settings = state.settings.lock().await;
+            settings.model_path = path.clone();
+            settings.device = "CPU".into();
+            settings.cpu_runtime_path = "/cpu/llama-server".into();
+        }
+        (base, state, path)
+    }
+
+    /// Reload replaces the instance picked in the load panel, so the fit
+    /// leaves out that one, not the first instance of the file; a fresh load
+    /// leaves out none.
+    #[tokio::test]
+    async fn the_fit_leaves_out_the_instance_the_reload_replaces() {
+        let (base, state, path) = fit_state("replace").await;
+        state.settings.lock().await.context_size = 131072;
+        let first = insert_test_instance(&state, &path, true).await;
+        state.settings.lock().await.context_size = 512;
+        let second = insert_test_instance(&state, &path, true).await;
+        assert_eq!((first.slot, second.slot), (1, 2));
+        state.settings.lock().await.context_size = 4096;
+        let candidate = state.settings.lock().await.clone();
+        let instances = state.instances.lock().await.clone();
+        // About 3 GiB for the first instance, a few MiB for the second.
+        let hw = machine(3300, None);
+        let fit = |replace: Option<&str>| fit_for_load(&candidate, None, &instances, replace, Some(&hw)).unwrap();
+        let (reload_second, counted) = fit(Some(&second.id));
+        assert_eq!(counted, 1);
+        let (reload_first, _) = fit(Some(&first.id));
+        assert_eq!(reload_first.level, 1, "{}", reload_first.detail);
+        assert!(reload_second.level > reload_first.level, "the first instance's memory stays taken: {}", reload_second.detail);
+        let (fresh, counted) = fit(None);
+        assert_eq!(counted, 2);
+        assert!(fresh.level >= reload_second.level);
+        drop((first, second, instances));
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// An empty device loads on the first GPU, else on the CPU, and the fit
+    /// is rated for that device: system memory and no GPU layers on the CPU,
+    /// that GPU's own memory on a GPU.
+    #[tokio::test]
+    async fn the_fit_rates_the_device_the_load_would_use() {
+        let (base, state, _) = fit_state("device").await;
+        {
+            let mut settings = state.settings.lock().await;
+            settings.device = String::new();
+            settings.gpu_layers = 99;
+            settings.context_size = 4096;
+        }
+        let candidate = state.settings.lock().await.clone();
+        // ~97 MiB needed. A 100 MiB probe reading would rate it from system memory.
+        let hw = machine(64 * 1024, Some(100));
+        let (cpu, _) = fit_for_load(&candidate, Some(&[]), &[], None, Some(&hw)).unwrap();
+        assert_eq!(cpu.level, 1, "{}", cpu.detail);
+        assert!(cpu.detail.contains("system memory available"), "{}", cpu.detail);
+        let gpus = crate::devices::parse_list_devices("Available devices:\n  CUDA0: Test GPU (200 MiB, 190 MiB free)\n  CUDA1: Other GPU (200 MiB, 190 MiB free)\n");
+        let (gpu, _) = fit_for_load(&candidate, Some(&gpus), &[], None, Some(&hw)).unwrap();
+        assert_eq!(gpu.level, 1, "{}", gpu.detail);
+        assert!(gpu.detail.contains("of graphics memory available"), "{}", gpu.detail);
+        // A model on the other GPU takes nothing from this one.
+        state.settings.lock().await.device = "CUDA1".into();
+        let elsewhere = insert_test_instance(&state, &candidate.model_path, true).await;
+        let instances = state.instances.lock().await.clone();
+        let (beside, counted) = fit_for_load(&candidate, Some(&gpus), &instances, None, Some(&hw)).unwrap();
+        assert_eq!((counted, beside.detail), (0, gpu.detail));
+        drop((elsewhere, instances));
+        state.shutdown().await;
+        remove_once_released(&base).await;
+    }
+
+    /// The badge follows the load panel's unsaved values, and says why when
+    /// there is no estimate.
+    #[tokio::test]
+    async fn the_fit_uses_unsaved_load_panel_values_and_names_the_reason() {
+        let (base, state, path) = fit_state("unsaved").await;
+        state.settings.lock().await.context_size = 512;
+        let hw = machine(64 * 1024, None);
+        let changes = |pairs: Value| pairs.as_object().unwrap().clone();
+        let saved = load_fit_in(&state, changes(json!({})), None, Some(&hw)).await.unwrap();
+        let edited = load_fit_in(&state, changes(json!({"context_size": 65536})), None, Some(&hw)).await.unwrap();
+        assert!(edited["fit"]["required_bytes"].as_u64() > saved["fit"]["required_bytes"].as_u64());
+        assert_eq!(state.settings.lock().await.context_size, 512, "nothing is saved");
+        let missing = base.join("missing.gguf").to_string_lossy().into_owned();
+        assert_eq!(load_fit_in(&state, changes(json!({"model_path": missing})), None, Some(&hw)).await.unwrap_err(), crate::hardware::MODEL_UNREADABLE);
+        assert_eq!(load_fit_in(&state, changes(json!({"device": "CUDA3"})), None, Some(&hw)).await.unwrap_err(), crate::devices::not_found("CUDA3"));
+        state.settings.lock().await.cpu_runtime_path = String::new();
+        assert_eq!(load_fit_in(&state, changes(json!({})), None, Some(&hw)).await.unwrap_err(), crate::devices::CPU_RUNTIME_MISSING);
+        state.settings.lock().await.cpu_runtime_path = "/cpu/llama-server".into();
+        assert!(load_fit_in(&state, changes(json!({})), None, None).await.unwrap_err().contains("Memory detection is still running"));
+        assert!(load_fit_in(&state, changes(json!({"model_path": path, "bogus": 1})), None, Some(&hw)).await.unwrap_err().contains("Unknown setting"));
+        state.shutdown().await;
+        remove_once_released(&base).await;
     }
 }

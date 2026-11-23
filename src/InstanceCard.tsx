@@ -13,7 +13,9 @@ export type CardInstance = {
   // Exact extra names for this instance only, held while it is loaded.
   instance_aliases: string[];
   projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null;
-  context_size: number; gpu_layers: number; settings: { decision_mode: string };
+  context_size: number; gpu_layers: number;
+  // settings.device: the device it was loaded on ("CPU" or a name such as CUDA0); `device` is how it is shown.
+  settings: { decision_mode: string; device: string };
   // This instance's own Keep context switch and history counts.
   keep_context: boolean; context: { entries: number; last_flushed: number };
 };
@@ -86,6 +88,7 @@ export function InstanceCard({ instance, account, runtime, aliases, routes, disp
   onSaveAliases: (path: string, aliases: string[]) => Promise<void>; onError: (message: string) => void;
 }) {
   const settings: [string, string, string?][] = [
+    ['Device', instance.device || instance.settings.device],
     ['Vision', instance.projector ? basename(instance.mmproj_path) : 'Off', instance.projector ? instance.mmproj_path : undefined],
     ['MTP', instance.mtp ? instance.mtp_path ? basename(instance.mtp_path) : 'Built-in layers' : 'Off', instance.mtp && instance.mtp_path ? instance.mtp_path : undefined],
     // Auto shows the layout it resolved to; a forced mode is its own layout.

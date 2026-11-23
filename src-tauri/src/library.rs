@@ -8,7 +8,7 @@ use crate::runtime::{file_stem, is_reserved, normalize_aliases, reserved_message
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -701,12 +701,15 @@ pub async fn current_hash(state: &AppState, path: &str, force: bool) -> Result<S
 }
 
 /// Fills in a missing sha256 for every entry whose file exists, one file at a
-/// time in the background, unless checks are off.
+/// time in the background, unless checks are off. A sum that cannot be
+/// written to models.yml is logged and that file is left for the next run,
+/// so the run moves on to the other files and still ends.
 pub fn hash_missing(state: AppState) {
     tokio::spawn(async move {
         if state.hash_worker.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        let mut skipped: HashSet<String> = HashSet::new();
         loop {
             if Check::parse(&state.settings.lock().await.sha256_check) == Check::Off {
                 break;
@@ -717,7 +720,7 @@ pub fn hash_missing(state: AppState) {
                 library.entries.iter().find_map(|e| {
                     SLOTS.into_iter().find_map(|slot| {
                         let file = e.file(slot);
-                        (e.sum(slot).is_empty() && !file.is_empty() && !busy.contains_key(file) && Path::new(file).is_file()).then(|| (e.path.clone(), slot, file.to_owned()))
+                        (e.sum(slot).is_empty() && !file.is_empty() && !busy.contains_key(file) && !skipped.contains(file) && Path::new(file).is_file()).then(|| (e.path.clone(), slot, file.to_owned()))
                     })
                 })
             };
@@ -730,7 +733,10 @@ pub fn hash_missing(state: AppState) {
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             refresh(&state).await;
                         }
-                        Err(_) => break,
+                        Err(error) => {
+                            state.log(format!("sha256 of {file} not recorded: {error}")).await;
+                            skipped.insert(file);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1036,6 +1042,44 @@ mod tests {
         let result = write(&base, &mut library, Vec::new(), Change::Checksums);
         assert_eq!(std::fs::read_to_string(path).unwrap(), external);
         assert_eq!(result.unwrap_err(), "models.yml changed on disk while a sha256 was being recorded. It will be recorded again.");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A sha256 that cannot be written to models.yml is logged, that file is
+    /// skipped and the next one is tried, and the background run still ends.
+    #[tokio::test]
+    async fn a_sum_that_cannot_be_recorded_is_logged_and_the_run_moves_on() {
+        let (state, base) = temp_state().await;
+        state.settings.lock().await.sha256_check = "off".into();
+        let files: Vec<String> = ["a.gguf", "b.gguf"].iter().map(|name| {
+            let path = base.join(name);
+            std::fs::write(&path, name.as_bytes()).unwrap();
+            path.to_string_lossy().into_owned()
+        }).collect();
+        ensure(&state, &files).await;
+        assert_eq!(state.library.lock().await.entries.len(), 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.hash_worker.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Every write of models.yml now fails: its temporary file cannot be created.
+        std::fs::create_dir(base.join("models.yml.tmp")).unwrap();
+        state.settings.lock().await.sha256_check = "once".into();
+        hash_missing(state.clone());
+        let logged = |logs: &std::collections::VecDeque<String>, file: &str| logs.iter().any(|l| l.starts_with(&format!("sha256 of {file} not recorded: Cannot write models.yml")));
+        loop {
+            let done = {
+                let logs = state.logs.lock().await;
+                files.iter().all(|f| logged(&logs, f)) && !state.hash_worker.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            if done { break; }
+            assert!(std::time::Instant::now() < deadline, "logs: {:#?}", state.logs.lock().await);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Each file was tried once, not over and over.
+        assert_eq!(state.logs.lock().await.iter().filter(|l| l.starts_with("sha256 of ")).count(), 2);
+        assert!(state.library.lock().await.entries.iter().all(|e| e.sha256.is_empty()));
         std::fs::remove_dir_all(base).unwrap();
     }
 

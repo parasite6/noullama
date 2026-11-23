@@ -59,22 +59,26 @@ fn required_bytes(model_bytes: u64, context_size: u32) -> u64 {
     model_bytes + (model_bytes as f64 * 0.12) as u64 + context_size as u64 * 24 * 1024
 }
 
-/// How a model file fits this machine, with the memory other loaded models
+pub const MODEL_UNREADABLE: &str = "The selected model file could not be read.";
+pub const NO_SYSTEM_MEMORY: &str = "System memory could not be detected, so there is no estimate.";
+
+/// How a model file fits `hardware`, with the memory other loaded models
 /// are estimated to hold set aside: each `(bytes, on_gpu)` in `taken` comes
 /// out of graphics or system memory. `extras` are files loaded alongside the
 /// model, such as a multimodal projector or an MTP head; they sit in the
 /// same memory as the weights, so they count toward the estimate. Empty
-/// paths are skipped.
-pub fn fit_beside(path: &str, extras: &[&str], context_size: u32, gpu_layers: i32, taken: &[(u64, bool)]) -> Option<Fit> {
-    let bytes = file_bytes(path, extras)?;
-    let mut hardware = cached()?.clone();
+/// paths are skipped. `hardware.vram_bytes` is the memory of the GPU the
+/// load runs on.
+pub fn fit_beside(path: &str, extras: &[&str], context_size: u32, gpu_layers: i32, hardware: &Hardware, taken: &[(u64, bool)]) -> Result<Fit, &'static str> {
+    let bytes = file_bytes(path, extras).ok_or(MODEL_UNREADABLE)?;
+    let mut hardware = hardware.clone();
     for (used, on_gpu) in taken {
         match (on_gpu, hardware.vram_bytes.as_mut()) {
             (true, Some(vram)) => *vram = vram.saturating_sub(*used).max(1),
             _ => hardware.ram_bytes = hardware.ram_bytes.saturating_sub(*used).max(1),
         }
     }
-    fit_model_bytes(bytes, context_size, gpu_layers, &hardware)
+    fit_model_bytes(bytes, context_size, gpu_layers, &hardware).ok_or(NO_SYSTEM_MEMORY)
 }
 
 #[derive(Serialize, Default, Debug, PartialEq)]
@@ -108,6 +112,76 @@ pub fn memory_use(pids: &[u32]) -> MemoryUse {
         return parse_nvidia_memory(&text, apps.as_deref(), pids);
     }
     amd_memory()
+}
+
+/// One GPU as nvidia-smi lists it, in its index order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuReading {
+    pub name: String,
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Every NVIDIA GPU's memory, in nvidia-smi index order (PCI bus order);
+/// `None` without nvidia-smi.
+pub fn nvidia_gpus() -> Option<Vec<GpuReading>> {
+    command_output("nvidia-smi", &["--query-gpu=index,name,memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .map(|text| parse_nvidia_gpus(&text))
+}
+
+/// `index, name, used, total` lines. The index comes off the front and the
+/// two numbers off the back, so a comma inside a name cannot shift them.
+fn parse_nvidia_gpus(text: &str) -> Vec<GpuReading> {
+    text.lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(',')?;
+            let (rest, total) = rest.rsplit_once(',')?;
+            let (name, used) = rest.rsplit_once(',')?;
+            Some(GpuReading { name: name.trim().to_owned(), used_bytes: mib(used)?, total_bytes: mib(total)? })
+        })
+        .collect()
+}
+
+/// Which nvidia-smi GPU (an index into `gpus`) is the llama.cpp device
+/// `device` among `devices`, matched by name:
+/// - a name that only one listed device and only one nvidia-smi GPU have
+///   is that GPU;
+/// - several GPUs with the same name are matched in order only when both
+///   lists count the same number of them and `pci_order` holds (CUDA set to
+///   enumerate in PCI bus order, as nvidia-smi does, with no device remapping);
+/// - otherwise, including a device nvidia-smi does not list, `None`.
+pub fn match_gpu(device: &str, devices: &[crate::devices::RuntimeDevice], gpus: &[GpuReading], pci_order: bool) -> Option<usize> {
+    let chosen = devices.iter().find(|d| d.name == device)?;
+    let twins: Vec<_> = devices.iter().filter(|d| d.description == chosen.description).collect();
+    let rank = twins.iter().position(|d| d.name == device)?;
+    let cards: Vec<usize> = gpus.iter().enumerate().filter(|(_, g)| g.name == chosen.description).map(|(i, _)| i).collect();
+    match (twins.len(), cards.len()) {
+        (1, 1) => Some(cards[0]),
+        (a, b) if a == b && a > 1 && pci_order => Some(cards[rank]),
+        _ => None,
+    }
+}
+
+/// Whether CUDA numbers its devices in the order nvidia-smi does: only when
+/// `CUDA_DEVICE_ORDER=PCI_BUS_ID` is set and `CUDA_VISIBLE_DEVICES` is not.
+/// CUDA's default order puts the fastest card first.
+pub fn cuda_in_pci_order(device: &str) -> bool {
+    device.starts_with("CUDA")
+        && std::env::var("CUDA_DEVICE_ORDER").is_ok_and(|v| v == "PCI_BUS_ID")
+        && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none()
+}
+
+/// Graphics memory `(total, used)` for a load on `device`: that GPU's own
+/// reading when it maps to one nvidia-smi entry, else the whole-machine
+/// reading of `memory_use` (the first NVIDIA GPU, or AMD sysfs).
+pub fn device_memory(device: &str, devices: &[crate::devices::RuntimeDevice]) -> Option<(u64, u64)> {
+    if let Some(gpus) = nvidia_gpus() {
+        if let Some(index) = match_gpu(device, devices, &gpus, cuda_in_pci_order(device)) {
+            return Some((gpus[index].total_bytes, gpus[index].used_bytes));
+        }
+    }
+    let usage = memory_use(&[]);
+    Some((usage.total_bytes?, usage.used_bytes?))
 }
 
 fn mib(text: &str) -> Option<u64> {
@@ -434,6 +508,30 @@ mod tests {
             parse_nvidia_memory("garbage", None, &[]),
             MemoryUse::default()
         );
+    }
+
+    #[test]
+    fn llama_devices_map_to_their_own_nvidia_gpu() {
+        use crate::devices::parse_list_devices;
+        // The format nvidia-smi prints for `index,name,memory.used,memory.total`
+        // (this machine: "0, NVIDIA GeForce RTX 4060 Laptop GPU, 15, 8188").
+        let gpus = parse_nvidia_gpus("0, NVIDIA GeForce RTX 3060, 100, 12288\n1, NVIDIA GeForce RTX 4090, 2000, 24564\n2, Odd, Name, 5, 10\n");
+        assert_eq!(gpus.len(), 3);
+        assert_eq!(gpus[2].name, "Odd, Name");
+        assert_eq!((gpus[1].used_bytes, gpus[1].total_bytes), (2000 << 20, 24564 << 20));
+        // CUDA lists the faster card first; names put each on its own GPU.
+        let devices = parse_list_devices("Available devices:\n  CUDA0: NVIDIA GeForce RTX 4090 (24076 MiB, 22000 MiB free)\n  CUDA1: NVIDIA GeForce RTX 3060 (11910 MiB, 11800 MiB free)\n");
+        assert_eq!(match_gpu("CUDA0", &devices, &gpus, false), Some(1));
+        assert_eq!(match_gpu("CUDA1", &devices, &gpus, false), Some(0));
+        assert_eq!(match_gpu("CUDA7", &devices, &gpus, false), None);
+        // Two identical cards: their order is only known in PCI bus order.
+        let twins = parse_nvidia_gpus("0, NVIDIA A10, 1, 23028\n1, NVIDIA A10, 2, 23028\n");
+        let devices = parse_list_devices("Available devices:\n  CUDA0: NVIDIA A10 (22000 MiB, 21000 MiB free)\n  CUDA1: NVIDIA A10 (22000 MiB, 21000 MiB free)\n");
+        assert_eq!(match_gpu("CUDA1", &devices, &twins, false), None);
+        assert_eq!(match_gpu("CUDA1", &devices, &twins, true), Some(1));
+        // A device nvidia-smi does not list (AMD over Vulkan) has no reading of its own.
+        let amd = parse_list_devices("Available devices:\n  Vulkan0: AMD Radeon RX 7900 XTX (RADV NAVI31) (24560 MiB, 24000 MiB free)\n");
+        assert_eq!(match_gpu("Vulkan0", &amd, &gpus, true), None);
     }
 
     fn machine(ram_gb: u64, vram_gb: Option<u64>) -> Hardware {

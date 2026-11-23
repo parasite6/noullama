@@ -1,7 +1,9 @@
 import React, { useEffect, useRef } from 'react';
 import { Power } from 'lucide-react';
+import { quitText } from './ui-state';
 
-export function QuitDialog({ open, pending, onCancel, onConfirm }: { open: boolean; pending: boolean; onCancel: () => void; onConfirm: () => void }) {
+// `loaded` is the number of loaded instances, or null before the first snapshot.
+export function QuitDialog({ open, pending, loaded, onCancel, onConfirm }: { open: boolean; pending: boolean; loaded: number | null; onCancel: () => void; onConfirm: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
   useEffect(() => {
@@ -17,7 +19,7 @@ export function QuitDialog({ open, pending, onCancel, onConfirm }: { open: boole
   }}>
     <Power size={24} aria-hidden="true"/>
     <h2 id="quit-title">Quit Noullama?</h2>
-    <p id="quit-description">The local API and loaded model will stop. Active downloads will also stop.</p>
+    <p id="quit-description">{quitText(loaded)}</p>
     <div className="quit-dialog-actions"><button ref={cancel} className="secondary" disabled={pending} onClick={onCancel}>Keep running</button><button className="primary" disabled={pending} onClick={onConfirm}>{pending ? 'Quitting…' : 'Quit Noullama'}</button></div>
   </dialog>;
 }

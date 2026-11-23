@@ -40,3 +40,85 @@ export function instancesOf<T extends LoadedInstance>(instances: readonly T[], m
 export function playModelAfterLoad(current: string | null, loaded: string, instances: readonly LoadedInstance[], replace: string | null, ejected?: string): string {
   return current && current !== replace && current !== ejected && instances.some(i => i.id === current) ? current : loaded;
 }
+
+// One device of the GPU runtime's `--list-devices` (RuntimeDevice in devices.rs).
+export type RuntimeDevice = { name: string; description: string; total_mib: number | null; free_mib: number | null };
+// The `device` value that loads on the CPU runtime.
+export const CPU_DEVICE = 'CPU';
+
+// "CUDA0 · NVIDIA GeForce RTX 4060 Laptop GPU (8 GB)".
+export function deviceLabel(device: RuntimeDevice): string {
+  const size = device.total_mib ? ` (${Math.round(device.total_mib / 1024)} GB)` : '';
+  return `${device.name}${device.description ? ` · ${device.description}` : ''}${size}`;
+}
+
+// The load panel's "Device" select for the saved `device` value. `devices`
+// is the GPU runtime's list, or null until it has been read. `effective` is
+// the device a load would use (an empty value means the first GPU, else the
+// CPU), or null while the list is unknown. A saved GPU the runtime does not
+// report stays selected and is marked "(not found)"; the load refuses it.
+export function deviceChoice(saved: string, devices: readonly RuntimeDevice[] | null) {
+  const listed = devices ?? [];
+  const effective = saved || (devices ? listed[0]?.name ?? CPU_DEVICE : null);
+  const known = !saved || saved === CPU_DEVICE || listed.some(d => d.name === saved);
+  const missing = !!devices && !known;
+  const options = [...listed.map(d => ({ value: d.name, label: deviceLabel(d) })), { value: CPU_DEVICE, label: 'CPU' }];
+  if (!known) options.unshift({ value: saved, label: devices ? `${saved} (not found)` : saved });
+  if (effective === null) options.unshift({ value: '', label: 'Checking devices…' });
+  return { value: effective ?? '', effective, missing, options };
+}
+
+// The instance the load panel's main load button replaces: the "Instance"
+// picker's choice when it needs a reload (the button reads "Reload model").
+// Otherwise the panel's load is a fresh one (Load model, Load beside, Load
+// another instance) and replaces none. The fit badge leaves out this one.
+export function panelReplace(selected: LoadedInstance | null, reloadSelected: boolean): string | null {
+  return selected && reloadSelected ? selected.id : null;
+}
+
+// Runs `run` once its arguments have been the same for `delay` ms, one call
+// at a time: arguments that arrive while a call is running wait for it, and
+// only the newest are sent. A result is passed to `apply` only when no newer
+// arguments came in meanwhile, so the caller keeps showing the last result
+// until the current one arrives.
+export function latestOnly<A, R>(delay: number, run: (args: A) => Promise<R>, apply: (result: { ok: true; value: R } | { ok: false; error: unknown }) => void) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let running = false;
+  let waiting: { args: A } | null = null;
+  let generation = 0;
+  const start = async () => {
+    if (running || !waiting) return;
+    const { args } = waiting;
+    waiting = null;
+    running = true;
+    const mine = generation;
+    let result: { ok: true; value: R } | { ok: false; error: unknown };
+    try { result = { ok: true, value: await run(args) }; } catch (error) { result = { ok: false, error }; }
+    running = false;
+    if (mine === generation && !waiting && !timer) apply(result);
+    void start();
+  };
+  return {
+    request(args: A) {
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { timer = null; waiting = { args }; void start(); }, delay);
+    },
+    cancel() {
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      waiting = null;
+    },
+  };
+}
+
+// The quit prompt's text for `loaded` loaded instances (null before the
+// first snapshot).
+export function quitText(loaded: number | null): string {
+  const models = loaded === null ? 'The local API and any loaded models will stop.'
+    : loaded === 0 ? 'The local API will stop.'
+    : loaded === 1 ? 'The local API and the loaded model will stop.'
+    : `The local API and all ${loaded} loaded models will stop.`;
+  return `${models} Active downloads will also stop.`;
+}

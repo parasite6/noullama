@@ -273,6 +273,7 @@ mod tests {
         {
             let mut settings = state.settings.lock().await;
             settings.runtime_path = std::env::var("NOULLAMA_TEST_RUNTIME").unwrap_or_default();
+            settings.cpu_runtime_path = settings.runtime_path.clone();
             settings.model_path = std::env::var("NOULLAMA_TEST_MODEL").expect("Set NOULLAMA_TEST_MODEL");
             settings.gpu_layers = 0;
             settings.context_size = 512;

@@ -19,8 +19,28 @@ const STALL: Duration = Duration::from_secs(60);
 #[derive(Default)]
 pub struct RuntimeManager {
     plan: Mutex<Option<RuntimePlan>>,
+    /// The "Download nightly + fallback" install.
     pub progress: Mutex<InstallProgress>,
+    /// The CPU runtime's own download ("Download the official CPU build").
+    pub cpu_progress: Mutex<InstallProgress>,
+    /// The one running install, of either kind: one runtime download at a time.
     pub task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Which download an install reports to.
+#[derive(Clone, Copy)]
+pub enum Download {
+    Builds,
+    Cpu,
+}
+
+impl RuntimeManager {
+    pub fn progress_of(&self, download: Download) -> &Mutex<InstallProgress> {
+        match download {
+            Download::Builds => &self.progress,
+            Download::Cpu => &self.cpu_progress,
+        }
+    }
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -177,6 +197,15 @@ pub async fn runtime_releases(
 }
 
 async fn plan_releases(state: &AppState, backend: &str) -> Result<RuntimePlan, String> {
+    let plan = release_plan(state, backend).await?;
+    *state.runtimes.plan.lock().await = Some(plan.clone());
+    Ok(plan)
+}
+
+/// The nightly and stable-fallback builds for `backend`, read from GitHub.
+/// Not kept as the approved plan, so the CPU download cannot replace the
+/// plan shown under "Download a build".
+async fn release_plan(state: &AppState, backend: &str) -> Result<RuntimePlan, String> {
     let os = std::env::consts::OS;
     let arch = platform_arch(std::env::consts::ARCH)?;
     let (releases, stable) = tokio::try_join!(
@@ -235,7 +264,6 @@ async fn plan_releases(state: &AppState, backend: &str) -> Result<RuntimePlan, S
         fallback,
         total_bytes,
     };
-    *state.runtimes.plan.lock().await = Some(plan.clone());
     Ok(plan)
 }
 
@@ -244,16 +272,31 @@ pub async fn discover_runtimes(state: tauri::State<'_, AppState>) -> Result<Valu
     let settings = state.settings.lock().await.clone();
     let managed = state.data_dir.join("runtimes");
     tokio::task::spawn_blocking(move || {
-        let mut roots = vec![(managed, 4, "managed")];
-        let binary = server_binary(&settings.runtime_path);
-        if let Some(parent) = binary.parent().filter(|p| !p.as_os_str().is_empty()) {
-            roots.push((parent.to_path_buf(), 2, "custom"));
-            if let Some(parent) = parent.parent().filter(|p| p.parent().is_some()) { roots.push((parent.to_path_buf(), 3, "near custom runtime")); }
-        }
-        if let Some(paths) = std::env::var_os("PATH") { roots.extend(std::env::split_paths(&paths).filter(|p| p.is_absolute()).map(|p| (p, 0, "PATH"))); }
+        let roots = discovery_roots(&settings, managed, std::env::var_os("PATH"));
         let (local, warnings) = scan_runtimes(roots, 12_000);
         json!({"platform":format!("{} / {}",std::env::consts::OS,std::env::consts::ARCH), "backends": if cfg!(target_os="macos") { vec!["metal"] } else { vec!["cpu","vulkan","cuda12","cuda13"] }, "local":local,"warnings":warnings})
     }).await.map_err(|e| e.to_string())
+}
+
+/// Where "Scan" looks for llama-server builds, as `(folder, depth, source)`:
+/// Noullama downloads, the selected GPU build's folder and the folder above
+/// it, the selected CPU build's folder, and each PATH folder. The Runtime
+/// tab's "Installed builds" hint lists the same places.
+fn discovery_roots(settings: &crate::runtime::Settings, managed: PathBuf, path_var: Option<std::ffi::OsString>) -> Vec<(PathBuf, usize, &'static str)> {
+    let mut roots = vec![(managed, 4, "managed")];
+    let binary = server_binary(&settings.runtime_path);
+    if let Some(parent) = binary.parent().filter(|p| !p.as_os_str().is_empty()) {
+        roots.push((parent.to_path_buf(), 2, "custom"));
+        if let Some(parent) = parent.parent().filter(|p| p.parent().is_some()) { roots.push((parent.to_path_buf(), 3, "near custom runtime")); }
+    }
+    if !settings.cpu_runtime_path.trim().is_empty() {
+        let binary = server_binary(&settings.cpu_runtime_path);
+        if let Some(parent) = binary.parent().filter(|p| !p.as_os_str().is_empty()) {
+            roots.push((parent.to_path_buf(), 2, "custom"));
+        }
+    }
+    if let Some(paths) = path_var { roots.extend(std::env::split_paths(&paths).filter(|p| p.is_absolute()).map(|p| (p, 0, "PATH"))); }
+    roots
 }
 
 fn scan_runtimes(
@@ -544,7 +587,7 @@ fn extract_archive(
     Ok(())
 }
 
-async fn fetch_asset(state: &AppState, asset: &ReleaseAsset, target: &Path) -> Result<(), String> {
+async fn fetch_asset(state: &AppState, asset: &ReleaseAsset, target: &Path, progress: &Mutex<InstallProgress>) -> Result<(), String> {
     let mut stop = state.app.api_stop.subscribe();
     let request = state
         .client
@@ -577,7 +620,7 @@ async fn fetch_asset(state: &AppState, asset: &ReleaseAsset, target: &Path) -> R
         }
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         hash.update(&chunk);
-        state.runtimes.progress.lock().await.downloaded += chunk.len() as u64;
+        progress.lock().await.downloaded += chunk.len() as u64;
     }
     file.flush().await.map_err(|e| e.to_string())?;
     if bytes != asset.size || format!("sha256:{:x}", hash.finalize()) != asset.digest.to_lowercase()
@@ -597,7 +640,7 @@ fn find_server(directory: &Path) -> Option<PathBuf> {
         .map(|r| PathBuf::from(r.path))
 }
 
-async fn install_build(state: &AppState, build: &RuntimeBuild) -> Result<LocalRuntime, String> {
+async fn install_build(state: &AppState, build: &RuntimeBuild, progress: &Mutex<InstallProgress>) -> Result<LocalRuntime, String> {
     let root = state.data_dir.join("runtimes");
     tokio::fs::create_dir_all(&root)
         .await
@@ -617,7 +660,7 @@ async fn install_build(state: &AppState, build: &RuntimeBuild) -> Result<LocalRu
             .eq(build.assets.iter().map(|a| &a.digest))
         {
             if let Some(server) = find_server(&destination) {
-                state.runtimes.progress.lock().await.downloaded +=
+                progress.lock().await.downloaded +=
                     build.assets.iter().map(|a| a.size).sum::<u64>();
                 return Ok(LocalRuntime {
                     path: server.to_string_lossy().into_owned(),
@@ -642,10 +685,10 @@ async fn install_build(state: &AppState, build: &RuntimeBuild) -> Result<LocalRu
             .await
             .map_err(|e| e.to_string())?;
         for (index, asset) in build.assets.iter().enumerate() {
-            state.runtimes.progress.lock().await.message = format!("Downloading {}", asset.name);
+            progress.lock().await.message = format!("Downloading {}", asset.name);
             let archive = staging.join(&asset.name);
-            fetch_asset(state, asset, &archive).await?;
-            state.runtimes.progress.lock().await.message =
+            fetch_asset(state, asset, &archive, progress).await?;
+            progress.lock().await.message =
                 format!("Verifying and extracting {}", asset.name);
             let package = extracted.join(format!("package-{index}"));
             tokio::fs::create_dir(&package)
@@ -747,6 +790,38 @@ fn walk_library_files(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Scan" looks in Noullama downloads, the selected builds' folders, the
+    /// folder above the GPU build's, and PATH, and the hint on the Runtime
+    /// tab says exactly that (no folder next to the app is scanned).
+    #[test]
+    fn the_installed_builds_hint_names_the_folders_the_scan_reads() {
+        let settings = crate::runtime::Settings {
+            runtime_path: "/opt/llama/b100-cuda/llama-server".into(),
+            cpu_runtime_path: "/opt/cpu/b100/llama-server".into(),
+            ..Default::default()
+        };
+        let path = std::env::join_paths(["/usr/bin", "relative/bin"]).unwrap();
+        let roots = discovery_roots(&settings, PathBuf::from("/data/runtimes"), Some(path));
+        let found: Vec<(&str, &str)> = roots.iter().map(|(p, _, source)| (p.to_str().unwrap(), *source)).collect();
+        assert_eq!(found, [
+            ("/data/runtimes", "managed"),
+            ("/opt/llama/b100-cuda", "custom"),
+            ("/opt/llama", "near custom runtime"),
+            ("/opt/cpu/b100", "custom"),
+            ("/usr/bin", "PATH"),
+        ]);
+        if let Some(app) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+            assert!(roots.iter().all(|(p, _, _)| *p != app), "the app's own folder is not scanned");
+        }
+        let manager = include_str!("../../src/RuntimeManager.tsx");
+        let hint = manager.split("<h3>Installed builds</h3><p className=\"hint\">").nth(1).and_then(|rest| rest.split("</p>").next()).unwrap();
+        assert!(!hint.contains("next to the app"), "{hint}");
+        for (source, words) in [("managed", "Noullama downloads"), ("custom", "folders of the selected GPU and CPU builds"), ("near custom runtime", "folder above the GPU build"), ("PATH", "on PATH")] {
+            assert!(found.iter().any(|(_, s)| *s == source));
+            assert!(hint.contains(words), "the hint does not name {source}: {hint}");
+        }
+    }
     use std::sync::Arc;
     #[test]
     fn zip_installation_extracts_windows_files_and_rejects_traversal() {
@@ -872,6 +947,72 @@ mod tests {
             .unwrap()
             .contains("SHA-256"));
         assert!(!state.data_dir.join("runtimes/btest3-cpu").exists());
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    /// The CPU runtime download installs with its own progress, and while
+    /// it runs the builds download is refused (one runtime download at a time).
+    #[tokio::test]
+    async fn cpu_download_has_its_own_progress_and_blocks_a_second_download() {
+        use axum::{body::Body, response::Response, routing::get, Router};
+        let base = directory();
+        let mut state = AppState::new(base.join("data")).unwrap();
+        state.client = state.local_client.clone();
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o755);
+        header.set_size(4);
+        header.set_cksum();
+        tar.append_data(&mut header, "build/llama-server", &b"test"[..]).unwrap();
+        let bytes = tar.into_inner().unwrap().finish().unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let fixture = bytes.clone();
+        let router = Router::new().route("/archive", get(move || { let data = fixture.clone(); async move { Response::new(Body::from(data)) } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/archive", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let build = |tag: &str| RuntimeBuild {
+            release: "Fixture".into(),
+            tag: tag.into(),
+            backend: "cpu".into(),
+            assets: vec![ReleaseAsset { name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"), size: bytes.len() as u64, digest: digest.clone(), url: url.clone() }],
+        };
+        let plan = RuntimePlan { id: "cpu".into(), platform: "test".into(), nightly: build("bcpu1"), fallback: build("bcpu2"), total_bytes: bytes.len() as u64 * 2 };
+        let shown = RuntimePlan { id: "shown".into(), ..plan.clone() };
+        *state.runtimes.plan.lock().await = Some(shown);
+        // The CPU plan is still being read from GitHub.
+        let (release, read) = tokio::sync::oneshot::channel::<()>();
+        let cpu_plan = plan.clone();
+        begin_install(&state, Download::Cpu, "Checking official releases for the CPU build…", async move {
+            let _ = read.await;
+            Ok(cpu_plan)
+        })
+        .await
+        .unwrap();
+        assert!(state.runtimes.cpu_progress.lock().await.active);
+        assert_eq!(begin_runtime_download(&state, "shown").await.unwrap_err(), "A runtime download is already active");
+        assert_eq!(
+            begin_install(&state, Download::Cpu, "again", async { Err("unused".into()) }).await.unwrap_err(),
+            "A runtime download is already active"
+        );
+        assert!(!state.runtimes.progress.lock().await.active);
+        release.send(()).unwrap();
+        let task = state.runtimes.task.lock().await.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        let cpu = state.runtimes.cpu_progress.lock().await.clone();
+        assert!(!cpu.active && cpu.error.is_none(), "{:?}", cpu.error);
+        assert_eq!(cpu.message, "The official CPU build and its fallback are ready. Save settings to use the nightly as the CPU runtime.");
+        assert_eq!(cpu.downloaded, cpu.total);
+        let installed: Vec<_> = cpu.installed.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(installed.len(), 2);
+        assert!(installed[0].contains("bcpu1-cpu") && Path::new(&installed[0]).is_file());
+        let builds = state.runtimes.progress.lock().await.clone();
+        assert!(builds.installed.is_empty() && builds.message.is_empty());
+        // The plan shown under "Download a build" is still the approved one.
+        assert_eq!(state.runtimes.plan.lock().await.as_ref().map(|p| p.id.clone()).as_deref(), Some("shown"));
+        let settings = state.settings.lock().await.clone();
+        assert!(settings.cpu_runtime_path.is_empty() && settings.runtime_path.is_empty(), "a download never changes a setting");
         server.abort();
         let _ = server.await;
         std::fs::remove_dir_all(base).unwrap();
@@ -1059,14 +1200,6 @@ pub async fn download_runtimes(
 }
 
 async fn begin_runtime_download(state: &AppState, plan_id: &str) -> Result<(), String> {
-    let _guard = state.lifecycle.lock().await;
-    if state.app.exiting.load(Ordering::SeqCst) {
-        return Err("Noullama is shutting down".into());
-    }
-    let mut progress = state.runtimes.progress.lock().await;
-    if progress.active {
-        return Err("A runtime download is already active".into());
-    }
     let plan = state
         .runtimes
         .plan
@@ -1075,35 +1208,66 @@ async fn begin_runtime_download(state: &AppState, plan_id: &str) -> Result<(), S
         .clone()
         .filter(|p| p.id == plan_id)
         .ok_or("Check releases again before approving this download")?;
-    *progress = InstallProgress {
-        active: true,
-        message: "Preparing the approved runtime downloads…".into(),
-        total: plan.total_bytes,
-        ..Default::default()
+    begin_install(state, Download::Builds, "Preparing the approved runtime downloads…", async move { Ok(plan) }).await
+}
+
+/// "Download the official CPU build": the official release plan for the
+/// `cpu` backend (nightly and stable fallback), installed like the builds
+/// download but with its own progress. It never changes a setting.
+#[tauri::command]
+pub async fn download_cpu_runtime(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let worker = state.inner().clone();
+    begin_install(state.inner(), Download::Cpu, "Checking official releases for the CPU build…", async move {
+        release_plan(&worker, "cpu").await
+    })
+    .await
+}
+
+/// Starts installing the plan that `plan` resolves to, reporting to
+/// `download`'s progress. Only one runtime download runs at a time, of
+/// either kind.
+async fn begin_install(
+    state: &AppState,
+    download: Download,
+    first: &str,
+    plan: impl std::future::Future<Output = Result<RuntimePlan, String>> + Send + 'static,
+) -> Result<(), String> {
+    let _guard = state.lifecycle.lock().await;
+    if state.app.exiting.load(Ordering::SeqCst) {
+        return Err("Noullama is shutting down".into());
+    }
+    let (mut builds, mut cpu) = (state.runtimes.progress.lock().await, state.runtimes.cpu_progress.lock().await);
+    if builds.active || cpu.active {
+        return Err("A runtime download is already active".into());
+    }
+    let progress = match download {
+        Download::Builds => &mut *builds,
+        Download::Cpu => &mut *cpu,
     };
-    drop(progress);
+    *progress = InstallProgress { active: true, message: first.into(), ..Default::default() };
+    drop((builds, cpu));
     let worker = state.clone();
     let task = tokio::spawn(async move {
+        let progress = worker.runtimes.progress_of(download);
         let result = async {
+            let plan = plan.await?;
+            progress.lock().await.total = plan.total_bytes;
             for build in [&plan.nightly, &plan.fallback] {
-                let installed = install_build(&worker, build).await?;
-                worker
-                    .runtimes
-                    .progress
-                    .lock()
-                    .await
-                    .installed
-                    .push(installed);
+                let installed = install_build(&worker, build, progress).await?;
+                progress.lock().await.installed.push(installed);
             }
             Ok::<_, String>(())
         }
         .await;
-        let mut progress = worker.runtimes.progress.lock().await;
+        let mut progress = progress.lock().await;
         progress.active = false;
         match result {
             Ok(()) => {
-                progress.message =
-                    "Nightly and official fallback are ready. Choose which runtime to use.".into()
+                progress.message = match download {
+                    Download::Builds => "Nightly and official fallback are ready. Choose which runtime to use.",
+                    Download::Cpu => "The official CPU build and its fallback are ready. Save settings to use the nightly as the CPU runtime.",
+                }
+                .into()
             }
             Err(error) => {
                 progress.message = "Runtime installation did not finish.".into();

@@ -28,7 +28,7 @@ import { DownloadPanel, type DownloadState } from './DownloadPanel';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { HuggingFaceLogo } from './HuggingFaceLogo';
 import { RuntimeManager, type RuntimeDownload } from './RuntimeManager';
-import { instancesOf, playModelAfterLoad, reloadSlot, visibleBanner, waitText } from './ui-state';
+import { instancesOf, latestOnly, panelReplace, playModelAfterLoad, reloadSlot, visibleBanner, waitText, deviceChoice, CPU_DEVICE, type RuntimeDevice } from './ui-state';
 import { containScrollChaining } from './scroll-contain';
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
@@ -38,12 +38,12 @@ import './styles.css';
 // decoded to 3.7 MB of bitmap for the sidebar.
 const logoUrl = new URL('./logo-96.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; cpu_runtime_path: string; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
 
 // One loaded model, with the settings it was loaded with.
 type Instance = { id: string; name: string; label: string; slot: number; suffix: string; default_suffix: string; api_names: string[]; instance_aliases: string[]; path: string; device: string; runtime_path: string; projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null; ready: boolean; context_size: number; gpu_layers: number; required_bytes: number | null; context: { entries: number; last_flushed: number }; keep_context: boolean; settings: Settings };
 type LoadError = { id: string; path: string; slot: number; name: string; message: string };
-type Snapshot = { settings: Settings; running: boolean; ready: boolean; instances: Instance[]; default_model: string | null; routes: ApiRoute[]; library: LibraryState; api_port: number; api_error: string | null; api_notice: string | null; load_errors: LoadError[]; runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; downloads: DownloadState[]; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; fit: Fit | null; model_missing: boolean };
+type Snapshot = { settings: Settings; running: boolean; ready: boolean; instances: Instance[]; default_model: string | null; routes: ApiRoute[]; library: LibraryState; api_port: number; api_error: string | null; api_notice: string | null; load_errors: LoadError[]; runtime_download: RuntimeDownload; cpu_runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; downloads: DownloadState[]; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; model_missing: boolean };
 type Hardware = { ram_bytes: number; vram_bytes: number | null; gpu: string | null; cpu_cores: number };
 type Fit = { level: number; label: string; detail: string; model_bytes: number; required_bytes: number };
 type SavedPreset = { id: string; name: string; questions: unknown; state: string; state_mode: 'text' | 'json' };
@@ -59,19 +59,19 @@ const WHEN_BUSY = [
 ] as const;
 // "Wait up to (ms)": the backend accepts 1–600000 (set_wait_ms in runtime.rs).
 const WAIT_MS = { min: 1, max: 600000, step: 1000 };
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', cpu_runtime_path: '', api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
 // The form is edited in two places, each saved on its own: the Local API
 // load panel (settings a load uses) and the Runtime tab (build and ports).
 // keep_context is the default a new instance starts with; loaded instances
 // have their own switch, so it is not compared for Reload.
-const LOAD_FIELDS = ['model_path', 'mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size', 'gpu_layers', 'keep_context'] as const;
+const LOAD_FIELDS = ['model_path', 'mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size', 'gpu_layers', 'device', 'keep_context'] as const;
 // Decision mode: stored value, UI label, hint under the segmented control.
 const DECISION_MODES = [
   ['auto', 'Auto', 'Uses Prompt layout for Winnow GGUFs, otherwise Built-in when the model and runtime support it.'],
   ['native', 'Built-in', "The model's own decision support, answered by llama.cpp. The model and build must support it."],
   ['winnow', 'Prompt layout', 'Noullama prompts the model and reads the probability of each answer label (Winnow layout).'],
 ] as const;
-const RUNTIME_FIELDS = ['runtime_path', 'library_path', 'api_port', 'runtime_port', 'hf_path'] as const;
+const RUNTIME_FIELDS = ['runtime_path', 'cpu_runtime_path', 'library_path', 'api_port', 'runtime_port', 'hf_path'] as const;
 const isLoadField = (key: keyof Settings) => (LOAD_FIELDS as readonly string[]).includes(key);
 const pick = <K extends keyof Settings>(settings: Settings, keys: readonly K[]) => Object.fromEntries(keys.map(key => [key, settings[key]])) as Pick<Settings, K>;
 const icons = [Route, ShieldCheck, Shield, Mail, Network, Plus];
@@ -104,6 +104,10 @@ function App() {
   // Unsaved edits on the Runtime tab, and in the Local API load panel.
   const [runtimeFormDirty, setRuntimeFormDirty] = useState(false);
   const [loadDirty, setLoadDirty] = useState(false);
+  // The load panel's fit badge for its current values: the fit and how many
+  // loaded instances it sets memory aside for, or why there is none.
+  const [panelFit, setPanelFit] = useState<{ fit: Fit; others: number } | { error: string } | null>(null);
+  const fitRequests = useRef<ReturnType<typeof latestOnly<{ settings: Partial<Settings>; replace: string | null }, { fit: Fit; others: number }>> | null>(null);
   const [preset, setPreset] = useState('triage');
   const [savedPresets, setSavedPresets] = useState<SavedPreset[]>([]);
   const [presetName, setPresetName] = useState('');
@@ -162,6 +166,10 @@ function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [token, setToken] = useState('');
   const [version, setVersion] = useState('');
+  const [cpuVersion, setCpuVersion] = useState('');
+  // The saved GPU runtime's devices for the load panel's "Device" select,
+  // with the runtime and library folders they were read for.
+  const [deviceList, setDeviceList] = useState<{ key: string; devices: RuntimeDevice[]; error: string | null } | null>(null);
   const [copied, setCopied] = useState('');
   const [updates, setUpdates] = useState<UpdateView | null>(null);
   const [updatesOpen, setUpdatesOpen] = useState(false);
@@ -239,6 +247,18 @@ function App() {
     if (runtimeFormDirty && unchanged(RUNTIME_FIELDS)) setRuntimeFormDirty(false);
   }, [settings, savedKey, loadDirty, runtimeFormDirty]);
   useEffect(() => { if (snapshot) setDownloadDir(snapshot.settings.download_dir); }, [snapshot?.settings.download_dir]);
+  // Read when the Local API tab is shown and whenever the saved GPU runtime
+  // changes; the backend keeps the list until the runtime changes.
+  const deviceKey = savedSettings ? `${savedSettings.runtime_path}\n${savedSettings.library_path}` : null;
+  useEffect(() => {
+    if (!desktop || tab !== 'api' || deviceKey === null) return;
+    let live = true;
+    setDeviceList(current => current?.key === deviceKey ? current : null);
+    invoke<{ devices: RuntimeDevice[]; error: string | null }>('runtime_devices')
+      .then(list => { if (live) setDeviceList({ key: deviceKey, devices: list.devices, error: list.error }); })
+      .catch(e => { if (live) setDeviceList({ key: deviceKey, devices: [], error: errorText(e) }); });
+    return () => { live = false; };
+  }, [tab, deviceKey]);
   useEffect(() => {
     const none = { path: settings.model_path, built_in: false, head: null };
     if (!desktop || !settings.model_path) { setMtpResult(none); return; }
@@ -482,14 +502,34 @@ function App() {
   // Whether a load now would differ from what this instance was loaded with:
   // the load panel's values, plus the saved build (unsaved Runtime tab edits
   // are not used by a load).
+  // An instance's settings.device is the device it was loaded on. On the CPU
+  // it ran the CPU runtime with 0 GPU layers, so those are what compare.
+  const device = deviceChoice(settings.device, deviceList?.key === deviceKey ? deviceList.devices : null);
   const differsFrom = (instance: Instance) => instance.path === settings.model_path && (
-    (['mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size', 'gpu_layers'] as const).some(key => settings[key] !== instance.settings[key])
-    || (['runtime_path', 'library_path'] as const).some(key => (savedSettings ?? defaultSettings)[key] !== instance.settings[key]));
+    (['mmproj_path', 'mtp', 'mtp_path', 'decision_mode', 'context_size'] as const).some(key => settings[key] !== instance.settings[key])
+    || (instance.settings.device !== CPU_DEVICE && settings.gpu_layers !== instance.settings.gpu_layers)
+    || (device.effective !== null && device.effective !== instance.settings.device)
+    || (instance.settings.device === CPU_DEVICE ? ['cpu_runtime_path', 'library_path'] as const : ['runtime_path', 'library_path'] as const).some(key => (savedSettings ?? defaultSettings)[key] !== instance.settings[key]));
   const reloadSelected = !!selectedInstance && differsFrom(selectedInstance);
-  // The fit leaves out one instance of the selected file, the one a reload replaces.
-  const otherLoaded = instances.length - (selectedInstance ? 1 : 0);
-  const fit = snapshot?.fit ?? null;
-  const fitDetail = fit ? `${fit.detail}${otherLoaded ? ` Counts the memory the ${otherLoaded === 1 ? 'other loaded model holds' : `${otherLoaded} other loaded models hold`}.` : ''}` : '';
+  // The panel's load: a reload of the picked instance, or a fresh load.
+  const replaceOnLoad = panelReplace(selectedInstance, reloadSelected);
+  // The fit is worked out by the backend for the panel's current values, the
+  // device the load would use and the instance this load replaces. Typing
+  // waits for a pause, one request runs at a time, and the badge keeps its
+  // last result until the new one arrives.
+  const fitArgs = JSON.stringify({ settings: pick(settings, LOAD_FIELDS), replace: replaceOnLoad });
+  const fitContext = `${savedKey}\n${instances.map(i => i.id).join(',')}\n${!!snapshot?.hardware}`;
+  useEffect(() => {
+    if (!desktop) return;
+    if (!settings.model_path) { fitRequests.current?.cancel(); setPanelFit(null); return; }
+    fitRequests.current ??= latestOnly(250, args => invoke<{ fit: Fit; others: number }>('load_fit', args), result => setPanelFit(result.ok ? result.value : { error: errorText(result.error) }));
+    fitRequests.current.request(JSON.parse(fitArgs));
+  }, [fitArgs, fitContext]);
+  useEffect(() => () => fitRequests.current?.cancel(), []);
+  const fit = panelFit && 'fit' in panelFit ? panelFit.fit : null;
+  const otherLoaded = panelFit && 'fit' in panelFit ? panelFit.others : 0;
+  const fitDetail = fit ? `${fit.detail}${otherLoaded ? ` Counts the memory ${otherLoaded === 1 ? 'another loaded model holds' : `${otherLoaded} other loaded models hold`}.` : ''}` : '';
+  const fitNote = !model.selected ? 'Select a model to see how it would run on this machine.' : fit ? fitDetail : panelFit && 'error' in panelFit ? panelFit.error : '';
   const defaultInstance = instances.find(i => i.id === snapshot?.default_model) ?? null;
   const activeInstance = instances.find(i => i.id === playModel) ?? defaultInstance ?? instances[0] ?? null;
   const ready = !!activeInstance?.ready;
@@ -502,10 +542,19 @@ function App() {
   const modelFiles = localModels.filter(file => !isProjector(file.path) && !file.mtp_head);
   const loadErrors = snapshot?.load_errors ?? [];
   const hardware = snapshot?.hardware ?? null;
-  const chosenRuntime = runtimeStatus(settings.runtime_path, selectedInstance?.runtime_path ?? null, !!selectedInstance, snapshot?.data_dir ?? '');
+  // An instance on Device CPU ran the CPU runtime, so that is the selection it is compared with.
+  const chosenRuntime = runtimeStatus(selectedInstance?.settings.device === CPU_DEVICE ? settings.cpu_runtime_path : settings.runtime_path, selectedInstance?.runtime_path ?? null, !!selectedInstance, snapshot?.data_dir ?? '');
   const runtimeName = (path: string) => { const r = runtimeStatus(path, null, false, snapshot?.data_dir ?? ''); return path ? `${r.source} · ${r.name}` : r.name; };
   // The build a load uses: the saved one.
   const loadRuntime = runtimeName(savedSettings?.runtime_path ?? '');
+  // Loads use the saved CPU runtime, like the saved build.
+  const savedCpuRuntime = (savedSettings ?? defaultSettings).cpu_runtime_path;
+  const listError = deviceList?.key === deviceKey && deviceList.error ? `The llama.cpp build in Runtime could not list its devices (${deviceList.error}). ` : '';
+  const deviceNote = device.effective === null ? 'Checking which devices the llama.cpp build reports…'
+    : device.missing ? `${settings.device} was not found: the llama.cpp build in Runtime does not report it. Loads are refused until you choose another device.`
+    : listError + (device.effective === CPU_DEVICE
+      ? savedCpuRuntime.trim() ? `Runs on the CPU runtime (${runtimeName(savedCpuRuntime)}) with GPU layers 0.` : 'Device CPU needs a CPU runtime. Choose or download one under CPU runtime in Runtime.'
+      : 'Each instance runs on this one device; a model is never split across GPUs.');
   const keepsContext = (instance: Instance) => keepOverride[instance.id] ?? instance.keep_context;
   const playContext = activeInstance?.context ?? { entries: 0, last_flushed: 0 };
   const libraryEntries = snapshot?.library?.entries ?? [];
@@ -643,7 +692,12 @@ function App() {
           </div>
         </>}
         {tab === 'runtime' && <>
-          <RuntimeManager currentPath={settings.runtime_path} running={running} progress={snapshot?.runtime_download} onRefresh={refresh} onSelect={runtime => { edit('runtime_path', runtime.path); if (runtime.backend) edit('gpu_layers', runtime.backend === 'cpu' ? 0 : 99); }}>
+          <RuntimeManager currentPath={settings.runtime_path} running={running} progress={snapshot?.runtime_download} onRefresh={refresh} onSelect={runtime => { edit('runtime_path', runtime.path); if (runtime.backend) edit('gpu_layers', runtime.backend === 'cpu' ? 0 : 99); }}
+            cpuPath={settings.cpu_runtime_path} cpuProgress={snapshot?.cpu_runtime_download} cpuName={settings.cpu_runtime_path ? runtimeName(settings.cpu_runtime_path) : 'No CPU runtime selected'} onSelectCpu={runtime => edit('cpu_runtime_path', runtime.path)}
+            cpuChildren={<>
+              <label>Path to CPU llama-server<div className="file-input-row"><input placeholder="/path/to/llama.cpp-cpu/build/bin" value={settings.cpu_runtime_path} onChange={e => edit('cpu_runtime_path', e.target.value)}/><button className="secondary" type="button" disabled={isBusy('probe-cpu') || !settings.cpu_runtime_path.trim()} onClick={() => action('probe-cpu', async () => setCpuVersion(await invoke('probe_runtime', { path: settings.cpu_runtime_path, libraryPath: settings.library_path })))}><RefreshCw size={14} className={isBusy('probe-cpu') ? 'spin' : ''}/>Check</button></div><small>A CPU build's folder or its llama-server. "Use for CPU" above fills this in. Saved with the save bar below.</small></label>
+              {cpuVersion && <pre className="runtime-version">{cpuVersion}</pre>}
+            </>}>
             <label>Path to llama-server<div className="file-input-row"><input placeholder="/path/to/llama.cpp/build/bin" value={settings.runtime_path} onChange={e => edit('runtime_path', e.target.value)}/><button className="secondary" type="button" disabled={isBusy('probe')} onClick={() => action('probe', async () => setVersion(await invoke('probe_runtime', { path: settings.runtime_path, libraryPath: settings.library_path })))}><RefreshCw size={14} className={isBusy('probe') ? 'spin' : ''}/>Check</button></div><small>A runtime folder or the llama-server executable. Choosing a build above fills this in.</small></label>
             {version && <pre className="runtime-version">{version}</pre>}
             <label>Shared-library folders (optional)<input placeholder="Found automatically, or /usr/local/cuda/lib64" value={settings.library_path} onChange={e => edit('library_path', e.target.value)}/><small>For CUDA or other libraries the runtime cannot find. Separate folders with a colon. Only the runtime process sees them.</small></label>
@@ -690,19 +744,20 @@ function App() {
               <span className={`chip ${model.ready ? 'success' : ''}`}><span className={`status-dot ${model.ready ? 'green' : model.loaded ? 'amber' : ''}`}/>{isBusy('start') ? 'Starting…' : model.label}</span>
               {selectedInstances.length > 1 && <div className="load-instance"><Select label="Instance" value={selectedInstance?.id ?? ''} options={selectedInstances.map(i => ({ value: i.id, label: `${apiName(i)} · instance\u00a0${i.slot}${i.ready ? '' : ' (loading)'}` }))} onChange={setLoadTarget}/></div>}
             </div>
-            <p className="hint fit-note">{fit ? fitDetail : model.selected ? 'The selected model file could not be read.' : 'Select a model to see how it would run on this machine.'}</p>
+            <p className="hint fit-note">{fitNote || '\u00a0'}</p>
             <label>Model file (GGUF)<div className="file-input-row"><input placeholder="/path/to/model.gguf" value={settings.model_path} onChange={e => edit('model_path', e.target.value)}/><button className="secondary" type="button" disabled={modelPending} onClick={() => browseFile('model_path')}><FolderOpen size={14}/>Browse file</button><button className="secondary" type="button" disabled={modelPending} onClick={() => setTab('models')}><Layers3 size={14}/>Select model</button></div></label>
             <div className="field"><div className="field-row"><span>Multimodal projector</span><Toggle label={settings.mmproj_path ? 'On' : 'Off'} ariaLabel="Multimodal projector" title={settings.mmproj_path ? `Loads ${basename(settings.mmproj_path)}` : projector ? `Load ${basename(projector)} with this model` : undefined} checked={!!settings.mmproj_path} disabled={!settings.mmproj_path && !projector} onChange={on => edit('mmproj_path', on ? projector : '')}/></div>{settings.mmproj_path ? <div className="file-input-row"><input aria-label="Multimodal projector path" placeholder="/path/to/mmproj.gguf" value={settings.mmproj_path} onChange={e => edit('mmproj_path', e.target.value)}/><button className="secondary" type="button" disabled={modelPending} onClick={() => browseFile('mmproj_path')}><FolderOpen size={14}/>Browse</button></div> : <small>{projector ? `Found ${basename(projector)} next to the selected model.` : <>No projector next to the selected model. <button type="button" className="text-button inline" disabled={modelPending} onClick={() => browseFile('mmproj_path')}>Choose a file</button></>}</small>}<small>Lets image-capable models read images in the Playground.</small></div>
             <div className="field"><div className="field-row"><span>Multi-token prediction (MTP)</span><Toggle label={settings.mtp ? 'On' : 'Off'} ariaLabel="Multi-token prediction" title={settings.mtp || mtpAvailable ? mtpTitle : undefined} checked={settings.mtp} disabled={!settings.mtp && !mtpAvailable} onChange={setMtp}/></div>{settings.mtp_path ? <div className="file-input-row"><input aria-label="MTP head path" placeholder="/path/to/mtp-model.gguf" value={settings.mtp_path} onChange={e => edit('mtp_path', e.target.value)}/><button className="secondary" type="button" disabled={modelPending} onClick={() => browseFile('mtp_path')}><FolderOpen size={14}/>Browse</button></div> : <small>{builtInMtp ? 'The selected model has built-in MTP layers.' : mtpHead ? `Found ${basename(mtpHead)} next to the selected model.` : <>No MTP layers in the selected model and no matching MTP head next to it. <button type="button" className="text-button inline" disabled={modelPending} onClick={() => browseFile('mtp_path')}>Choose a file</button></>}</small>}<small>Drafts several tokens per step with the model's MTP layers, which can speed up generation. Needs a llama.cpp build with MTP support.</small></div>
             <div className="field"><div className="field-row"><span>Decision mode</span><div className="segmented" role="group" aria-label="Decision mode">{DECISION_MODES.map(([value, label]) => <button key={value} type="button" className={settings.decision_mode === value ? 'on' : ''} aria-pressed={settings.decision_mode === value} onClick={() => edit('decision_mode', value)}>{label}</button>)}</div></div><small>{(DECISION_MODES.find(([value]) => value === settings.decision_mode) ?? DECISION_MODES[0])[2]}</small></div>
             <div className="field"><div className="field-row"><span>Keep context</span><Toggle label={settings.keep_context ? 'On' : 'Off'} ariaLabel="Keep context for new loads" checked={settings.keep_context} onChange={on => edit('keep_context', on)}/></div><small>Whether a newly loaded model starts with Keep context on. Loaded models have their own switch on their card below; this does not change them.</small></div>
-            <div className="form-grid"><label>Context size<NumberField min={512} max={131072} step={1024} value={settings.context_size} onChange={value => edit('context_size', value)}/><small>Maximum tokens per request. The default is 8192.</small></label><label>GPU layers<NumberField min={-1} value={settings.gpu_layers} onChange={value => edit('gpu_layers', value)}/><small>0 runs on the CPU. 99 puts every layer that fits on the GPU.</small></label></div>
+            <div className="form-grid"><label>Context size<NumberField min={512} max={131072} step={1024} value={settings.context_size} onChange={value => edit('context_size', value)}/><small>Maximum tokens per request. The default is 8192.</small></label><label>GPU layers<NumberField min={-1} value={settings.gpu_layers} onChange={value => edit('gpu_layers', value)}/><small>{device.effective === CPU_DEVICE ? 'Not used on Device CPU, which always loads with 0.' : '0 runs on the CPU. 99 puts every layer that fits on the GPU.'}</small></label></div>
+            <div className="field"><div className="field-row"><span>Device</span><div className="load-device"><Select label="Device" value={device.value} disabled={!device.effective} options={device.options} onChange={value => edit('device', value)}/></div></div><small>{deviceNote}</small></div>
             <div className="field"><div className="field-row"><span>llama.cpp build</span><span className="load-build"><code title={savedSettings?.runtime_path || undefined}>{loadRuntime}</code><button type="button" className="text-button" onClick={() => setTab('runtime')}>Change in Runtime<ArrowRight size={13}/></button></span></div><small>{runtimeFormDirty ? 'The Runtime tab has unsaved changes. Loads use the saved build and shared-library folders until you save them there.' : 'The build and shared-library folders saved on the Runtime tab.'}</small></div>
           </div></section>
           <div className={`save-bar load-bar ${loadDirty ? 'dirty' : ''}`}><span className="hint">{loadDirty ? 'You have unsaved changes. Loading saves them first.' : reloadSelected ? 'The selected model was loaded with other settings. Reload model applies these.' : selectedInstances.length > 1 ? `The selected model is loaded ${selectedInstances.length} times. Eject and Reload act on the instance chosen above.` : selectedInstance ? 'The selected model is loaded with these settings.' : running ? 'Settings apply when you load. Loaded models keep the settings they started with.' : 'Settings apply when you load.'}</span><div className="load-bar-actions">
             <button className="secondary" disabled={!loadDirty || modelPending} onClick={() => action('save-load', async () => { await saveLoadSettings(); setNotice({ text: 'Settings saved.', error: false }); })}>Save settings</button>
             {selectedInstance && <button className="secondary" disabled={modelPending} title={selectedInstance.ready ? `Unload ${apiName(selectedInstance)}; other loaded models keep running` : undefined} onClick={() => void eject(selectedInstance.id)}>{selectedInstance.ready ? <Unplug size={13}/> : <Square size={13}/>}{selectedInstance.ready ? 'Eject' : 'Cancel loading'}</button>}
-            {(!selectedInstance || reloadSelected) && <button className="primary" disabled={modelPending || !model.selected || model.missing || (!!selectedInstance && !selectedInstance.ready)} title={!selectedInstance && running ? 'Loads beside the models already loaded' : undefined} onClick={() => void loadSelected({ replace: selectedInstance?.id ?? null })}>{isBusy('start') ? <RefreshCw className="spin" size={14}/> : <Play size={14}/>} {isBusy('start') ? 'Starting…' : selectedInstance ? 'Reload model' : running ? 'Load beside' : 'Load model'}</button>}
+            {(!selectedInstance || reloadSelected) && <button className="primary" disabled={modelPending || !model.selected || model.missing || (!!selectedInstance && !selectedInstance.ready)} title={!selectedInstance && running ? 'Loads beside the models already loaded' : undefined} onClick={() => void loadSelected({ replace: replaceOnLoad })}>{isBusy('start') ? <RefreshCw className="spin" size={14}/> : <Play size={14}/>} {isBusy('start') ? 'Starting…' : selectedInstance ? 'Reload model' : running ? 'Load beside' : 'Load model'}</button>}
             {selectedInstance && <button className={reloadSelected ? 'secondary' : 'primary'} disabled={modelPending || !model.selected || model.missing} title="Loads one more instance of this file beside the loaded one. It answers to the file's names with a suffix such as -i-2." onClick={() => void loadSelected()}>{isBusy('start') ? <RefreshCw className="spin" size={14}/> : <Plus size={14}/>} {isBusy('start') ? 'Starting…' : 'Load another instance'}</button>}
           </div></div>
           {instances.length > 0 && <><div className="section-heading"><h2>Loaded</h2><span>{instances.length} {instances.length === 1 ? 'model' : 'models'} · each keeps the settings it was loaded with</span></div><div className="loaded-list">{instances.map(instance => <InstanceCard key={instance.id} instance={instance} account={accountFor(instance.path)} runtime={runtimeName(instance.runtime_path || instance.settings.runtime_path)} aliases={aliasesFor(instance.path)} routes={routes} displayName={apiName(instance)}
@@ -730,7 +785,7 @@ function App() {
     <ContextMenu/>
     {updates && <UpdatesDialog open={updatesOpen} view={updates} onClose={() => setUpdatesOpen(false)} onCheck={() => { void updateCommand('check_for_update'); }} onInstall={() => { void updateCommand('install_update'); }} onPrefs={(includePrereleases, checkOnLaunch) => { setUpdates(view => view && { ...view, include_prereleases: includePrereleases, check_on_launch: checkOnLaunch }); void updateCommand('set_update_prefs', { includePrereleases, checkOnLaunch }); }}/>}
     <DeletePresetDialog name={presetToDelete?.name ?? null} pending={isBusy('preset')} onCancel={() => setPresetToDelete(null)} onConfirm={() => { if (presetToDelete) void trashPreset(presetToDelete.id); }}/>
-    <QuitDialog open={quitPrompt} pending={isBusy('quit') || isBusy('cancel-quit')} onCancel={() => { setQuitPrompt(false); void action('cancel-quit', async () => { await invoke('cancel_quit'); }); }} onConfirm={() => { void action('quit', async () => { await invoke('quit_app'); }); }}/>
+    <QuitDialog open={quitPrompt} pending={isBusy('quit') || isBusy('cancel-quit')} loaded={snapshot ? snapshot.instances.length : null} onCancel={() => { setQuitPrompt(false); void action('cancel-quit', async () => { await invoke('cancel_quit'); }); }} onConfirm={() => { void action('quit', async () => { await invoke('quit_app'); }); }}/>
     {showLogs && <div className="log-drawer"><div className="panel-heading"><span><Terminal size={16}/> Runtime activity</span><button className="icon-button" aria-label="Close runtime logs" onClick={() => setShowLogs(false)}><X size={17}/></button></div><pre>{snapshot?.logs.join('\n') || 'No runtime activity yet.'}</pre></div>}
   </div>;
 }
