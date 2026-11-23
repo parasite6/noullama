@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { deviceChoice, instancesOf, latestOnly, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
+import { apiKeyAccessSummary, apiKeyExpiry, apiKeyExpiryOptions, apiKeyModelOptions, deviceChoice, enablesKeyboardFocus, instancesOf, latestOnly, panelReplace, playModelAfterLoad, quitText, reloadSlot } from './ui-state.ts';
 
 const file = '/models/acme/qwen.gguf';
 const first = { id: 'a1', slot: 1, path: file };
@@ -109,4 +109,56 @@ test('the quit prompt counts the loaded models', () => {
   assert.equal(quitText(null), 'The local API and any loaded models will stop. Active downloads will also stop.');
   const dialog = readFileSync(new URL('./QuitDialog.tsx', import.meta.url), 'utf8');
   assert.match(dialog, /<p id="quit-description">\{quitText\(loaded\)\}<\/p>/, 'the dialog shows the counted text');
+});
+
+test('API key expiry supports each preset and the end of a custom local day', () => {
+  const now = new Date(2028, 1, 28, 12).getTime();
+  assert.equal(apiKeyExpiry('never', '', now), null);
+  assert.deepEqual(apiKeyExpiryOptions.map(option => option.value), ['never', '1', '7', '30', '90', '365', 'custom']);
+  for (const days of [1, 7, 30, 90, 365]) {
+    assert.equal(apiKeyExpiry(String(days), '', now), now / 1000 + days * 86400);
+  }
+  assert.equal(apiKeyExpiry('custom', '2028-02-29', now), new Date(2028, 2, 1).getTime() / 1000);
+  assert.throws(() => apiKeyExpiry('custom', '2028-02-30', now), /Choose an expiry date/);
+  assert.throws(() => apiKeyExpiry('custom', '2028-02-27', now), /Choose today or a future date/);
+});
+
+test('API key access summaries show model identifiers and aliases at creation', () => {
+  assert.equal(apiKeyAccessSummary(null), 'Any');
+  assert.equal(apiKeyAccessSummary([
+    { name: 'sorter', aliases: ['triage', 'tickets'] },
+    { name: 'review', aliases: [] },
+  ]), 'sorter (aliases at creation: triage, tickets) · review');
+});
+
+test('API key options show each Library alias with its model and retain its selected name', () => {
+  const options = apiKeyModelOptions([
+    { path: '/models/sorter.gguf', name: 'sorter', aliases: ['fast', 'triage'] },
+    { path: '/models/other.gguf', name: 'other', aliases: [] },
+  ]);
+  assert.deepEqual(options.map(option => option.label), ['sorter', 'fast → sorter', 'triage → sorter', 'other']);
+  assert.deepEqual(options[1].selection, { path: '/models/sorter.gguf', name: 'fast' });
+  assert.equal(new Set(options.map(option => option.id)).size, options.length);
+  const [other, moved] = apiKeyModelOptions([{ path: '/models/other.gguf', name: 'other', aliases: ['fast'] }]);
+  assert.equal(other.id, options[3].id);
+  assert.notEqual(moved.id, options[1].id);
+  assert.deepEqual(apiKeyModelOptions([]), []);
+});
+
+test('focus rings start only with navigation or control activation', () => {
+  const key = (key: string, modifiers = {}) => ({ key, altKey: false, ctrlKey: false, metaKey: false, ...modifiers });
+  for (const name of ['Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']) {
+    assert.equal(enablesKeyboardFocus(key(name), false), true, name);
+  }
+  assert.equal(enablesKeyboardFocus(key('Tab', { shiftKey: true }), false), true);
+  for (const name of ['Meta', 'Super', 'OS', 'Alt', 'Control', 'Shift', 'Escape', 'a']) {
+    assert.equal(enablesKeyboardFocus(key(name), true), false, name);
+  }
+  for (const name of ['Enter', ' ']) {
+    assert.equal(enablesKeyboardFocus(key(name), true), true, name);
+    assert.equal(enablesKeyboardFocus(key(name), false), false, name);
+  }
+  for (const modifier of ['altKey', 'ctrlKey', 'metaKey']) {
+    assert.equal(enablesKeyboardFocus(key('ArrowLeft', { [modifier]: true }), true), false, modifier);
+  }
 });

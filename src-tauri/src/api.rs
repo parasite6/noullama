@@ -1,3 +1,4 @@
+use crate::api_keys::{Access, Rejection};
 use crate::runtime::{validate_request, AnyError, AppState, RouteError, ANY_AVAILABLE};
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
@@ -5,7 +6,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde_json::{json, Value};
 
@@ -23,6 +24,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/systemone", post(systemone))
         .route("/v1/chat/completions", post(chat))
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), loopback_only))
         .with_state(state)
@@ -52,6 +55,31 @@ async fn loopback_only(State(state): State<AppState>, request: Request, next: Ne
         )
         .into_response();
     }
+    next.run(request).await
+}
+
+async fn authorize(State(state): State<AppState>, mut request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    let access = if (path == "/health" || path.starts_with("/v1/")) && state.settings.lock().await.require_api_key {
+        let headers = request.headers().get_all(axum::http::header::AUTHORIZATION);
+        let mut values = headers.iter();
+        let bearer = values.next().and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())
+            .map(|(_, token)| token);
+        let Some(key) = bearer.filter(|_| values.next().is_none()) else {
+            return ApiError(StatusCode::UNAUTHORIZED, "Missing API key. Send Authorization: Bearer <key>.".into()).into_response();
+        };
+        match state.api_keys.authorize(key).await {
+            Ok(access) => access,
+            Err(Rejection::Unknown) => return ApiError(StatusCode::UNAUTHORIZED, "Unknown API key.".into()).into_response(),
+            Err(Rejection::Expired) => return ApiError(StatusCode::UNAUTHORIZED, "API key has expired.".into()).into_response(),
+            Err(Rejection::Unavailable) => return ApiError(StatusCode::SERVICE_UNAVAILABLE, "Cannot read API key file.".into()).into_response(),
+        }
+    } else {
+        Access::default()
+    };
+    request.extensions_mut().insert(access);
     next.run(request).await
 }
 
@@ -162,10 +190,10 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         json!({"status":"ok", "service":"noullama", "api_port":state.listening_port(), "model_ready": state.any_ready().await}),
     )
 }
-async fn models(State(state): State<AppState>) -> Json<Value> {
+async fn models(State(state): State<AppState>, Extension(access): Extension<Access>) -> Json<Value> {
     // Every name that reaches a ready model; several can reach the same one.
     let data: Vec<Value> = state
-        .model_names()
+        .model_names(&access)
         .await
         .into_iter()
         .map(|id| json!({"id":id, "object":"model", "created":0, "owned_by":"local", "architecture":{"output_modalities":["decisions"]}}))
@@ -174,7 +202,7 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
 }
 /// Routes a decision to the loaded model its `model` field names and returns
 /// the result with the name the caller used.
-async fn infer(state: &AppState, payload: Value) -> Result<(Value, String), ApiError> {
+async fn infer(state: &AppState, payload: Value, access: &Access) -> Result<(Value, String), ApiError> {
     validate_request(&payload).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     let requested = match payload.get("model") {
         None | Some(Value::Null) => None,
@@ -184,15 +212,16 @@ async fn infer(state: &AppState, payload: Value) -> Result<(Value, String), ApiE
     // `any-available` (exact) claims an idle instance of any model, waiting
     // for one when the setting says so; every other name routes as usual.
     let result = if requested.as_deref() == Some(ANY_AVAILABLE) {
-        let claim = state.claim_any().await.map_err(|error| match error {
+        let claim = state.claim_any(access).await.map_err(|error| match error {
             AnyError::NoneReady(m) | AnyError::Busy(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
         })?;
         state.infer_claimed(&claim, payload).await
     } else {
-        let instance = state.route(requested.as_deref()).await.map_err(|error| match error {
+        let instance = state.route(requested.as_deref(), access).await.map_err(|error| match error {
             RouteError::Missing(m) => ApiError(StatusCode::BAD_REQUEST, m),
             RouteError::Unavailable(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
             RouteError::Unknown(m) => ApiError(StatusCode::NOT_FOUND, m),
+            RouteError::Forbidden => ApiError(StatusCode::FORBIDDEN, "API key does not allow this model.".into()),
             RouteError::Ambiguous(m) => ApiError(StatusCode::CONFLICT, m),
         })?;
         state.infer_on(&instance, payload).await
@@ -204,8 +233,8 @@ async fn infer(state: &AppState, payload: Value) -> Result<(Value, String), ApiE
     }
     Ok((result, requested))
 }
-async fn systemone(State(state): State<AppState>, Json(payload): Json<Value>) -> ApiResult {
-    infer(&state, payload).await.map(|(result, _)| Json(result))
+async fn systemone(State(state): State<AppState>, Extension(access): Extension<Access>, Json(payload): Json<Value>) -> ApiResult {
+    infer(&state, payload, &access).await.map(|(result, _)| Json(result))
 }
 
 pub fn chat_payload(body: &Value) -> Result<Value, String> {
@@ -245,9 +274,9 @@ pub fn chat_payload(body: &Value) -> Result<Value, String> {
     Ok(payload)
 }
 
-async fn chat(State(state): State<AppState>, Json(body): Json<Value>) -> ApiResult {
+async fn chat(State(state): State<AppState>, Extension(access): Extension<Access>, Json(body): Json<Value>) -> ApiResult {
     let payload = chat_payload(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    let (result, model) = infer(&state, payload).await?;
+    let (result, model) = infer(&state, payload, &access).await?;
     let input = result["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -445,6 +474,219 @@ pub(crate) mod tests {
     fn request() -> Value {
         json!({"state":"charged twice", "questions":{"route":{"type":"choice","instructions":"Which team?", "criteria":{"billing":null,"technical":null}}}})
     }
+
+    async fn keyed_request(app: &Router, uri: &str, key: Option<&str>, payload: Option<Value>) -> (StatusCode, Value) {
+        let mut request = Request::builder().uri(uri).header("host", "127.0.0.1:11435");
+        if let Some(key) = key {
+            request = request.header("authorization", format!("Bearer {key}"));
+        }
+        let body = if let Some(payload) = payload {
+            request = request.method("POST").header("content-type", "application/json");
+            Body::from(payload.to_string())
+        } else {
+            Body::empty()
+        };
+        let response = app.clone().oneshot(request.body(body).unwrap()).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    async fn keyed_decision(app: &Router, key: &str, model: &str) -> StatusCode {
+        let mut payload = request();
+        payload["model"] = json!(model);
+        keyed_request(app, "/v1/systemone", Some(key), Some(payload)).await.0
+    }
+
+    #[tokio::test]
+    async fn api_key_switch_checks_missing_unknown_and_expired_keys_on_api_and_health() {
+        let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        let app = router(state.clone());
+        assert_eq!(keyed_request(&app, "/v1/models", None, None).await.0, StatusCode::OK);
+        assert_eq!(keyed_request(&app, "/health", None, None).await.0, StatusCode::OK);
+        let created = serde_json::to_value(crate::api_keys::create(&state, "Example", None, None).await.unwrap()).unwrap();
+        let key = created["key"].as_str().unwrap();
+        let file = dir.join("api-keys.json");
+        let mut keys: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        keys[0]["expires"] = json!(1);
+        std::fs::write(file, serde_json::to_vec(&keys).unwrap()).unwrap();
+        let valid = serde_json::to_value(crate::api_keys::create(&state, "Current", None, None).await.unwrap()).unwrap();
+        let valid = valid["key"].as_str().unwrap();
+        crate::runtime::update_settings(&state, |settings| {
+            settings.require_api_key = true;
+            Ok(())
+        }).await.unwrap();
+        for uri in ["/v1/models", "/health"] {
+            for (token, message) in [
+                (None, "Missing API key. Send Authorization: Bearer <key>."),
+                (Some("unknown"), "Unknown API key."),
+                (Some(key), "API key has expired."),
+            ] {
+                let (status, body) = keyed_request(&app, uri, token, None).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(body["error"]["message"], message);
+                assert_eq!(body["error"]["code"], 401);
+            }
+        }
+        assert_eq!(keyed_request(&app, "/v1/unknown", None, None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(keyed_request(&app, "/v1/chat/completions", None, Some(json!({}))).await.0, StatusCode::UNAUTHORIZED);
+        let (status, body) = keyed_request(&app, "/health", Some(valid), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"status":"ok","service":"noullama","api_port":11435,"model_ready":false}));
+        assert!(AppState::new(dir.clone()).unwrap().settings.lock().await.require_api_key);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn choosing_library_aliases_creates_one_model_binding_and_refuses_a_moved_alias() {
+        use crate::{api_keys::{create, ModelSelection}, library};
+        let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        state.settings.lock().await.sha256_check = "off".into();
+        let sorter = dir.join("sorter.gguf").to_str().unwrap().to_owned();
+        let other = dir.join("other.gguf").to_str().unwrap().to_owned();
+        std::fs::write(&sorter, "model bytes").unwrap();
+        library::ensure(&state, &[sorter.clone(), other.clone()]).await;
+        crate::runtime::set_aliases(&state, sorter.clone(), vec!["fast".into(), "triage".into()]).await.unwrap();
+        let (port, _) = fake_native_runtime().await;
+        crate::runtime::insert_test_instance_on(&state, &sorter, true, port).await;
+        crate::runtime::insert_test_instance_on(&state, &sorter, true, port).await;
+        crate::runtime::insert_test_instance_on(&state, &other, true, port).await;
+        let pick = |name: &str| ModelSelection { path: sorter.clone(), name: name.into() };
+        let picked = serde_json::to_value(create(&state, "Alias only", None, Some(vec![pick("fast")])).await.unwrap()).unwrap();
+        let bindings = &picked["info"]["models"];
+        assert_eq!(bindings[0]["name"], "sorter");
+        let mixed = serde_json::to_value(create(&state, "Mixed", None, Some(vec![
+            pick("fast"), pick("sorter"), pick("triage"),
+        ])).await.unwrap()).unwrap();
+        assert_eq!(bindings.as_array().unwrap().len(), 1);
+        assert_eq!(&mixed["info"]["models"], bindings);
+
+        state.settings.lock().await.require_api_key = true;
+        let app = router(state.clone());
+        let key = picked["key"].as_str().unwrap();
+        for name in ["sorter", "fast", "triage", "sorter-i-2"] {
+            assert_eq!(keyed_decision(&app, key, name).await, StatusCode::OK, "{name}");
+        }
+        assert_eq!(keyed_request(&app, "/health", Some(key), None).await.0, StatusCode::OK);
+
+        crate::runtime::set_aliases(&state, sorter, vec!["triage".into()]).await.unwrap();
+        crate::runtime::set_aliases(&state, other, vec!["fast".into()]).await.unwrap();
+        assert_eq!(keyed_decision(&app, key, "fast").await, StatusCode::FORBIDDEN);
+        assert_eq!(keyed_decision(&app, key, "sorter").await, StatusCode::OK);
+        assert_eq!(keyed_request(&app, "/health", Some(key), None).await.0, StatusCode::OK);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn api_keys_route_and_list_only_models_matching_their_library_bindings() {
+        use crate::{api_keys::{create, ModelSelection}, library};
+        let dir = std::env::temp_dir().join(format!("noullama-test-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(dir.clone()).unwrap();
+        state.settings.lock().await.sha256_check = "off".into();
+        let a_path = dir.join("sorter.gguf").to_str().unwrap().to_owned();
+        let b_path = dir.join("other.gguf").to_str().unwrap().to_owned();
+        std::fs::write(&a_path, "model bytes").unwrap();
+        std::fs::write(&b_path, "other model bytes").unwrap();
+        let (a_port, seen_a) = fake_native_runtime().await;
+        let (b_port, seen_b) = fake_native_runtime().await;
+        let first = crate::runtime::insert_test_instance_on(&state, &a_path, true, a_port).await;
+        let second = crate::runtime::insert_test_instance_on(&state, &a_path, true, a_port).await;
+        let other = crate::runtime::insert_test_instance_on(&state, &b_path, true, b_port).await;
+        library::ensure(&state, &[a_path.clone(), b_path.clone()]).await;
+        crate::runtime::set_aliases(&state, a_path.clone(), vec!["triage".into()]).await.unwrap();
+        crate::runtime::change_instance_aliases(&state, &second.id, vec!["session-alias".into()]).await.unwrap();
+        let restricted = serde_json::to_value(create(&state, "Restricted", None, Some(vec![
+            ModelSelection { path: a_path.clone(), name: "sorter".into() },
+        ])).await.unwrap()).unwrap();
+        assert!(state.library.lock().await.entry(&a_path).unwrap().sha256.is_empty());
+        assert_eq!(restricted["info"]["models"][0]["aliases"], json!(["triage"]));
+        let both = serde_json::to_value(create(&state, "Both", None, Some(vec![
+            ModelSelection { path: a_path.clone(), name: "sorter".into() },
+            ModelSelection { path: b_path.clone(), name: "other".into() },
+        ])).await.unwrap()).unwrap();
+        let both = both["key"].as_str().unwrap();
+        let any = serde_json::to_value(create(&state, "Any", None, None).await.unwrap()).unwrap();
+        let sum = restricted["info"]["models"][0]["sha256"].as_str().unwrap().to_owned();
+        let restricted = restricted["key"].as_str().unwrap();
+        let any = any["key"].as_str().unwrap();
+        state.settings.lock().await.require_api_key = true;
+        let app = router(state.clone());
+
+        for name in ["sorter", "triage", "sorter-i-2", "triage-i-2", "session-alias"] {
+            assert_eq!(keyed_decision(&app, restricted, name).await, StatusCode::OK, "{name}");
+        }
+        let (_, list) = keyed_request(&app, "/v1/models", Some(restricted), None).await;
+        let names: Vec<_> = list["data"].as_array().unwrap().iter().map(|model| model["id"].as_str().unwrap()).collect();
+        assert_eq!(names, ["sorter", "triage", "sorter-i-2", "triage-i-2", "session-alias", "any-available"]);
+        assert_eq!(keyed_decision(&app, restricted, "other").await, StatusCode::FORBIDDEN);
+        assert_eq!(keyed_decision(&app, any, "other").await, StatusCode::OK);
+        assert_eq!(keyed_decision(&app, any, "triage").await, StatusCode::OK);
+        let (_, full_list) = keyed_request(&app, "/v1/models", Some(any), None).await;
+        assert!(full_list["data"].as_array().unwrap().iter().any(|model| model["id"] == "other"));
+
+        let held_first = crate::runtime::hold_test_claim(&state, &first);
+        let held_second = crate::runtime::hold_test_claim(&state, &second);
+        assert_eq!(keyed_decision(&app, restricted, "any-available").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(keyed_decision(&app, any, "any-available").await, StatusCode::OK);
+        drop(held_second);
+        let calls_before = seen_a.lock().unwrap().len();
+        assert_eq!(keyed_decision(&app, restricted, "any-available").await, StatusCode::OK);
+        assert_eq!(seen_a.lock().unwrap().len(), calls_before + 1);
+        assert_eq!(seen_b.lock().unwrap().len(), 2);
+        drop(held_first);
+
+        crate::runtime::set_when_busy(&state, "wait").await.unwrap();
+        let held_first = crate::runtime::hold_test_claim(&state, &first);
+        let held_second = crate::runtime::hold_test_claim(&state, &second);
+        let waiting = keyed_decision(&app, restricted, "any-available");
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiting).await.is_err());
+        drop(held_first);
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap(), StatusCode::OK);
+        drop(held_second);
+
+        let (original, revision) = {
+            let lib = state.library.lock().await;
+            (lib.entries.clone(), lib.revision)
+        };
+        let mut moved = original.clone();
+        moved.iter_mut().find(|entry| entry.path == a_path).unwrap().aliases.clear();
+        moved.iter_mut().find(|entry| entry.path == b_path).unwrap().aliases.push("triage".into());
+        library::save(&state, moved, revision).await.unwrap();
+        assert_eq!(keyed_decision(&app, restricted, "triage").await, StatusCode::FORBIDDEN);
+        assert_eq!(keyed_decision(&app, both, "other").await, StatusCode::OK);
+        assert_eq!(keyed_decision(&app, both, "triage").await, StatusCode::FORBIDDEN);
+        let (_, list) = keyed_request(&app, "/v1/models", Some(both), None).await;
+        assert!(list["data"].as_array().unwrap().iter().all(|model| model["id"] != "triage"));
+        assert_eq!(keyed_decision(&app, any, "triage").await, StatusCode::OK);
+
+        let changed_path = dir.join("replacement.gguf").to_str().unwrap().to_owned();
+        crate::runtime::insert_test_instance_on(&state, &changed_path, true, a_port).await;
+        for field in ["path", "name", "sha256"] {
+            let mut entries = original.clone();
+            let entry = entries.iter_mut().find(|entry| entry.path == a_path).unwrap();
+            entry.sha256.clone_from(&sum);
+            match field {
+                "path" => entry.path.clone_from(&changed_path),
+                "name" => entry.name = "renamed".into(),
+                _ => entry.sha256 = "00".repeat(32),
+            }
+            let revision = state.library.lock().await.revision;
+            library::save(&state, entries, revision).await.unwrap();
+            assert_eq!(keyed_decision(&app, restricted, "triage").await, StatusCode::FORBIDDEN, "{field}");
+            assert_eq!(keyed_decision(&app, any, "triage").await, StatusCode::OK, "{field}");
+        }
+        assert_eq!(keyed_request(&app, "/v1/models", Some(restricted), None).await.1["data"], json!([]));
+        assert_eq!(keyed_decision(&app, restricted, "any-available").await, StatusCode::SERVICE_UNAVAILABLE);
+        let mut content = request();
+        content["model"] = json!("other");
+        let chat = json!({"messages":[{"role":"user","content":content.to_string()}]});
+        assert_eq!(keyed_request(&app, "/v1/chat/completions", Some(restricted), Some(chat)).await.0, StatusCode::FORBIDDEN);
+        assert!(!other.is_busy());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn chat_keeps_state_and_questions_without_inventing_prompts() {
         let body = json!({"model":"d1-3B-Q8_0","messages":[{"role":"user","content":request().to_string()}]});
@@ -530,7 +772,7 @@ pub(crate) mod tests {
         let ids: Vec<&str> = body["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["d1-3B-Q8_0", "triage", "Winnow-E4B-Q8_0", "sorter", "any-available"]);
         for (name, expected) in [("triage", &d1), ("d1-3B-Q8_0", &d1), ("sorter", &winnow), ("Winnow-E4B-Q8_0", &winnow)] {
-            assert_eq!(state.route(Some(name)).await.ok().map(|i| i.id.clone()), Some(expected.id.clone()), "{name}");
+            assert_eq!(state.route(Some(name), &Access::default()).await.ok().map(|i| i.id.clone()), Some(expected.id.clone()), "{name}");
         }
         // Names are exact: no other casing, no default name, no missing name.
         for name in ["TRIAGE", "winnow-e4b-q8_0", "noullama", " triage"] {
@@ -542,7 +784,7 @@ pub(crate) mod tests {
         let (status, message) = status_and_message(&app, "").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(message.contains("d1-3B-Q8_0, triage"), "{message}");
-        assert!(matches!(state.route(None).await, Err(RouteError::Missing(_))));
+        assert!(matches!(state.route(None, &Access::default()).await, Err(RouteError::Missing(_))));
         let (status, message) = status_and_message(&app, "other").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(message.contains("d1-3B-Q8_0, triage, Winnow-E4B-Q8_0, sorter"), "{message}");
@@ -558,7 +800,7 @@ pub(crate) mod tests {
         let mut entries = state.library.lock().await.entries.clone();
         entries.iter_mut().find(|e| e.path == d1.path()).unwrap().name = "billing-router".into();
         crate::library::save(&state, entries.clone(), revision).await.unwrap();
-        assert_eq!(state.route(Some("billing-router")).await.ok().map(|i| i.id.clone()), Some(d1.id.clone()));
+        assert_eq!(state.route(Some("billing-router"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(d1.id.clone()));
         assert_eq!(status_and_message(&app, "d1-3B-Q8_0").await.0, StatusCode::NOT_FOUND);
         // An editor working from an older copy cannot overwrite the newer file.
         assert!(crate::library::save(&state, entries, revision).await.unwrap_err().contains("changed since you started editing"));
@@ -580,10 +822,10 @@ pub(crate) mod tests {
         let (status, message) = status_and_message(&app, "model-Q4_K_M").await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(message.contains("/a/model-Q4_K_M.gguf, /b/model-Q4_K_M.gguf"), "{message}");
-        assert!(!state.model_names().await.iter().any(|n| n == "model-Q4_K_M"));
+        assert!(!state.model_names(&Access::default()).await.iter().any(|n| n == "model-Q4_K_M"));
         assert_eq!(status_and_message(&app, "slow").await.0, StatusCode::SERVICE_UNAVAILABLE);
         crate::runtime::set_aliases(&state, first.path().into(), vec!["fast".into()]).await.unwrap();
-        assert_eq!(state.route(Some("fast")).await.ok().map(|i| i.id.clone()), Some(first.id.clone()));
+        assert_eq!(state.route(Some("fast"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(first.id.clone()));
         assert!(!loading.is_ready());
         state.shutdown().await;
         std::fs::remove_dir_all(path).unwrap();
@@ -612,12 +854,12 @@ pub(crate) mod tests {
         // Two instances of one file are not a conflict: each identifier has one target.
         assert_eq!(listed(&app).await, ["qwen", "triage", "other", "qwen-i-2", "triage-i-2", "any-available"]);
         for (name, expected) in [("qwen", &first), ("triage", &first), ("qwen-i-2", &second), ("triage-i-2", &second), ("other", &other)] {
-            assert_eq!(state.route(Some(name)).await.ok().map(|i| i.id.clone()), Some(expected.id.clone()), "{name}");
+            assert_eq!(state.route(Some(name), &Access::default()).await.ok().map(|i| i.id.clone()), Some(expected.id.clone()), "{name}");
         }
         assert_eq!(status_and_message(&app, "qwen-i-3").await.0, StatusCode::NOT_FOUND);
         // A custom suffix takes effect on the next request; the old one stops working.
         assert_eq!(crate::runtime::change_suffix(&state, &second.id, " -fast ").await.unwrap(), "-fast");
-        assert_eq!(state.route(Some("triage-fast")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(state.route(Some("triage-fast"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
         assert_eq!(status_and_message(&app, "triage-i-2").await.0, StatusCode::NOT_FOUND);
         assert!(crate::runtime::change_suffix(&state, &first.id, "-x").await.unwrap_err().contains("cannot be changed"));
         assert!(crate::runtime::change_suffix(&state, &second.id, "").await.unwrap_err().starts_with("Enter a suffix"));
@@ -631,7 +873,7 @@ pub(crate) mod tests {
         crate::runtime::unload(&state, &second.id).await.unwrap();
         let again = crate::runtime::insert_test_instance(&state, file, true).await;
         assert_eq!((again.slot, again.suffix().as_str()), (2, "-i-2"));
-        assert_eq!(state.route(Some("triage-i-2")).await.ok().map(|i| i.id.clone()), Some(again.id.clone()));
+        assert_eq!(state.route(Some("triage-i-2"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(again.id.clone()));
         assert_eq!(status_and_message(&app, "triage-fast").await.0, StatusCode::NOT_FOUND);
         // A loading instance answers 503 by its own names only.
         crate::runtime::set_test_ready(&third, false);
@@ -663,17 +905,17 @@ pub(crate) mod tests {
         let (status, message) = status_and_message(&app, "triage").await;
         assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "qwen instance 2 is still loading."));
         crate::runtime::set_test_ready(&second, true);
-        assert_eq!(state.route(Some("triage")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
-        assert_eq!(state.route(Some("qwen")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(state.route(Some("triage"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(state.route(Some("qwen"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
         assert_eq!(listed(&app).await, ["qwen", "triage", "qwen-i-2", "triage-i-2", "qwen-i-3", "triage-i-3", "any-available"]);
         // Suffixed names never fall through.
         crate::runtime::unload(&state, &second.id).await.unwrap();
         assert_eq!(status_and_message(&app, "triage-i-2").await.0, StatusCode::NOT_FOUND);
-        assert_eq!(state.route(Some("triage")).await.ok().map(|i| i.id.clone()), Some(third.id.clone()));
+        assert_eq!(state.route(Some("triage"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(third.id.clone()));
         // With slot 1 loaded again, the bare name goes to it, not the lowest other slot.
         let back = crate::runtime::insert_test_instance(&state, file, true).await;
         assert_eq!(back.slot, 1);
-        assert_eq!(state.route(Some("triage")).await.ok().map(|i| i.id.clone()), Some(back.id.clone()));
+        assert_eq!(state.route(Some("triage"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(back.id.clone()));
         state.shutdown().await;
         std::fs::remove_dir_all(path).unwrap();
     }
@@ -834,7 +1076,7 @@ pub(crate) mod tests {
         let app = router(state.clone());
         // Listed right after that instance's own identifiers, exact and unsuffixed.
         assert_eq!(listed(&app).await, ["qwen", "triage", "qwen-i-2", "triage-i-2", "billing", "refunds", "other", "any-available"]);
-        assert_eq!(state.route(Some("billing")).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
+        assert_eq!(state.route(Some("billing"), &Access::default()).await.ok().map(|i| i.id.clone()), Some(second.id.clone()));
         assert_eq!(status_and_message(&app, "billing-i-2").await.0, StatusCode::NOT_FOUND);
         let snapshot = crate::runtime::state_snapshot(&state).await.unwrap();
         let card = snapshot["instances"].as_array().unwrap().iter().find(|i| i["id"] == second.id.as_str()).unwrap().clone();

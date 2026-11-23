@@ -1,3 +1,4 @@
+import { ApiKeys } from './ApiKeys';
 import { PendingActions, retainEqual, usePageVisible } from './refresh-state';
 import { MemoryWarningDialog, type CrowdedWarning } from './MemoryWarningDialog';
 import React, { useEffect, useRef, useState } from 'react';
@@ -29,7 +30,7 @@ import { DownloadPanel, type DownloadState } from './DownloadPanel';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { HuggingFaceLogo } from './HuggingFaceLogo';
 import { RuntimeManager, type RuntimeDownload } from './RuntimeManager';
-import { instancesOf, latestOnly, panelReplace, playModelAfterLoad, reloadSlot, visibleBanner, waitText, deviceChoice, CPU_DEVICE, type RuntimeDevice } from './ui-state';
+import { enablesKeyboardFocus, instancesOf, latestOnly, panelReplace, playModelAfterLoad, reloadSlot, visibleBanner, waitText, deviceChoice, CPU_DEVICE, type RuntimeDevice } from './ui-state';
 import { containScrollChaining } from './scroll-contain';
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
@@ -39,7 +40,7 @@ import './styles.css';
 // decoded to 3.7 MB of bitmap for the sidebar.
 const logoUrl = new URL('./logo-96.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; cpu_runtime_path: string; api_port: number; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; cpu_runtime_path: string; api_port: number; require_api_key: boolean; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
 
 // One loaded model, with the settings it was loaded with.
 type Instance = { id: string; name: string; label: string; slot: number; suffix: string; default_suffix: string; api_names: string[]; instance_aliases: string[]; path: string; device: string; runtime_path: string; projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null; ready: boolean; context_size: number; gpu_layers: number; required_bytes: number | null; context: { entries: number; last_flushed: number }; keep_context: boolean; settings: Settings };
@@ -60,7 +61,7 @@ const WHEN_BUSY = [
 ] as const;
 // "Wait up to (ms)": the backend accepts 1–600000 (set_wait_ms in runtime.rs).
 const WAIT_MS = { min: 1, max: 600000, step: 1000 };
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', cpu_runtime_path: '', api_port: 11435, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', cpu_runtime_path: '', api_port: 11435, require_api_key: false, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
 // The form is edited in two places, each saved on its own: the Local API
 // load panel (settings a load uses) and the Runtime tab (build and ports).
 // keep_context is the default a new instance starts with; loaded instances
@@ -575,7 +576,9 @@ function App() {
   const usable = (instance: Instance) => routes.filter(r => r.instance === instance.id && !r.fallthrough && !r.conflict);
   const exampleFor = (instance: Instance | null) => instance ? (usable(instance).find(r => r.kind === 'alias') ?? usable(instance)[0])?.name ?? null : null;
   const exampleModel = exampleFor(activeInstance) || 'your-model-name';
-  const pythonExample = `import json\nfrom openai import OpenAI\n\nclient = OpenAI(base_url="${apiBase}", api_key="local")\n\nrequest = {\n    "state": "I was charged twice. Please refund the duplicate.",\n    "questions": {\n        "refund": {\n            "type": "noul",\n            "instructions": "Is the customer requesting a refund?"\n        }\n    }\n}\n\nresponse = client.chat.completions.create(\n    model="${exampleModel}",\n    messages=[{"role": "user", "content": json.dumps(request)}],\n    stream=False,\n)\ndecision = json.loads(response.choices[0].message.content)\nprint(decision["answers"])`;
+  const requireApiKey = shownSetting('require_api_key', false);
+  const authHeader = requireApiKey ? ' -H "Authorization: Bearer $NOULLAMA_API_KEY"' : '';
+  const pythonExample = `import json\nfrom openai import OpenAI\n\nclient = OpenAI(base_url="${apiBase}", api_key="${requireApiKey ? "YOUR_API_KEY" : "local"}")\n\nrequest = {\n    "state": "I was charged twice. Please refund the duplicate.",\n    "questions": {\n        "refund": {\n            "type": "noul",\n            "instructions": "Is the customer requesting a refund?"\n        }\n    }\n}\n\nresponse = client.chat.completions.create(\n    model="${exampleModel}",\n    messages=[{"role": "user", "content": json.dumps(request)}],\n    stream=False,\n)\ndecision = json.loads(response.choices[0].message.content)\nprint(decision["answers"])`;
   let questionError = '';
   try { buildRequest(questions, '', 'text'); } catch (e) { questionError = errorText(e); }
   let jsonError = '';
@@ -761,8 +764,11 @@ function App() {
             </div>
           </div></section>
         </>}
+        <ApiKeys active={tab === 'settings'} desktop={desktop}
+          required={requireApiKey} models={libraryEntries} onCopyError={copyError} onOpenLibrary={() => setTab('library')}
+          onToggle={on => void changeSetting('require_api_key', on, 'set_require_api_key', { on })}/>
         {tab === 'api' && <>
-          <section className="endpoint-card"><div><span className={`status-dot ${!snapshot?.api_error && desktop ? 'green' : ''}`}/><strong>{apiBase}</strong><button className="icon-button" aria-label="Copy API URL" onClick={() => copy(apiBase, 'api')}>{copied === 'api' ? <Check size={16}/> : <Copy size={16}/>}</button></div><p>{snapshot?.api_error ?? 'Localhost only. No API key needed. Available while Noullama is open.'}</p></section>
+          <section className="endpoint-card"><div><span className={`status-dot ${!snapshot?.api_error && desktop ? 'green' : ''}`}/><strong>{apiBase}</strong><button className="icon-button" aria-label="Copy API URL" onClick={() => copy(apiBase, 'api')}>{copied === 'api' ? <Check size={16}/> : <Copy size={16}/>}</button></div><p>{snapshot?.api_error ?? (requireApiKey ? 'Localhost only. Send a bearer API key with /v1/ and /health requests.' : 'Localhost only. No API key needed. Available while Noullama is open.')}</p></section>
           {loadErrors.map(error => <div className="load-error" role="alert" key={error.id}><AlertCircle size={18}/><div><strong>{error.name}: {error.message.split('\n')[0]}</strong>{error.message.includes('\n') && <pre>{error.message.split('\n').slice(1).join('\n')}</pre>}</div><div className="load-error-actions"><button className="text-button" onClick={() => setShowLogs(true)}>View logs</button><button className="icon-button" aria-label={`Dismiss error for ${error.name}`} onClick={() => void dismissLoadError(error.id)}><X size={15}/></button></div></div>)}
           <section className="panel settings-panel load-panel" aria-label="Load a model"><div className="panel-heading"><span><Play size={16}/> Load a model</span></div><div className="settings-body">
             <div className="load-summary">
@@ -825,8 +831,8 @@ function App() {
             keepContext={keepsContext(instance)} onKeepContext={on => void toggleKeepContext(instance.id, on)} onClearContext={() => void clearContext(instance.id)}
             onEject={() => void eject(instance.id)} onReload={() => void loadSelected({ replace: instance.id })} onSaveAliases={saveAliases} onSaveSuffix={suffix => saveSuffix(instance.id, suffix)} onSaveInstanceAliases={aliases => saveInstanceAliases(instance.id, aliases)} onError={copyError}/>)}</div></>}
           <ModelRouting loadedCount={instances.length} anyReady={instances.some(i => i.ready)} whenBusy={whenBusy} waitMs={savedWait} routes={routes} aliasesFor={aliasesFor} disabled={!desktop} onSave={saveAliases} onError={copyError}/>
-          <div className="endpoint-list">{([['GET', '/v1/models', 'List the names that reach a loaded model'], ['POST', '/v1/systemone', 'Native state + typed questions'], ['POST', '/v1/chat/completions', 'OpenAI chat response envelope'], ['GET', '/health', 'Gateway health and model readiness (outside /v1)']] as const).map(([method, path, text]) => <div key={path}><span className={`method ${method === 'GET' ? 'get' : ''}`}>{method}</span><code>{path}</code><span>{text}</span><CopyButton value={`${apiOrigin}${path}`} label={`Copy ${apiOrigin}${path}`} size={13} onError={copyError}/></div>)}</div>
-          <section className="panel code-panel"><div className="panel-heading"><span>Native decision request</span><button className="icon-button" aria-label="Copy native API example" onClick={() => copy(`curl ${apiBase}/systemone -H 'Content-Type: application/json' -d '${requestJson.replace(/'/g, "'\\''")}'`, 'curl')}>{copied === 'curl' ? <Check size={14}/> : <Copy size={14}/>}</button></div><pre>{`curl ${apiBase}/systemone \\\n  -H 'Content-Type: application/json' \\\n  -d '${requestJson.replace(/'/g, "'\\''")}'`}</pre></section>
+          <div className="endpoint-list">{([['GET', '/v1/models', 'List the names that reach a loaded model'], ['POST', '/v1/systemone', 'Native state + typed questions'], ['POST', '/v1/chat/completions', 'OpenAI chat response envelope'], ['GET', '/health', 'Gateway health and model readiness']] as const).map(([method, path, text]) => <div key={path}><span className={`method ${method === 'GET' ? 'get' : ''}`}>{method}</span><code>{path}</code><span>{text}</span><CopyButton value={`${apiOrigin}${path}`} label={`Copy ${apiOrigin}${path}`} size={13} onError={copyError}/></div>)}</div>
+          <section className="panel code-panel"><div className="panel-heading"><span>Native decision request</span><button className="icon-button" aria-label="Copy native API example" onClick={() => copy(`curl ${apiBase}/systemone${authHeader} -H 'Content-Type: application/json' -d '${requestJson.replace(/'/g, "'\\''")}'`, 'curl')}>{copied === 'curl' ? <Check size={14}/> : <Copy size={14}/>}</button></div><pre>{`curl ${apiBase}/systemone${authHeader} \\\n  -H 'Content-Type: application/json' \\\n  -d '${requestJson.replace(/'/g, "'\\''")}'`}</pre></section>
           <section className="panel code-panel"><div className="panel-heading"><span>Python · OpenAI SDK</span><div className="heading-actions"><span className="chip">Non-streaming</span><CopyButton value={pythonExample} label="Copy Python example" onError={copyError}/></div></div><pre>{pythonExample}</pre></section>
           <div className="api-note"><BookOpen size={18}/><div><strong>Request format</strong><p>Send one user message containing a JSON request with state and questions. The assistant content contains the native result as JSON. Chat history, tools, and streaming are unsupported. Questions use choice, noul, or score; this runtime does not support extraction or multi-select.</p><a href="https://github.com/ggml-org/llama.cpp/blob/b11938/tools/server/README.md#post-v1systemone-typesafe-compatible-system-one-api" target="_blank" rel="noreferrer">llama.cpp decision API reference<ExternalLink size={12}/></a></div></div>
         </>}
@@ -849,5 +855,14 @@ function App() {
     {showLogs && <div className="log-drawer"><div className="panel-heading"><span><Terminal size={16}/> Runtime activity</span><button className="icon-button" aria-label="Close runtime logs" onClick={() => setShowLogs(false)}><X size={17}/></button></div><pre>{snapshot?.logs.join('\n') || 'No runtime activity yet.'}</pre></div>}
   </div>;
 }
+
+const keyboardControls = 'button, a[href], summary, input, select, textarea, [tabindex], [contenteditable="true"]';
+window.addEventListener('keydown', event => {
+  const focused = document.activeElement?.matches(keyboardControls) ?? false;
+  if (enablesKeyboardFocus(event, focused)) document.documentElement.classList.add('keyboard-nav');
+}, { capture: true });
+window.addEventListener('pointerdown', () => {
+  document.documentElement.classList.remove('keyboard-nav');
+}, { capture: true });
 
 createRoot(document.getElementById('root')!).render(<App/>);

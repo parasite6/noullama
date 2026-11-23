@@ -1,3 +1,4 @@
+use crate::api_keys::{Access, KeyStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -40,6 +41,7 @@ pub struct Settings {
     // Saved by the Runtime tab.
     pub cpu_runtime_path: String,
     pub api_port: u16,
+    pub require_api_key: bool,
     pub runtime_port: u16,
     pub hf_path: String,
     pub download_dir: String,
@@ -85,6 +87,7 @@ impl Default for Settings {
             device: String::new(),
             cpu_runtime_path: String::new(),
             api_port: 11435,
+            require_api_key: false,
             runtime_port: 11436,
             hf_path: "hf".into(),
             download_dir: String::new(),
@@ -122,6 +125,7 @@ pub struct AppState {
     // Why recent loads failed or models stopped on their own, newest last.
     pub load_errors: Arc<Mutex<Vec<LoadError>>>,
     pub presets_lock: Arc<Mutex<()>>,
+    pub api_keys: Arc<KeyStore>,
     // models.yml, and the sha256 work around it.
     pub library: Arc<Mutex<crate::library::Library>>,
     pub hashing: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
@@ -136,8 +140,7 @@ pub struct AppState {
     /// Stamps each request an instance starts, so `any-available` can pick
     /// the instance idle the longest.
     pub request_seq: Arc<AtomicU64>,
-    /// Wakes `any-available` requests waiting for an instance: one when a
-    /// request finishes or an instance becomes ready, all when one unloads.
+    /// Wakes `any-available` requests when instance availability changes.
     pub instance_freed: Arc<tokio::sync::Notify>,
     /// The GPU runtime's `--list-devices`, until the runtime changes.
     pub devices: Arc<Mutex<crate::devices::DeviceCache>>,
@@ -425,7 +428,7 @@ impl Instance {
 
 /// A request running on one instance. It counts toward the instance's
 /// `in_flight` from creation until it is dropped, including when the caller
-/// goes away mid-request, and then wakes one waiting `any-available` request.
+/// goes away mid-request, and wakes waiting `any-available` requests when the instance becomes idle.
 pub struct Claim {
     pub instance: Arc<Instance>,
     freed: Arc<tokio::sync::Notify>,
@@ -450,8 +453,9 @@ impl Claim {
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        self.instance.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.freed.notify_one();
+        if self.instance.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.freed.notify_waiters();
+        }
     }
 }
 
@@ -480,6 +484,7 @@ pub enum RouteError {
     Unknown(String),
     /// An identifier that reaches more than one model.
     Ambiguous(String),
+    Forbidden,
 }
 
 /// One name the local API knows, and where it goes.
@@ -602,7 +607,12 @@ pub struct DownloadState {
 }
 
 impl AppState {
+    #[cfg(test)]
     pub fn new(data_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_config_dir(data_dir.clone(), data_dir)
+    }
+
+    pub fn with_config_dir(data_dir: PathBuf, config_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&data_dir)?;
         let settings_path = data_dir.join("settings.json");
         let (settings, startup_warning) = match std::fs::read(&settings_path) {
@@ -642,6 +652,7 @@ impl AppState {
             api_notice: Default::default(),
             load_errors: Default::default(),
             presets_lock: Default::default(),
+            api_keys: Arc::new(KeyStore::new(config_dir)),
             library: Default::default(),
             hashing: Default::default(),
             mismatches: Default::default(),
@@ -727,6 +738,10 @@ impl AppState {
 
     /// Every identifier the local API knows (see `route_table`).
     pub async fn routes(&self) -> Vec<Route> {
+        self.routes_with_access(&Access::default()).await.0
+    }
+
+    async fn routes_with_access(&self, access: &Access) -> (Vec<Route>, Option<std::collections::HashSet<String>>) {
         crate::library::refresh(self).await;
         let fall_through = self.settings.lock().await.fall_through_to_other_instances;
         let instances = self.instances.lock().await.clone();
@@ -740,16 +755,22 @@ impl AppState {
             .map(|i| RouteInstance { id: &i.id, path: i.path(), slot: i.slot, suffix: i.suffix(), ready: i.is_ready(), aliases: i.aliases() })
             .collect();
         let entries: Vec<String> = library.entries.iter().map(|e| e.path.clone()).collect();
-        route_table(&table, &entries, names, fall_through)
+        let routes = route_table(&table, &entries, names, fall_through);
+        (routes, access.allowed_paths(self, &library).await)
     }
     /// Names that reach a ready model right now, as `/v1/models` lists them:
     /// the route table's, then `any-available` when any instance is ready.
-    pub async fn model_names(&self) -> Vec<String> {
-        let routes = self.routes().await;
-        self.with_any_available(listed_names(&routes)).await
-    }
-    async fn with_any_available(&self, mut names: Vec<String>) -> Vec<String> {
-        if self.any_ready().await {
+    pub async fn model_names(&self, access: &Access) -> Vec<String> {
+        let (mut routes, allowed) = self.routes_with_access(access).await;
+        let any_ready = if let Some(allowed) = allowed {
+            let ready = routes.iter().any(|route| route.ready && allowed.contains(&route.path));
+            routes.retain(|route| allowed.contains(&route.path) && access.allows_alias_owner(&route.base, &route.path));
+            ready
+        } else {
+            self.any_ready().await
+        };
+        let mut names = listed_names(&routes);
+        if any_ready {
             names.push(ANY_AVAILABLE.to_owned());
         }
         names
@@ -758,7 +779,7 @@ impl AppState {
     /// idle the longest. When every ready instance is busy, answers at once
     /// (setting "reject") or waits for the first to free up (setting "wait",
     /// up to `any_available_wait_ms`). The claim is held until the request ends.
-    pub async fn claim_any(&self) -> Result<Claim, AnyError> {
+    pub async fn claim_any(&self, access: &Access) -> Result<Claim, AnyError> {
         let (wait, wait_ms) = {
             let settings = self.settings.lock().await;
             (settings.any_available_when_busy == "wait", settings.any_available_wait_ms.clamp(WAIT_MS_MIN, WAIT_MS_MAX))
@@ -769,7 +790,13 @@ impl AppState {
             let freed = self.instance_freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            let instances = self.instances.lock().await.clone();
+            let mut instances = self.instances.lock().await.clone();
+            if access.0.is_some() {
+                crate::library::refresh(self).await;
+                let library = self.library.lock().await;
+                let allowed = access.allowed_paths(self, &library).await.unwrap_or_default();
+                instances.retain(|instance| allowed.contains(instance.path()));
+            }
             if !instances.iter().any(|i| i.is_ready()) {
                 return Err(AnyError::NoneReady(format!("No loaded instance is ready for \"{ANY_AVAILABLE}\". Load a model in noullama, or wait for one to finish loading.")));
             }
@@ -789,19 +816,24 @@ impl AppState {
     /// names or aliases in models.yml plus the instance's suffix (a loaded
     /// file with no entry answers to its file name). Every request must name
     /// one, exactly as written.
-    pub async fn route(&self, requested: Option<&str>) -> Result<Arc<Instance>, RouteError> {
+    pub async fn route(&self, requested: Option<&str>, access: &Access) -> Result<Arc<Instance>, RouteError> {
         use RouteError::*;
         let Some(name) = requested.filter(|n| !n.is_empty()) else {
-            let names = self.model_names().await;
+            let names = self.model_names(access).await;
             return Err(Missing(if names.is_empty() {
                 "Set \"model\" to a loaded model's name or alias. No model is loaded yet; load one in noullama.".into()
             } else {
                 format!("Set \"model\" to a loaded model's name or alias: {}.", names.join(", "))
             }));
         };
-        let routes = self.routes().await;
+        let (routes, allowed) = self.routes_with_access(access).await;
         let instances = self.instances.lock().await.clone();
         let matches: Vec<&Route> = routes.iter().filter(|r| r.name == name).collect();
+        if let Some(allowed) = allowed {
+            if matches.is_empty() || matches.iter().any(|route| !allowed.contains(&route.path) || !access.allows_alias_owner(&route.base, &route.path)) {
+                return Err(Forbidden);
+            }
+        }
         let still_loading = |instance: &Instance| Unavailable(if instance.slot <= 1 {
             format!("{} is still loading.", instance.stem())
         } else {
@@ -816,7 +848,10 @@ impl AppState {
                     .or_else(|| is_reserved(name).then_some(ANY_AVAILABLE))
                     .map(|n| format!(" Names are case-sensitive; did you mean '{n}'?"))
                     .unwrap_or_default();
-                let names = self.with_any_available(listed_names(&routes)).await;
+                let mut names = listed_names(&routes);
+                if self.any_ready().await {
+                    names.push(ANY_AVAILABLE.to_owned());
+                }
                 Err(Unknown(if names.is_empty() {
                     format!("Unknown model '{name}'.{hint} No model is ready; load one in noullama.")
                 } else {
@@ -1275,8 +1310,9 @@ pub async fn save_settings(
 /// switches have their own commands, so a form's copy of them (which can be
 /// stale) is ignored. `keep_context` (the default for new loads) is a load
 /// panel field and is saved from the form.
-const SERVER_OWNED: [&str; 7] = [
+const SERVER_OWNED: [&str; 8] = [
     "model_routes",
+    "require_api_key",
     "sha256_check",
     "allow_force_fit",
     "hide_crowded_load_warning",
@@ -1954,7 +1990,7 @@ async fn prepare_and_poll(state: &AppState, instance: &Arc<Instance>) -> Result<
                     model.layout = Some(layout.name().into());
                 }
                 instance.ready.store(true, Ordering::SeqCst);
-                state.instance_freed.notify_one();
+                state.instance_freed.notify_waiters();
                 state
                     .log(format!("{prefix}Decision model is ready. Local API is accepting requests."))
                     .await;
@@ -2959,7 +2995,7 @@ mod tests {
         let reloaded = load(Some(3)).await;
         assert_eq!((reloaded.slot, reloaded.suffix().as_str()), (3, "-i-3"));
         assert_eq!(reaches("qwen-i-3").await, Some(reloaded.id.clone()));
-        assert!(matches!(state.route(Some("qwen-i-3")).await, Err(RouteError::Unavailable(m)) if m == "qwen instance 3 is still loading."));
+        assert!(matches!(state.route(Some("qwen-i-3"), &Access::default()).await, Err(RouteError::Unavailable(m)) if m == "qwen instance 3 is still loading."));
         // A fresh load fills the gap.
         let fresh = load(None).await;
         assert_eq!((fresh.slot, fresh.suffix().as_str()), (2, "-i-2"));

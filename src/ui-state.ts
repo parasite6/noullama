@@ -125,3 +125,49 @@ export function quitText(loaded: number | null): string {
     : `The local API and all ${loaded} loaded models will stop.`;
   return `${models} Active downloads will also stop.`;
 }
+export const apiKeyExpiryOptions = [
+  { value: 'never', label: 'Never' },
+  { value: '1', label: '1 day' },
+  { value: '7', label: '7 days' },
+  { value: '30', label: '30 days' },
+  { value: '90', label: '90 days' },
+  { value: '365', label: '1 year' },
+  { value: 'custom', label: 'Custom date' },
+] as const;
+
+export function apiKeyExpiry(preset: string, date: string, now = Date.now()): number | null {
+  if (preset === 'never') return null;
+  if (preset !== 'custom') {
+    if (!apiKeyExpiryOptions.some(option => option.value === preset)) throw new Error('Choose an expiry.');
+    return Math.floor(now / 1000) + Number(preset) * 86400;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('Choose an expiry date.');
+  const [year, month, day] = date.split('-').map(Number);
+  const end = new Date(year, month - 1, day);
+  if (end.getFullYear() !== year || end.getMonth() !== month - 1 || end.getDate() !== day) {
+    throw new Error('Choose an expiry date.');
+  }
+  end.setDate(day + 1);
+  if (end.getTime() <= now) throw new Error('Choose today or a future date.');
+  return end.getTime() / 1000;
+}
+
+export function apiKeyAccessSummary(models: { name: string; aliases: string[] }[] | null): string {
+  if (models === null) return 'Any';
+  return models.map(model => model.aliases.length ? `${model.name} (aliases at creation: ${model.aliases.join(', ')})` : model.name).join(' · ');
+}
+
+export function apiKeyModelOptions(models: { path: string; name: string; aliases: string[] }[]) {
+  return models.flatMap(model => [model.name, ...model.aliases].map((name, index) => ({
+    id: JSON.stringify([model.path, model.name, name]),
+    label: index === 0 ? name : `${name} → ${model.name}`,
+    selection: { path: model.path, name },
+  })));
+}
+
+const navigationKeys = new Set(['Tab', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown']);
+
+export function enablesKeyboardFocus(event: Pick<KeyboardEvent, 'key' | 'altKey' | 'ctrlKey' | 'metaKey'>, onControl: boolean): boolean {
+  if (event.altKey || event.ctrlKey || event.metaKey) return false;
+  return navigationKeys.has(event.key) || (onControl && (event.key === 'Enter' || event.key === ' '));
+}

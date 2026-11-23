@@ -639,6 +639,20 @@ fn read_cache(data_dir: &Path) -> BTreeMap<String, Fingerprint> {
     std::fs::read(data_dir.join(HASH_CACHE)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
 }
 
+/// Cached sums whose file size and modification time still match.
+pub async fn cached_hashes(state: &AppState, paths: &[&str]) -> BTreeMap<String, String> {
+    if paths.is_empty() {
+        return BTreeMap::new();
+    }
+    let _guard = state.hash_cache_lock.lock().await;
+    let cache = read_cache(&state.data_dir);
+    paths.iter().copied().filter_map(|path| {
+        let cached = cache.get(path)?;
+        (fingerprint(path) == Some((cached.size, cached.modified)))
+            .then(|| (path.to_owned(), cached.sha256.clone()))
+    }).collect()
+}
+
 fn hash_file(path: &str) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;

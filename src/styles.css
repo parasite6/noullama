@@ -1,6 +1,16 @@
 /* Neutral charcoal surfaces, separated by fill rather than outlines. The
    lavender accent is the noullama.dev brand colour; status colours stay apart
-   from it so a primary button never reads as a fit or health signal. */
+   from it so a primary button never reads as a fit or health signal.
+
+   Window-width breakpoints, one set for the whole app (media queries, since
+   the sidebar width is fixed per range and a size container on the page would
+   re-anchor the fixed toasts and drawers inside it):
+     1240px  Playground rail moves above the content.
+     1000px  Sidebar collapses to icons; Hub panes stack; page padding tightens.
+      900px  Medium: wide settings rows stack, model rows put chips on a second line.
+      760px  Narrow: every settings row stacks (toggles and lone buttons stay
+             inline), card indents drop, endpoint rows stack.
+   Bars, file rows and headings otherwise wrap on their own content. */
 :root {
   --bg: #1b1b1d;
   --sidebar: #161617;
@@ -66,8 +76,12 @@ button, input, textarea, select { font: inherit; }
 button { cursor: pointer; color: inherit; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 0; background: none; transition: background .15s, color .15s, border-color .15s, opacity .15s; }
 button:disabled { opacity: .5; cursor: not-allowed; }
 button svg { flex-shrink: 0; }
-button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-input, textarea { outline: none; color: var(--text); }
+:focus { outline: none; }
+.keyboard-nav :is(button, a[href], summary, input, select, textarea, [tabindex], [contenteditable="true"]):focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+input, textarea { color: var(--text); }
 input, select { background: var(--field); border: 1px solid var(--line); border-radius: var(--r-pill); padding: 10px 16px; min-width: 0; width: 100%; color: var(--text); font-size: 13px; }
 input:focus, textarea:focus, select:focus { border-color: var(--line-strong); }
 input::placeholder, textarea::placeholder { color: var(--faint); }
@@ -160,7 +174,7 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .notice { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 12px 14px 12px 18px; margin-bottom: 16px; border-radius: 12px; background: var(--surface); color: var(--text); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .notice.error { background: rgba(239, 138, 133, .1); color: #f3c4c1; }
 .notice > button { flex-shrink: 0; padding: 4px; color: inherit; border-radius: var(--r-pill); }
-.section-heading { display: flex; align-items: baseline; justify-content: space-between; margin: 8px 0 12px; gap: 16px; }
+.section-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; margin: 8px 0 12px; gap: 4px 16px; }
 .section-heading > span { font-size: 12px; color: var(--muted); }
 .spin { animation: rotate 1s linear infinite; }
 @keyframes rotate { to { transform: rotate(360deg); } }
@@ -173,7 +187,7 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .model-identity small { overflow-wrap: anywhere; }
 .pending-model { color: var(--warn); }
 .load-bar { margin: 0 0 22px; }
-.load-bar-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.load-bar-actions { display: flex; align-items: center; gap: 8px; }
 .settings-panel.load-panel { margin-bottom: 10px; }
 
 /* Playground: content on the left, run settings in a rail on the right */
@@ -210,7 +224,9 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .probability code { font-size: 12px; width: 52px; text-align: right; color: var(--text); }
 .usage { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 12px; padding: 14px 0; border-top: 1px solid var(--line); }
 .usage span { color: var(--faint); }
-.run-settings { display: flex; flex-direction: column; gap: 14px; min-height: 0; padding: 18px; border-radius: var(--r-card); background: var(--surface); }
+/* In a short window the rail scrolls rather than squeezing the Questions editor to a few lines. */
+.run-settings { display: flex; flex-direction: column; gap: 14px; min-height: 0; overflow-y: auto; padding: 18px; border-radius: var(--r-card); background: var(--surface); }
+.run-settings > * { flex-shrink: 0; }
 .run-settings > h2 { font-size: 16px; }
 .rail-label { font-size: 12px; font-weight: 550; color: var(--muted); display: inline-flex; align-items: center; gap: 8px; }
 .rail-section { display: grid; gap: 10px; }
@@ -225,6 +241,7 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .preset-chip.saved > button { height: 30px; padding: 0 6px 0 12px; gap: 6px; color: inherit; font-size: inherit; }
 .chip-remove { width: 22px; height: 22px; padding: 0; border-radius: 50%; color: var(--muted); }
 .chip-remove:hover:not(:disabled) { background: var(--line-strong); color: var(--text); }
+.run-settings > .question-panel { flex: 1 0 240px; }
 .question-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; border-radius: 12px; background: var(--field); overflow: hidden; }
 .rail-heading { display: flex; align-items: center; justify-content: space-between; padding: 6px 6px 6px 14px; }
 .question-panel > .json-editor { flex: 1; }
@@ -347,8 +364,10 @@ label small { font-weight: 400; line-height: 1.6; }
 .number-field input::-webkit-inner-spin-button, .number-field input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
 .number-field .icon-button { position: absolute; right: 38px; padding: 5px; }
 .number-field .icon-button + .icon-button { right: 8px; }
-.file-input-row { display: flex; gap: 8px; align-items: stretch; }
-.file-input-row > input, .file-input-row > .select { flex: 1; min-width: 0; }
+/* The field keeps at least 240px; when its buttons do not fit beside it they
+   wrap onto the next line instead of squeezing the path. */
+.file-input-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; }
+.file-input-row > input, .file-input-row > .select, .file-input-row > .combo { flex: 1 1 240px; min-width: 0; }
 .runtime-download-confirm { display: flex; gap: 16px; align-items: center; justify-content: space-between; }
 .runtime-build-list { display: grid; gap: 6px; max-height: 320px; overflow-y: auto; }
 .runtime-build-row { display: flex; gap: 16px; justify-content: space-between; align-items: center; padding: 12px 14px; border-radius: 12px; background: var(--field); }
@@ -442,7 +461,8 @@ label small { font-weight: 400; line-height: 1.6; }
   .playground { min-height: 0; }
   .playground-main { overflow: visible; }
   .run-settings { order: -1; }
-  .question-panel { height: 380px; flex: none; }
+  .question-panel, .run-settings > .question-panel { height: 380px; flex: none; }
+  .run-settings { overflow-y: visible; }
 }
 @media (max-width: 1000px) {
   :root { --sidebar-w: 72px; }
@@ -455,14 +475,9 @@ label small { font-weight: 400; line-height: 1.6; }
   .page-content.page-hub { height: auto; }
   .hub-panes { grid-template-columns: minmax(0, 1fr); min-height: 0; }
   .hub-list, .hub-detail { overflow: visible; }
-  .load-bar { flex-wrap: wrap; border-radius: 18px; }
-  .load-bar-actions { width: 100%; justify-content: flex-end; }
   .form-grid { grid-template-columns: minmax(0, 1fr); }
-  .endpoint-list > div { grid-template-columns: 56px minmax(0, 1fr) auto; }
-  .endpoint-list > div > span:nth-child(3) { grid-column: 2; grid-row: 2; }
-  .endpoint-list .copy-button { grid-column: 3; grid-row: 1; }
 }
-@media (max-width: 800px) {
+@media (max-width: 760px) {
   .file-row { flex-wrap: wrap; }
   .file-row > div { flex-basis: calc(100% - 40px); }
   .file-row > .fit-badge, .file-row > .fit-unavailable { margin-left: 29px; }
@@ -539,7 +554,14 @@ label small { font-weight: 400; line-height: 1.6; }
 .settings-body h3 { font-size: 13.5px; font-weight: 600; }
 .runtime-version { color: var(--secondary); font-size: 12px; line-height: 1.6; padding: 10px 14px; border-radius: 10px; background: var(--field); }
 .save-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 10px 10px 18px; border-radius: var(--r-pill); background: var(--surface-2); box-shadow: 0 10px 30px rgba(0, 0, 0, .35); }
-.save-bar { box-shadow: none; background: var(--surface); transition: background .2s, box-shadow .2s; }
+/* One line while everything fits, a pill. When the buttons do not fit beside
+   the text they drop below it as a full-width row (the actions take the whole
+   leftover line and their buttons share it), and the fixed radius turns the
+   taller bar into a rounded block instead of a stretched pill. */
+.save-bar { box-shadow: none; background: var(--surface); transition: background .2s, box-shadow .2s; flex-wrap: wrap; row-gap: var(--space-3); padding: 10px; border-radius: 28px; }
+.save-bar > .hint { flex: 1000 1 240px; min-width: 0; padding-left: var(--space-2); }
+.save-bar > .load-bar-actions, .save-bar > .save-actions { flex: 1 1 auto; flex-wrap: wrap; justify-content: flex-end; }
+.save-bar > .load-bar-actions > button, .save-bar > .save-actions > button { flex: 1 1 auto; }
 /* Float only while there is something to save. */
 .save-bar.dirty { position: sticky; bottom: 16px; z-index: 2; background: var(--surface-2); box-shadow: 0 10px 30px rgba(0, 0, 0, .35); }
 .save-bar.dirty .hint { color: var(--text); }
@@ -551,7 +573,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .copy-button.copied, .copy-button.copied:hover { color: var(--ok); }
 .identity-line .copy-button, .endpoint-list .copy-button { padding: 4px; }
 .model-identity .copy-button, .file-row .copy-button, .endpoint-list .copy-button, .runtime-build-row .copy-button { opacity: 0; transition: opacity .15s, background .15s, color .15s; }
-.model-identity:hover .copy-button, .file-row:hover .copy-button, .endpoint-list > div:hover .copy-button, .runtime-build-row:hover .copy-button, .copy-button:focus-visible, .copy-button.copied { opacity: 1; }
+.model-identity:hover .copy-button, .file-row:hover .copy-button, .endpoint-list > div:hover .copy-button, .runtime-build-row:hover .copy-button, .keyboard-nav .copy-button:focus, .copy-button.copied { opacity: 1; }
 .chip-copy { padding-right: 4px; }
 .chip-copy .copy-button { padding: 3px; margin-left: -2px; }
 .detail-head .detail-copy { margin-left: auto; align-self: flex-start; }
@@ -600,7 +622,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .instance-settings { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px 16px; margin: 0; padding-left: 46px; }
 .instance-settings > div { min-width: 0; }
 .instance-settings dt { font-size: 12px; color: var(--muted); }
-.instance-settings dd { margin: 2px 0 0; font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instance-settings dd { margin: 2px 0 0; font-size: 12.5px; color: var(--text); overflow-wrap: anywhere; }
 .instance-stale { margin-left: 46px; font-size: 12px; line-height: 1.6; color: var(--warn); }
 .instance-names { display: grid; gap: 8px; }
 .instance-names-label { padding-left: 46px; font-size: 12px; color: var(--muted); }
@@ -624,7 +646,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .instance-keep .keep-context-row { justify-content: flex-start; }
 /* Sidebar: stored load errors, linking to the Local API tab */
 .nav-item.load-error-nav, .nav-item.load-error-nav svg { color: var(--bad); }
-@media (max-width: 640px) {
+@media (max-width: 760px) {
   .row-aliases, .loaded-model .model-aliases, .instance-settings, .instance-names-label { padding-left: 4px; }
   .instance-suffix input { margin-left: 4px; }
   .instance-suffix small { padding-left: 4px; }
@@ -677,12 +699,13 @@ label small { font-weight: 400; line-height: 1.6; }
 .combo .select-menu li { justify-content: space-between; }
 .combo .select-menu li svg { flex-shrink: 0; }
 .combo .select-menu li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
-.file-input-row .combo { flex: 1; min-width: 0; }
+.file-input-row .combo { min-width: 0; }
 /* Library cards let suggestion lists extend past their bottom edge. */
 .panel.library-entry { overflow: visible; }
 
 .memory-dialog { width: min(540px, calc(100vw - 40px)); }
-.memory-dialog label { display: block; margin-top: 18px; font-size: 13px; }
+.memory-dialog label { flex-direction: row; justify-content: center; align-items: center; gap: var(--space-2); margin-top: 18px; font-size: 13px; }
+.memory-dialog label input { width: auto; margin: 0; }
 .memory-dialog .quit-dialog-actions { flex-wrap: wrap; }
 
 /* Settings layout (SettingsLayout.tsx): titled sections of even rows. Each
@@ -720,6 +743,25 @@ label small { font-weight: 400; line-height: 1.6; }
 .setting-control .segmented button { flex: 1 1 auto; font-size: var(--text-base); padding: 0 10px; white-space: nowrap; }
 .setting-full, .setting-status { grid-column: 1 / -1; min-width: 0; }
 .setting-full { display: grid; gap: var(--space-3); }
+.api-keys .panel-heading h2 { font: inherit; }
+.api-keys .setting-control { gap: var(--space-2); }
+.api-keys .setting-control > button { min-height: var(--control-h); }
+.api-keys .setting-control > .copy-button { width: var(--control-h); }
+.api-key-models { display: grid; gap: var(--space-2); }
+.api-key-model-group { min-width: 0; border: 1px solid var(--line-strong); border-radius: var(--r-row); background: var(--field); }
+.api-key-model, .api-key-alias { min-height: var(--control-h); justify-content: flex-start; text-align: left; overflow-wrap: anywhere; }
+.api-key-model { width: 100%; padding: var(--space-2) var(--space-3); border-radius: var(--r-row); font-size: var(--text-md); font-weight: 500; }
+.api-key-model:hover:not(:disabled), .api-key-alias:hover:not(:disabled) { background: var(--surface-2); }
+.api-key-model[aria-checked="true"], .api-key-alias[aria-checked="true"] { background: var(--accent-soft); color: var(--text); }
+.api-key-check { display: grid; flex: none; place-items: center; width: 16px; height: 16px; border: 1px solid var(--line-strong); border-radius: var(--space-1); }
+[aria-checked="true"] > .api-key-check { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.api-key-aliases { display: flex; flex-wrap: wrap; gap: var(--space-2); padding: 0 var(--space-3) var(--space-2) var(--space-6); }
+.api-key-alias { border-radius: var(--r-pill); padding: 0 var(--space-3); background: var(--surface); color: var(--secondary); font-size: var(--text-sm); }
+.api-key-library, .api-key-identity, .api-key-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.api-key-library .text-button { min-height: var(--control-h); }
+.api-key-access { display: block; margin-top: var(--space-1); }
+.api-key-secret, .api-key-identity, .api-key-meta, .api-key-access { overflow-wrap: anywhere; }
+
 .setting-status { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: calc(var(--space-1) * -1); }
 .value-box { display: flex; align-items: center; height: var(--control-h); padding: 0 var(--space-4); border-radius: var(--r-pill); background: var(--field); border: 1px solid var(--line); min-width: 0; }
 .value-box code { font-size: var(--text-base); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -757,7 +799,7 @@ label small { font-weight: 400; line-height: 1.6; }
 .runtime-current code { font-size: var(--text-sm); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .runtime-current .identity-line strong { font-size: var(--text-lg); }
 .runtime-current .copy-button { opacity: 0; transition: opacity .15s; }
-.runtime-current:hover .copy-button, .runtime-current .copy-button:focus-visible, .runtime-current .copy-button.copied { opacity: 1; }
+.runtime-current:hover .copy-button, .runtime-current .copy-button.copied { opacity: 1; }
 .runtime-current > .setting-help { padding-top: var(--space-3); border-top: 1px solid var(--line); }
 
 /* Installed builds: list rows share the control column's right edge. */
@@ -771,11 +813,29 @@ label small { font-weight: 400; line-height: 1.6; }
 .setting-section > .setting-rows > .runtime-build-list, .setting-section > .setting-rows > .status-note { margin-top: var(--space-2); }
 .setting-section > .setting-rows > .status-note { justify-self: start; margin-bottom: var(--space-1); }
 .setting-section .runtime-download-plan, .setting-section .runtime-install-status, .setting-section .notice { margin-top: var(--space-2); }
-.setting-section .file-input-row .select { flex: 1; }
 
+@media (max-width: 900px) {
+  .setting-row.wide { grid-template-columns: minmax(0, 1fr); }
+  .setting-row.wide > .setting-control { justify-content: flex-start; }
+  /* Chips go below the name instead of squeezing it. The logo sits in the
+     row's left padding so every wrapped line of chips lines up with the name. */
+  .model-row { position: relative; flex-wrap: wrap; gap: var(--space-2); padding-left: 56px; }
+  .model-row > .author-logo:first-child { position: absolute; left: 14px; top: 12px; }
+  .model-row > span:nth-child(2) { flex-basis: 100%; }
+}
 @media (max-width: 760px) {
   .setting-row, .setting-row.wide { grid-template-columns: minmax(0, 1fr); }
   .setting-control { justify-content: flex-start; }
+  /* A switch or a single button is small enough to stay beside its label. */
+  .setting-row:has(> .setting-control > .toggle:only-child), .setting-row:has(> .setting-control > button:only-child) { grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--space-4); }
+  .setting-row:has(> .setting-control > .toggle:only-child) > .setting-control, .setting-row:has(> .setting-control > button:only-child) > .setting-control { justify-content: flex-end; }
+  .endpoint-list > div { grid-template-columns: 56px minmax(0, 1fr) auto; row-gap: 4px; }
+  .endpoint-list > div > span:nth-child(3) { grid-column: 2; grid-row: 2; }
+  .endpoint-list .copy-button { grid-column: 3; grid-row: 1; }
+  /* With two buttons, the path takes its own line and the buttons sit together below it. */
+  .file-input-row:has(> button + button) > input { flex-basis: 100%; }
+  .page-heading { gap: var(--space-3); }
+  .stat-chip { height: 30px; padding: 0 12px; }
   .load-identity { flex-wrap: wrap; }
   .load-identity-state { margin-left: 54px; }
   .load-fit { flex-direction: column; align-items: flex-start; }

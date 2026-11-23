@@ -1,4 +1,5 @@
 mod api;
+mod api_keys;
 mod context;
 mod library;
 mod desktop;
@@ -46,7 +47,7 @@ fn main() {
             let updates = updates::Updates::load(&data_dir);
             updates.check_on_launch(app.handle().clone());
             app.manage(updates);
-            let state = AppState::new(data_dir)?;
+            let state = AppState::with_config_dir(data_dir, app.path().app_config_dir()?)?;
             app.manage(state.clone());
             runtime::start_memory_guard(state.clone());
             desktop::install_signal_handler(app.handle().clone());
@@ -69,6 +70,10 @@ fn main() {
             runtimes::download_cpu_runtime,
             devices::runtime_devices,
             runtime::snapshot,
+            api_keys::set_require_api_key,
+            api_keys::list_api_keys,
+            api_keys::create_api_key,
+            api_keys::delete_api_key,
             runtime::save_settings,
             runtime::probe_runtime,
             runtime::start_runtime,
