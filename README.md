@@ -130,9 +130,9 @@ Linux cgroup v2 memory limits and pressure are included where readable. Missing 
 
 Downloads use `hf download` at the inspected repository revision. Saved Hugging Face credentials and `HF_TOKEN` are supported; a token entered in the app is held only for the session and passed to `hf` through its environment.
 
-**Download with** in the Hugging Face card picks how `hf` fetches files. **Auto** lets `hf` choose: Xet for files stored on Xet when `hf` has the `hf_xet` package, otherwise HTTPS. **Xet** requires Xet and refuses to start a download for a file that is not stored on Xet or with an `hf` that has no `hf_xet`. **HTTPS** turns Xet off and downloads whole files. The choice applies to downloads started after it changes.
+**Download with** in the Hugging Face card picks how `hf` fetches files. **Auto** lets `hf` choose: Xet for files stored on Xet when `hf` has the `hf_xet` package, otherwise HTTPS; an `HF_HUB_DISABLE_XET` set in the environment Noullama was started from still applies. **Xet** requires Xet, ignores an inherited `HF_HUB_DISABLE_XET`, and refuses to start a download for a file that is not stored on Xet or with an `hf` that has no `hf_xet`. **HTTPS** turns Xet off and downloads whole files. A download uses the choice shown when you start it.
 
-When the model selected in **Loading** was downloaded from the Hub tab, a **Hub** button next to its state opens its repository in the Hub.
+When the model selected in **Loading** was downloaded from the Hub tab, a **Hub** button next to its state opens its repository in the Hub. Noullama remembers such downloads, so the button stays after you change the download folder, and goes away if the file is replaced.
 
 Several files can download concurrently. Each has a progress panel and **Cancel download**; network progress fills from one side and file reconstruction from the other. Xet compression and deduplication can make those values differ; over HTTPS they are the same. Cancelled partial files remain available for an immediate resume and are removed on full quit. The floating **Downloads** card provides cancellation, completion dismissal and repository navigation while you use other tabs.
 

@@ -422,15 +422,96 @@ fn scan_local_models(
 pub async fn model_repo(path: String, state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
     let settings = state.settings.lock().await.clone();
     let roots = [model_directory(&settings, &state.data_dir), state.data_dir.join("models")];
-    Ok(tokio::task::spawn_blocking(move || roots.iter().find_map(|root| hub_repo(root, Path::new(&path))))
-        .await
-        .map_err(|e| e.to_string())?)
+    let record = provenance_path(&state.data_dir);
+    let _guard = PROVENANCE.lock().await;
+    Ok(tokio::task::spawn_blocking(move || {
+        let path = Path::new(&path);
+        let mut known = read_provenance(&record);
+        let found = roots.iter().find_map(|root| hub_repo(root, path));
+        let repo = match found {
+            Some(repo) => {
+                // Remembered, so the link survives a change of download folder.
+                remember(&mut known, path, &repo);
+                Some(repo)
+            }
+            None => {
+                let repo = known.get(&path.to_string_lossy().into_owned()).and_then(|entry| recorded_repo(entry, path));
+                if repo.is_none() {
+                    known.remove(&path.to_string_lossy().into_owned());
+                }
+                repo
+            }
+        };
+        let _ = write_provenance(&record, &known);
+        repo
+    })
+    .await
+    .map_err(|e| e.to_string())?)
+}
+
+/// Serializes reads and writes of hub-downloads.json.
+static PROVENANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `<app-data>/hub-downloads.json`: for each file the Hub tab downloaded, its
+/// repository and the size and modification time it had then. A file that
+/// changed since no longer counts as that download.
+fn provenance_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("hub-downloads.json")
+}
+
+fn read_provenance(path: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_provenance(path: &Path, known: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let temporary = path.with_extension("json.tmp");
+    let text = serde_json::to_vec_pretty(known).map_err(|e| e.to_string())?;
+    std::fs::write(&temporary, text)
+        .and_then(|()| std::fs::rename(&temporary, path))
+        .map_err(|e| e.to_string())
+}
+
+fn file_stamp(path: &Path) -> Option<(u64, f64)> {
+    let metadata = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let modified = metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64();
+    Some((metadata.len(), modified))
+}
+
+fn remember(known: &mut serde_json::Map<String, Value>, path: &Path, repo: &str) {
+    if let Some((size, modified)) = file_stamp(path) {
+        known.insert(path.to_string_lossy().into_owned(), json!({"repo": repo, "size": size, "modified": modified}));
+    }
+}
+
+fn recorded_repo(entry: &Value, path: &Path) -> Option<String> {
+    let (size, modified) = file_stamp(path)?;
+    let repo = entry["repo"].as_str().filter(|repo| valid_repo(repo))?;
+    (entry["size"].as_u64() == Some(size) && entry["modified"].as_f64() == Some(modified)).then(|| repo.to_owned())
+}
+
+/// Records a finished Hub download so its Hub link outlives a folder change.
+async fn remember_download(state: &AppState, path: &str, repo: &str) {
+    let record = provenance_path(&state.data_dir);
+    let (path, repo) = (path.to_owned(), repo.to_owned());
+    let _guard = PROVENANCE.lock().await;
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut known = read_provenance(&record);
+        remember(&mut known, Path::new(&path), &repo);
+        write_provenance(&record, &known)
+    })
+    .await;
 }
 
 /// The repository a file was downloaded from with `hf download`, as the Hub
 /// tab saves it: `<root>/<owner>--<repo>/<file>`, where hf leaves
 /// `.cache/huggingface/download/<file>.metadata` next to it. None for any
-/// other file, even one in a folder that happens to be named like that.
+/// other file, even one in a folder that happens to be named like that, and
+/// for a file replaced after the download: like hf, the metadata counts only
+/// while the file is no newer than the time it records.
 fn hub_repo(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     let mut parts = relative.components();
@@ -441,9 +522,24 @@ fn hub_repo(root: &Path, path: &Path) -> Option<String> {
     }
     let (owner, name) = folder.split_once("--")?;
     let repo = format!("{owner}/{name}");
+    if !valid_repo(&repo) {
+        return None;
+    }
     let mut metadata = root.join(folder).join(".cache/huggingface/download").join(file).into_os_string();
     metadata.push(".metadata");
-    (valid_repo(&repo) && Path::new(&metadata).is_file()).then_some(repo)
+    let recorded = metadata_time(&std::fs::read_to_string(metadata).ok()?)?;
+    let (_, modified) = file_stamp(path)?;
+    (modified - 1.0 <= recorded).then_some(repo)
+}
+
+/// The save time in hf's local-dir metadata: a 40-hex commit, the etag, then
+/// the time as seconds since the epoch.
+fn metadata_time(text: &str) -> Option<f64> {
+    let mut lines = text.lines();
+    let commit = lines.next()?.trim();
+    let etag = lines.next()?.trim();
+    let time = lines.next()?.trim().parse::<f64>().ok()?;
+    (commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()) && !etag.is_empty() && time.is_finite()).then_some(time)
 }
 
 #[tauri::command]
@@ -475,8 +571,10 @@ pub async fn hf_session(state: tauri::State<'_, AppState>) -> Result<Value, Stri
         hf_xet_version(&hf)
     );
     let cli = cli.ok().and_then(Result::ok).is_some_and(|o| o.status.success());
+    // xet_known is false when hf env could not be read, so the UI does not
+    // claim hf_xet is missing.
     Ok(
-        json!({"authenticated": account.is_some(), "account": account, "cli_available": cli, "xet": xet, "token_present": token.is_some()}),
+        json!({"authenticated": account.is_some(), "account": account, "cli_available": cli, "xet": xet.as_ref().ok().cloned().flatten(), "xet_known": xet.is_ok(), "token_present": token.is_some()}),
     )
 }
 
@@ -498,14 +596,18 @@ async fn set_transport(state: &AppState, mode: String) -> Result<(), String> {
     .await
 }
 
-/// The hf_xet version `hf env` reports, or None when hf has no hf_xet (or
-/// cannot run). Without it hf can only download over HTTPS.
-async fn hf_xet_version(hf: &str) -> Option<String> {
+/// The hf_xet version `hf env` reports, None when it reports no hf_xet
+/// (then hf can only download over HTTPS), or an error when `hf env` could
+/// not run, timed out or failed.
+async fn hf_xet_version(hf: &str) -> Result<Option<String>, String> {
     let output = crate::runtime::probe_output(Command::new(hf).arg("env"), Duration::from_secs(8))
         .await
-        .ok()?
-        .ok()?;
-    output.status.success().then(|| xet_version(&String::from_utf8_lossy(&output.stdout))).flatten()
+        .map_err(|_| "hf env did not answer within 8 seconds".to_owned())?
+        .map_err(|e| format!("cannot start hf: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("hf env failed ({})", output.status));
+    }
+    Ok(xet_version(&String::from_utf8_lossy(&output.stdout)))
 }
 
 fn xet_version(env: &str) -> Option<String> {
@@ -782,9 +884,13 @@ pub async fn inspect_model(
 pub async fn download_model(
     repo: String,
     filename: String,
+    transport: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    begin_download(state.inner(), repo, filename).await
+    if transport.as_deref().is_some_and(|mode| !DOWNLOAD_TRANSPORTS.contains(&mode)) {
+        return Err("Unknown download transport.".into());
+    }
+    begin_download(state.inner(), repo, filename, transport).await
 }
 
 #[tauri::command]
@@ -828,7 +934,9 @@ fn download_revision(model: &Value) -> Result<&str, String> {
 /// Finished entries kept for the downloads list; older ones drop off.
 const KEPT_FINISHED_DOWNLOADS: usize = 8;
 
-async fn begin_download(state: &AppState, repo: String, filename: String) -> Result<(), String> {
+/// `transport` is the mode the Hub tab showed when the download was started;
+/// None uses the saved setting.
+async fn begin_download(state: &AppState, repo: String, filename: String, transport: Option<String>) -> Result<(), String> {
     if !valid_repo(&repo) || !valid_filename(&filename) {
         return Err("Choose a relative GGUF filename (not starting with '-') from an owner/model repository.".into());
     }
@@ -860,7 +968,11 @@ async fn begin_download(state: &AppState, repo: String, filename: String) -> Res
                 downloads.remove(oldest);
             }
         }
-        (state.settings.lock().await.clone(), DownloadKey { id, attempt }, receiver)
+        let mut settings = state.settings.lock().await.clone();
+        if let Some(transport) = transport {
+            settings.download_transport = transport;
+        }
+        (settings, DownloadKey { id, attempt }, receiver)
     };
     let mut waiter = cancel.clone();
     let prepared = tokio::select! {
@@ -912,8 +1024,10 @@ async fn prepare_download(
         if !stored_on_xet(state, repo, revision, filename).await? {
             return Err(format!("{filename} is not stored on Xet, so it cannot be downloaded with Xet. Choose Auto or HTTPS in the Hub tab."));
         }
-        if hf_xet_version(&settings.hf_path).await.is_none() {
-            return Err("This hf has no hf_xet package, so it cannot download with Xet. Install hf_xet for it, or choose Auto or HTTPS in the Hub tab.".into());
+        match hf_xet_version(&settings.hf_path).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err("This hf has no hf_xet package, so it cannot download with Xet. Install hf_xet for it, or choose Auto or HTTPS in the Hub tab.".into()),
+            Err(error) => return Err(format!("Could not check whether hf can download with Xet: {error}.")),
         }
     }
     let directory = model_directory(settings, &state.data_dir).join(repo.replace('/', "--"));
@@ -1063,6 +1177,7 @@ async fn prepare_download(
         }
         drop(downloads);
         if success && !cancelled {
+            remember_download(&state, &model_path, &repo).await;
             if filename.to_lowercase().contains("mmproj") || crate::gguf::is_mtp_head(&model_path) {
                 crate::library::attach(&state, &model_path).await;
             } else {
@@ -1290,6 +1405,7 @@ mod tests {
                 &worker_state,
                 "acme/decision-model-GGUF".into(),
                 "model.gguf".into(),
+                None,
             )
             .await
         });
@@ -1318,7 +1434,7 @@ mod tests {
         // The same file cannot start twice while it is active.
         let duplicate = tokio::time::timeout(
             Duration::from_millis(500),
-            begin_download(&state, "acme/decision-model-GGUF".into(), "model.gguf".into()),
+            begin_download(&state, "acme/decision-model-GGUF".into(), "model.gguf".into(), None),
         )
         .await
         .unwrap();
@@ -1326,7 +1442,7 @@ mod tests {
         // A different file starts alongside it.
         let second_state = state.clone();
         let second = tokio::spawn(async move {
-            begin_download(&second_state, "acme/decision-model-GGUF".into(), "second.gguf".into()).await
+            begin_download(&second_state, "acme/decision-model-GGUF".into(), "second.gguf".into(), None).await
         });
         let (mut second_connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
             .await
@@ -1377,17 +1493,49 @@ mod tests {
         let cache = folder.join(".cache/huggingface/download");
         std::fs::create_dir_all(cache.join("gguf")).unwrap();
         std::fs::create_dir_all(folder.join("gguf")).unwrap();
-        std::fs::write(cache.join("w.gguf.metadata"), "sha").unwrap();
-        std::fs::write(cache.join("gguf/x.gguf.metadata"), "sha").unwrap();
         std::fs::create_dir_all(root.join("mine--copies")).unwrap();
+        let later = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() + 60.0;
+        let saved = |time: f64| format!("{}\n8111d5af\n{time}\n", "a".repeat(40));
+        for file in ["w.gguf", "gguf/x.gguf", "replaced.gguf", "garbled.gguf", "copied.gguf"] {
+            std::fs::write(folder.join(file), "gguf").unwrap();
+        }
+        std::fs::write(root.join("mine--copies/a.gguf"), "gguf").unwrap();
+        std::fs::write(cache.join("w.gguf.metadata"), saved(later)).unwrap();
+        std::fs::write(cache.join("gguf/x.gguf.metadata"), saved(later)).unwrap();
+        // Written long before the file now there: it was replaced since.
+        std::fs::write(cache.join("replaced.gguf.metadata"), saved(1000.0)).unwrap();
+        std::fs::write(cache.join("garbled.gguf.metadata"), "sha").unwrap();
+        std::fs::write(cache.join("gone.gguf.metadata"), saved(later)).unwrap();
         assert_eq!(hub_repo(&root, &folder.join("w.gguf")).as_deref(), Some("EldanRing/Winnow-E4B"));
         assert_eq!(hub_repo(&root, &folder.join("gguf/x.gguf")).as_deref(), Some("EldanRing/Winnow-E4B"));
-        // Copied in by hand: no hf metadata.
-        assert_eq!(hub_repo(&root, &folder.join("copied.gguf")), None);
+        for file in ["replaced.gguf", "garbled.gguf", "gone.gguf", "copied.gguf"] {
+            assert_eq!(hub_repo(&root, &folder.join(file)), None, "{file}");
+        }
         assert_eq!(hub_repo(&root, &root.join("mine--copies/a.gguf")), None);
         assert_eq!(hub_repo(&root, &root.join("loose.gguf")), None);
         assert_eq!(hub_repo(&root, Path::new("/elsewhere/EldanRing--Winnow-E4B/w.gguf")), None);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remembered_downloads_keep_their_repository_until_the_file_changes() {
+        let base = std::env::temp_dir().join(format!("noullama-provenance-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("moved-folder/model.gguf");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "gguf").unwrap();
+        let record = provenance_path(&base);
+        let mut known = read_provenance(&record);
+        remember(&mut known, &file, "LiquidAI/d1-3B-GGUF");
+        write_provenance(&record, &known).unwrap();
+        let key = file.to_string_lossy().into_owned();
+        let reread = read_provenance(&record);
+        assert_eq!(recorded_repo(&reread[&key], &file).as_deref(), Some("LiquidAI/d1-3B-GGUF"));
+        std::fs::write(&file, "a different, longer file").unwrap();
+        assert_eq!(recorded_repo(&reread[&key], &file), None);
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(recorded_repo(&reread[&key], &file), None);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -1421,6 +1569,8 @@ mod tests {
 
     #[test]
     fn hf_env_and_paths_info_show_whether_xet_can_be_used() {
+        assert!(metadata_time("x\ny\n1.0").is_none());
+        assert_eq!(metadata_time(&format!("{}\netag\n1795633097.7\n", "0".repeat(40))), Some(1795633097.7));
         assert_eq!(xet_version("- huggingface_hub version: 1.2.0\n- hf_xet: 1.8.0\n- HF_HUB_DISABLE_XET: False\n").as_deref(), Some("1.8.0"));
         assert_eq!(xet_version("- hf_xet: N/A\n"), None);
         assert_eq!(xet_version(""), None);

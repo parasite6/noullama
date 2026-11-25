@@ -95,10 +95,10 @@ type SavedPreset = { id: string; name: string; questions: unknown; state: string
 type Model = { id: string; downloads: number; likes: number; tags: string[]; fit: Fit | null };
 type ModelFile = { name: string; size?: number; projector: boolean; mtp_head: boolean; fit: Fit | null };
 type Inspection = { repo: string; files: ModelFile[]; sha: string };
-type Session = { authenticated: boolean; account: string | null; cli_available: boolean; xet: string | null; token_present: boolean };
+type Session = { authenticated: boolean; account: string | null; cli_available: boolean; xet: string | null; xet_known: boolean; token_present: boolean };
 const TRANSPORTS = [
-  { value: 'auto', label: 'Auto', detail: 'Xet for files stored on Xet when hf has hf_xet, otherwise HTTPS.' },
-  { value: 'xet', label: 'Xet', detail: 'Xet only. A file not stored on Xet, or an hf without hf_xet, is not downloaded.' },
+  { value: 'auto', label: 'Auto', detail: 'hf decides: Xet for files stored on Xet when it has hf_xet, otherwise HTTPS. An HF_HUB_DISABLE_XET set where Noullama was started still applies.' },
+  { value: 'xet', label: 'Xet', detail: 'Xet only, even if HF_HUB_DISABLE_XET is set. A file not stored on Xet, or an hf without hf_xet, is not downloaded.' },
   { value: 'https', label: 'HTTPS', detail: 'Whole files over HTTPS, without Xet deduplication.' },
 ];
 type Result = { answers?: Record<string, { type?: string; choice?: string; score?: number; noul?: number; confidence?: number; probabilities?: Record<string, number> }>; usage?: { input_tokens: number; output_tokens: number }; [key: string]: unknown };
@@ -241,6 +241,9 @@ function App() {
   const [toastHeight, setToastHeight] = useState(0);
   const [models, setModels] = useState<Model[]>([]);
   const [inspection, setInspection] = useState<Inspection | null>(null);
+  const [inspecting, setInspecting] = useState(false);
+  const inspectRequest = useRef(0);
+  const sessionRequest = useRef(0);
   const lastScan = useRef<Parameters<typeof shouldScanModels>[0]>(null);
   const scanRequest = useRef(0);
   const libraryScroll = useRef({ top: 0, estimatedHeight: 0 });
@@ -368,7 +371,15 @@ function App() {
     const timer = tab === 'models' && pageVisible ? setInterval(read, 5000) : undefined;
     return () => { live = false; clearInterval(timer); };
   }, [settings.model_path, tab === 'models' && pageVisible]);
-  useEffect(() => { if (desktop && tab === 'hub' && !session) invoke<Session>('hf_session').then(setSession).catch(e => setNotice({ text: errorText(e), error: true })); }, [tab]);
+  // A session answer belongs to the hf path it was checked with: a new saved
+  // path drops it, and an answer for an older request is ignored.
+  const savedHfPath = snapshot?.settings.hf_path;
+  function checkSession() {
+    const request = ++sessionRequest.current;
+    return invoke<Session>('hf_session').then(next => { if (request === sessionRequest.current) setSession(next); });
+  }
+  useEffect(() => { sessionRequest.current++; setSession(null); }, [savedHfPath]);
+  useEffect(() => { if (desktop && tab === 'hub' && !session) checkSession().catch(e => setNotice({ text: errorText(e), error: true })); }, [tab, session === null]);
   function scanModels() {
     const request = ++scanRequest.current;
     invoke<{ models: typeof localModels; warnings: string[] }>('local_models').then(scan => {
@@ -584,8 +595,21 @@ function App() {
     if (getComputedStyle(detail).overflowY === 'auto') detail.scrollTo({ top: 0, behavior: 'smooth' });
     else detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, [inspection]);
+  // The newest request wins: opening another repository while one is still
+  // being read (from the Hub list or Loading's Hub button) replaces it.
   async function openRepo(id: string) {
-    await action('inspect', async () => { setInspection(await invoke('inspect_model', { contextSize: settings.context_size, gpuLayers: settings.gpu_layers, repo: id })); });
+    if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
+    const request = ++inspectRequest.current;
+    const timer = window.setTimeout(() => { if (request === inspectRequest.current) setInspecting(true); }, busyDelay);
+    try {
+      const next = await invoke<Inspection>('inspect_model', { contextSize: settings.context_size, gpuLayers: settings.gpu_layers, repo: id });
+      if (request === inspectRequest.current) setInspection(next);
+    } catch (e) {
+      if (request === inspectRequest.current) setNotice({ text: errorText(e), error: true });
+    } finally {
+      window.clearTimeout(timer);
+      if (request === inspectRequest.current) setInspecting(false);
+    }
   }
   async function cancelDownload(id: string) { await action('cancel', async () => { await invoke('cancel_download', { id }); }); }
   async function dismissDownload(id: string) {
@@ -597,7 +621,7 @@ function App() {
     const id = `${repo}/${file}`;
     if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
     setPreparing(current => [...current, id]); setToastDismissed(current => current.filter(other => other !== id)); setToastCollapsed(false); setNotice(null);
-    try { await invoke('download_model', { repo, filename: file }); await refresh(); }
+    try { await invoke('download_model', { repo, filename: file, transport }); await refresh(); }
     catch (e) { setNotice({ text: errorText(e), error: true }); }
     finally { setPreparing(current => current.filter(other => other !== id)); }
   }
@@ -880,13 +904,13 @@ function App() {
               <div className="hf-card">
                 <strong className="auth-heading"><HuggingFaceLogo size={16}/>{session?.authenticated ? `Connected as ${session.account}` : 'Hugging Face'}</strong>
                 <p>{session && !session.cli_available ? 'hf CLI not found. Install it or set the executable path in Runtime.' : session?.authenticated ? 'Downloads use your Hugging Face session.' : 'Public models work without signing in. Uses HF_TOKEN or your hf auth login session.'}</p>
-                <div className="hf-transport"><span>Download with</span><SegmentedControl label="Download with">{TRANSPORTS.map(option => <button key={option.value} type="button" className={transport === option.value ? 'on' : ''} aria-pressed={transport === option.value} disabled={!desktop} onClick={() => { if (transport !== option.value) void changeSetting('download_transport', option.value, 'set_download_transport', { mode: option.value }); }}>{option.label}</button>)}</SegmentedControl><Reveal open swapKey={`${transport}${session?.cli_available && !session.xet ? '-no-xet' : ''}`}><p>{TRANSPORTS.find(option => option.value === transport)?.detail}{session?.cli_available && !session.xet && transport !== 'https' ? ' This hf has no hf_xet, so ' + (transport === 'xet' ? 'downloads will not start.' : 'it uses HTTPS.') : ''} Applies to downloads started after a change.</p></Reveal></div>
-                <div className="hf-card-actions"><button className="secondary compact" {...busyButton(isBusy('session'))} onClick={() => action('session', async () => setSession(await invoke('hf_session')))}><RefreshCw size={13}/>Check session</button></div>
-                <div className="token-details"><button type="button" className="token-summary" aria-expanded={tokenOpen} aria-controls={tokenFormId} onClick={() => setTokenOpen(open => !open)}><ChevronRight className="disclosure" size={14}/>Use a token for this session</button><Reveal open={tokenOpen} id={tokenFormId}><div className="inline-form"><input type="password" autoComplete="off" aria-label="Hugging Face token" placeholder="hf_… (kept in memory only)" value={token} onChange={e => setToken(e.target.value)}/><button className="secondary compact" {...busyButton(isBusy('token'))} onClick={() => action('token', async () => { await invoke('set_hf_token', { token }); setToken(''); setSession(await invoke('hf_session')); })}>Apply</button></div><button className="ghost" {...busyButton(isBusy('token'))} onClick={() => action('token', async () => { await invoke('set_hf_token', { token: '' }); setSession(await invoke('hf_session')); })}>Use saved login instead</button></Reveal></div>
+                <div className="hf-transport"><span>Download with</span><SegmentedControl label="Download with">{TRANSPORTS.map(option => <button key={option.value} type="button" className={transport === option.value ? 'on' : ''} aria-pressed={transport === option.value} disabled={!desktop} onClick={() => { if (transport !== option.value) void changeSetting('download_transport', option.value, 'set_download_transport', { mode: option.value }); }}>{option.label}</button>)}</SegmentedControl><Reveal open swapKey={`${transport}${session?.xet_known && !session.xet ? '-no-xet' : ''}`}><p>{TRANSPORTS.find(option => option.value === transport)?.detail}{session?.xet_known && !session.xet && transport !== 'https' ? ' This hf has no hf_xet, so ' + (transport === 'xet' ? 'downloads will not start.' : 'it uses HTTPS.') : ''} Applies to downloads started after a change.</p></Reveal></div>
+                <div className="hf-card-actions"><button className="secondary compact" {...busyButton(isBusy('session'))} onClick={() => action('session', checkSession)}><RefreshCw size={13}/>Check session</button></div>
+                <div className="token-details"><button type="button" className="token-summary" aria-expanded={tokenOpen} aria-controls={tokenFormId} onClick={() => setTokenOpen(open => !open)}><ChevronRight className="disclosure" size={14}/>Use a token for this session</button><Reveal open={tokenOpen} id={tokenFormId}><div className="inline-form"><input type="password" autoComplete="off" aria-label="Hugging Face token" placeholder="hf_… (kept in memory only)" value={token} onChange={e => setToken(e.target.value)}/><button className="secondary compact" {...busyButton(isBusy('token'))} onClick={() => action('token', async () => { await invoke('set_hf_token', { token }); setToken(''); await checkSession(); })}>Apply</button></div><button className="ghost" {...busyButton(isBusy('token'))} onClick={() => action('token', async () => { await invoke('set_hf_token', { token: '' }); await checkSession(); })}>Use saved login instead</button></Reveal></div>
               </div>
             </section>
             <section className="hub-detail" id="hub-detail" aria-label="Repository details">
-              {!inspection ? <div className="hub-empty">{showBusy('inspect') ? <><RefreshCw className="spin" size={20}/><p>Reading repository…</p></> : <><Network size={22}/><p>Pick a repository to see its GGUF files.</p></>}</div> : <>
+              {!inspection ? <div className="hub-empty">{inspecting ? <><RefreshCw className="spin" size={20}/><p>Reading repository…</p></> : <><Network size={22}/><p>Pick a repository to see its GGUF files.</p></>}</div> : <>
                 <div className="detail-head"><AuthorLogo author={inspection.repo.split('/')[0]} size={56}/><div><h2>{inspection.repo.split('/').slice(1).join('/')}</h2><p>{inspection.repo.split('/')[0]}</p></div><CopyButton className="detail-copy" value={inspection.repo} label="Copy repository id" size={15} onError={copyError}/></div>
                 <div className="detail-chips"><span className="chip">GGUF</span><span className="chip">{inspection.files.length} {inspection.files.length === 1 ? 'file' : 'files'}</span>{inspection.sha && <span className="chip chip-copy" title={inspection.sha}>Revision <code>{inspection.sha.slice(0, 10)}</code><CopyButton value={inspection.sha} label="Copy full revision" size={12} onError={copyError}/></span>}</div>
                 <div className="files" id="hub-files">{inspection.files.length === 0 ? <p className="hint">No GGUF files in this repository. Open a GGUF conversion of this model.</p> : inspection.files.map(file => { const fileDownload = downloadFor(inspection.repo, file.name); const isPreparing = preparing.includes(`${inspection.repo}/${file.name}`); return <div className="file-entry" key={file.name}><div className="file-row"><FileJson size={17}/><div><span className="identity-line"><strong>{file.name}</strong><CopyButton value={file.name} label={`Copy file name ${file.name}`} size={12} onError={copyError}/></span><small>{file.projector ? 'Multimodal projector' : file.mtp_head ? 'MTP head' : 'Model weights'}{file.size ? ` / ${(file.size / 1e9).toFixed(2)} GB` : ''}</small></div>{!file.projector && !file.mtp_head && <FileFit fit={file.fit}/>}<button className="secondary compact" {...busyButton(isPreparing, !!fileDownload?.active)} onClick={() => startDownload(inspection.repo, file.name)}><ArrowDownToLine size={14}/>Download</button></div>{fileDownload ? <DownloadPanel download={fileDownload} busy={isBusy('cancel')} onCancel={() => cancelDownload(fileDownload.id)} onReveal={() => revealFile(fileDownload.path!)} onSelect={() => { if (file.projector) edit('mmproj_path', fileDownload.path!); else if (file.mtp_head) { edit('mtp_path', fileDownload.path!); edit('mtp', true); } else selectModel(fileDownload.path!); setTab('loading'); }}/> : isPreparing ? <div className="download-preparing" role="status"><RefreshCw className="spin" size={14}/>Preparing download…</div> : null}</div>; })}</div>
