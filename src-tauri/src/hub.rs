@@ -1066,7 +1066,7 @@ async fn prepare_download(
     {
         let mut downloads = state.downloads.lock().await;
         if let Some(download) = entry(&mut downloads, key) {
-            download.message = "Downloading with hf; resumable files are kept on disk…".into();
+            download.message = "Downloading with hf…".into();
             download.total_bytes = model["siblings"]
                 .as_array()
                 .and_then(|files| files.iter().find(|file| file["rfilename"] == filename))
@@ -1089,11 +1089,13 @@ async fn prepare_download(
     let filename = filename.to_owned();
     let key = key.clone();
     let app = state.app.clone();
-    // hf keeps resume state under <local-dir>/.cache/huggingface/download/<filename>.*
+    // hf writes its partial data under <local-dir>/.cache/huggingface/download/<filename>.*
+    // Each hf run downloads into a new file of its own, so nothing is resumed
+    // across attempts; a cancelled attempt's files are only cleaned up at quit.
     let partial_base = directory
         .join(".cache/huggingface/download")
         .join(&filename);
-    // A retry resumes from these files, so they no longer belong to a cancelled download.
+    // This attempt now owns these names, so they leave the cancelled list.
     state
         .app
         .cancelled_partials
@@ -1142,7 +1144,7 @@ async fn prepare_download(
         let success = result.as_ref().is_ok_and(|s| s.success()) && size.is_some();
         release_cancel(&state, &key).await;
         if cancelled {
-            // Keep the partial files until the app exits so an immediate retry can resume.
+            // hf was killed, so its partial files stay behind; a full quit deletes them.
             let files = cancelled_partial_files(&partial_base);
             let mut partials = state.app.cancelled_partials.lock().await;
             partials.retain(|(base, _)| *base != partial_base);
@@ -1155,7 +1157,7 @@ async fn prepare_download(
             if cancelled {
                 download.cancelled = true;
                 download.message =
-                    "Download cancelled; partial files are kept until you quit Noullama.".into();
+                    "Download cancelled; its partial files are deleted when you quit Noullama.".into();
             } else if success {
                 download.downloaded_bytes = size.unwrap_or(download.downloaded_bytes);
                 download.total_bytes = size.or(download.total_bytes);
@@ -1168,11 +1170,11 @@ async fn prepare_download(
                     Err(error) => error.to_string(),
                 };
                 download.error = Some(if diagnostics.is_empty() {
-                    format!("hf download failed ({status}). Check connection, disk space, and repository access; retry resumes the download.")
+                    format!("hf download failed ({status}). Check connection, disk space, and repository access, then download again; it starts over.")
                 } else {
                     format!("hf download failed ({status}):\n{diagnostics}")
                 });
-                download.message = "Download failed; partial files were preserved.".into();
+                download.message = "Download failed.".into();
             }
         }
         drop(downloads);
