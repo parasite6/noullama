@@ -50,6 +50,9 @@ pub struct Settings {
     pub require_api_key: bool,
     pub runtime_port: u16,
     pub hf_path: String,
+    // How hf downloads model files: "auto" (hf decides), "xet" or "https".
+    // Changed only by set_download_transport.
+    pub download_transport: String,
     pub download_dir: String,
     pub library_path: String,
     // Aliases saved by an earlier version, keyed by model path. They moved to
@@ -98,6 +101,7 @@ impl Default for Settings {
             require_api_key: false,
             runtime_port: 11436,
             hf_path: "hf".into(),
+            download_transport: "auto".into(),
             download_dir: String::new(),
             library_path: String::new(),
             model_routes: BTreeMap::new(),
@@ -1349,8 +1353,9 @@ pub async fn save_settings(
 /// switches have their own commands, so a form's copy of them (which can be
 /// stale) is ignored. `keep_context` (the default for new loads) is a load
 /// panel field and is saved from the form.
-const SERVER_OWNED: [&str; 8] = [
+const SERVER_OWNED: [&str; 9] = [
     "model_routes",
+    "download_transport",
     "require_api_key",
     "sha256_check",
     "allow_force_fit",

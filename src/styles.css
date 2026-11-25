@@ -497,6 +497,17 @@ main { margin-left: var(--sidebar-w); flex: 1; min-width: 0; }
 .auth-heading { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; overflow-wrap: anywhere; }
 .hf-logo { flex-shrink: 0; }
 .hf-card-actions { display: flex; gap: 8px; }
+.hf-transport { display: grid; gap: 6px; padding-top: 8px; border-top: 1px solid var(--edge); }
+.hf-transport > span { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.hf-transport .segmented { display: flex; height: var(--control-h); }
+.hf-transport .segmented button { flex: 1 1 0; min-width: 0; }
+/* The buttons keep equal widths, so the check grows in place and the label
+   glides aside with the pill instead of jumping. */
+.hf-transport .segmented button::before {
+  transition: width var(--motion-selection) var(--ease-selection), margin-inline-end var(--motion-selection) var(--ease-selection),
+    opacity var(--motion-fast) var(--ease-out), transform var(--motion-selection) var(--ease-selection);
+}
+.hub-link { gap: 6px; }
 .token-details { font-size: 12px; color: var(--text-secondary); }
 .disclosure { color: var(--muted); transition: transform var(--motion-fast) var(--ease-out); }
 .token-details .inline-form { display: flex; gap: 8px; margin: 8px 0 4px; }

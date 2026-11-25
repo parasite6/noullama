@@ -24,6 +24,9 @@ fn parse_hf_progress(line: &str) -> Option<HfProgress> {
         .and_then(|c| c[1].parse::<f64>().ok())
         .map(|p| p.clamp(0.0, 100.0));
     let transfer = line.contains(": downloading bytes:");
+    // Xet reports the file it rebuilds and the bytes it receives on separate
+    // bars; a plain HTTPS download has one bar, and every byte written was received.
+    let https = !transfer && !line.contains(": reconstructing file:");
     if percent.is_none() && !transfer {
         return None;
     }
@@ -50,7 +53,7 @@ fn parse_hf_progress(line: &str) -> Option<HfProgress> {
     Some(HfProgress {
         percent,
         completed: if transfer { None } else { bytes },
-        transferred: if transfer { bytes } else { None },
+        transferred: if transfer || https { bytes } else { None },
     })
 }
 
@@ -227,7 +230,11 @@ async fn hf_token(state: &AppState) -> Option<String> {
 }
 
 async fn hub_get(state: &AppState, url: &str) -> Result<Value, String> {
-    let mut request = state.client.get(url).timeout(Duration::from_secs(30));
+    hub_send(state, state.client.get(url)).await
+}
+
+async fn hub_send(state: &AppState, request: reqwest::RequestBuilder) -> Result<Value, String> {
+    let mut request = request.timeout(Duration::from_secs(30));
     if let Some(token) = hf_token(state).await {
         request = request.bearer_auth(token);
     }
@@ -409,6 +416,36 @@ fn scan_local_models(
     json!({"models": files, "warnings": warnings, "incomplete": incomplete})
 }
 
+/// The Hub repository the Hub tab downloaded this model from, or None. The
+/// Loading tab shows a Hub button for it.
+#[tauri::command]
+pub async fn model_repo(path: String, state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let settings = state.settings.lock().await.clone();
+    let roots = [model_directory(&settings, &state.data_dir), state.data_dir.join("models")];
+    Ok(tokio::task::spawn_blocking(move || roots.iter().find_map(|root| hub_repo(root, Path::new(&path))))
+        .await
+        .map_err(|e| e.to_string())?)
+}
+
+/// The repository a file was downloaded from with `hf download`, as the Hub
+/// tab saves it: `<root>/<owner>--<repo>/<file>`, where hf leaves
+/// `.cache/huggingface/download/<file>.metadata` next to it. None for any
+/// other file, even one in a folder that happens to be named like that.
+fn hub_repo(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = relative.components();
+    let folder = parts.next()?.as_os_str().to_str()?;
+    let file = parts.as_path();
+    if file.as_os_str().is_empty() {
+        return None;
+    }
+    let (owner, name) = folder.split_once("--")?;
+    let repo = format!("{owner}/{name}");
+    let mut metadata = root.join(folder).join(".cache/huggingface/download").join(file).into_os_string();
+    metadata.push(".metadata");
+    (valid_repo(&repo) && Path::new(&metadata).is_file()).then_some(repo)
+}
+
 #[tauri::command]
 pub async fn set_hf_token(token: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     *state.token.lock().await = if token.trim().is_empty() {
@@ -431,14 +468,88 @@ pub async fn hf_session(state: tauri::State<'_, AppState>) -> Result<Value, Stri
         None
     };
     let hf = state.settings.lock().await.hf_path.clone();
-    let cli = crate::runtime::probe_output(Command::new(hf).arg("--version"), Duration::from_secs(8))
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .is_some_and(|o| o.status.success());
+    let mut version = Command::new(&hf);
+    version.arg("--version");
+    let (cli, xet) = tokio::join!(
+        crate::runtime::probe_output(&mut version, Duration::from_secs(8)),
+        hf_xet_version(&hf)
+    );
+    let cli = cli.ok().and_then(Result::ok).is_some_and(|o| o.status.success());
     Ok(
-        json!({"authenticated": account.is_some(), "account": account, "cli_available": cli, "token_present": token.is_some()}),
+        json!({"authenticated": account.is_some(), "account": account, "cli_available": cli, "xet": xet, "token_present": token.is_some()}),
     )
+}
+
+pub const DOWNLOAD_TRANSPORTS: [&str; 3] = ["auto", "xet", "https"];
+
+#[tauri::command]
+pub async fn set_download_transport(mode: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    set_transport(state.inner(), mode).await
+}
+
+async fn set_transport(state: &AppState, mode: String) -> Result<(), String> {
+    if !DOWNLOAD_TRANSPORTS.contains(&mode.as_str()) {
+        return Err("Unknown download transport.".into());
+    }
+    crate::runtime::update_settings(state, |s| {
+        s.download_transport = mode;
+        Ok(())
+    })
+    .await
+}
+
+/// The hf_xet version `hf env` reports, or None when hf has no hf_xet (or
+/// cannot run). Without it hf can only download over HTTPS.
+async fn hf_xet_version(hf: &str) -> Option<String> {
+    let output = crate::runtime::probe_output(Command::new(hf).arg("env"), Duration::from_secs(8))
+        .await
+        .ok()?
+        .ok()?;
+    output.status.success().then(|| xet_version(&String::from_utf8_lossy(&output.stdout))).flatten()
+}
+
+fn xet_version(env: &str) -> Option<String> {
+    env.lines()
+        .find_map(|line| line.trim().strip_prefix("- hf_xet:"))
+        .map(str::trim)
+        .filter(|version| !version.is_empty() && *version != "N/A")
+        .map(str::to_owned)
+}
+
+/// Sets how hf downloads: "https" turns Xet off, "xet" clears an inherited
+/// HF_HUB_DISABLE_XET so hf uses Xet, and "auto" leaves the environment as it is.
+fn apply_transport(command: &mut Command, transport: &str) {
+    match transport {
+        "https" => {
+            command.env("HF_HUB_DISABLE_XET", "1");
+        }
+        "xet" => {
+            command.env_remove("HF_HUB_DISABLE_XET");
+        }
+        _ => {}
+    }
+}
+
+/// Whether the Hub stores this file on Xet at this revision. hf falls back to
+/// HTTPS for a file that is not, so the Xet setting checks first.
+async fn stored_on_xet(state: &AppState, repo: &str, revision: &str, filename: &str) -> Result<bool, String> {
+    let entries = hub_send(
+        state,
+        state
+            .client
+            .post(format!("https://huggingface.co/api/models/{repo}/paths-info/{revision}"))
+            .json(&json!({ "paths": [filename] })),
+    )
+    .await?;
+    Ok(has_xet_hash(&entries, filename))
+}
+
+fn has_xet_hash(entries: &Value, filename: &str) -> bool {
+    entries
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["path"] == filename))
+        .and_then(|entry| entry["xetHash"].as_str())
+        .is_some_and(|hash| !hash.is_empty())
 }
 
 #[tauri::command]
@@ -796,6 +907,15 @@ async fn prepare_download(
         return Err("This file is not present in the selected repository.".into());
     }
     let revision = download_revision(&model)?;
+    let transport = settings.download_transport.as_str();
+    if transport == "xet" {
+        if !stored_on_xet(state, repo, revision, filename).await? {
+            return Err(format!("{filename} is not stored on Xet, so it cannot be downloaded with Xet. Choose Auto or HTTPS in the Hub tab."));
+        }
+        if hf_xet_version(&settings.hf_path).await.is_none() {
+            return Err("This hf has no hf_xet package, so it cannot download with Xet. Install hf_xet for it, or choose Auto or HTTPS in the Hub tab.".into());
+        }
+    }
     let directory = model_directory(settings, &state.data_dir).join(repo.replace('/', "--"));
     tokio::fs::create_dir_all(&directory)
         .await
@@ -820,6 +940,7 @@ async fn prepare_download(
         .env("HF_HUB_DISABLE_PROGRESS_BARS", "0")
         .env("TQDM_POSITION", "-1")
         .env("TQDM_MININTERVAL", "0.2");
+    apply_transport(&mut command, transport);
     let _spawn_guard = state.lifecycle.lock().await;
     if state.app.exiting.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("Noullama is shutting down.".into());
@@ -840,8 +961,13 @@ async fn prepare_download(
     }
     state
         .log(format!(
-            "Downloading {repo}/{filename} at {}",
-            revision.chars().take(12).collect::<String>()
+            "Downloading {repo}/{filename} at {} ({})",
+            revision.chars().take(12).collect::<String>(),
+            match transport {
+                "xet" => "Xet",
+                "https" => "HTTPS",
+                _ => "Auto",
+            }
         ))
         .await;
     let state = state.clone();
@@ -1242,6 +1368,81 @@ mod tests {
         assert_eq!(transfer.transferred, Some(12_300_000));
         assert_eq!(transfer.percent, None);
         assert!(parse_hf_progress("Warning: a token is not configured").is_none());
+    }
+
+    #[test]
+    fn only_files_hf_downloaded_into_a_repository_folder_link_to_the_hub() {
+        let root = std::env::temp_dir().join(format!("noullama-hub-repo-{}", uuid::Uuid::new_v4()));
+        let folder = root.join("EldanRing--Winnow-E4B");
+        let cache = folder.join(".cache/huggingface/download");
+        std::fs::create_dir_all(cache.join("gguf")).unwrap();
+        std::fs::create_dir_all(folder.join("gguf")).unwrap();
+        std::fs::write(cache.join("w.gguf.metadata"), "sha").unwrap();
+        std::fs::write(cache.join("gguf/x.gguf.metadata"), "sha").unwrap();
+        std::fs::create_dir_all(root.join("mine--copies")).unwrap();
+        assert_eq!(hub_repo(&root, &folder.join("w.gguf")).as_deref(), Some("EldanRing/Winnow-E4B"));
+        assert_eq!(hub_repo(&root, &folder.join("gguf/x.gguf")).as_deref(), Some("EldanRing/Winnow-E4B"));
+        // Copied in by hand: no hf metadata.
+        assert_eq!(hub_repo(&root, &folder.join("copied.gguf")), None);
+        assert_eq!(hub_repo(&root, &root.join("mine--copies/a.gguf")), None);
+        assert_eq!(hub_repo(&root, &root.join("loose.gguf")), None);
+        assert_eq!(hub_repo(&root, Path::new("/elsewhere/EldanRing--Winnow-E4B/w.gguf")), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn https_progress_counts_every_written_byte_as_received() {
+        // A line hf prints with HF_HUB_DISABLE_XET=1.
+        let progress = parse_hf_progress(
+            "model.safetensors: 100%|██████████| 454k/454k [00:00<00:00, 3.42MB/s]",
+        )
+        .unwrap();
+        assert_eq!(progress.percent, Some(100.0));
+        assert_eq!(progress.completed, Some(454_000));
+        assert_eq!(progress.transferred, Some(454_000));
+    }
+
+    #[test]
+    fn each_transport_sets_hfs_environment() {
+        let env = |transport: &str| {
+            let mut command = Command::new("hf");
+            apply_transport(&mut command, transport);
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == "HF_HUB_DISABLE_XET")
+                .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(env("auto"), None);
+        assert_eq!(env("https"), Some(Some("1".into())));
+        // Removed, so a HF_HUB_DISABLE_XET in the desktop's environment cannot turn Xet off.
+        assert_eq!(env("xet"), Some(None));
+    }
+
+    #[test]
+    fn hf_env_and_paths_info_show_whether_xet_can_be_used() {
+        assert_eq!(xet_version("- huggingface_hub version: 1.2.0\n- hf_xet: 1.8.0\n- HF_HUB_DISABLE_XET: False\n").as_deref(), Some("1.8.0"));
+        assert_eq!(xet_version("- hf_xet: N/A\n"), None);
+        assert_eq!(xet_version(""), None);
+        let entries = json!([{"path": "a.gguf", "xetHash": "514c9a"}, {"path": "b.gguf", "lfs": {"oid": "x"}}]);
+        assert!(has_xet_hash(&entries, "a.gguf"));
+        assert!(!has_xet_hash(&entries, "b.gguf"));
+        assert!(!has_xet_hash(&entries, "c.gguf"));
+    }
+
+    #[tokio::test]
+    async fn download_transport_accepts_only_known_modes_and_defaults_to_auto() {
+        let base = std::env::temp_dir().join(format!("noullama-transport-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(base.clone()).unwrap();
+        assert_eq!(state.settings.lock().await.download_transport, "auto");
+        set_transport(&state, "https".into()).await.unwrap();
+        assert_eq!(state.settings.lock().await.download_transport, "https");
+        assert!(set_transport(&state, "ftp".into()).await.is_err());
+        assert_eq!(state.settings.lock().await.download_transport, "https");
+        // settings.json from a release without the field reads as Auto.
+        let saved: Settings = serde_json::from_str(r#"{"hf_path": "hf"}"#).unwrap();
+        assert_eq!(saved.download_transport, "auto");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]

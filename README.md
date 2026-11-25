@@ -130,7 +130,11 @@ Linux cgroup v2 memory limits and pressure are included where readable. Missing 
 
 Downloads use `hf download` at the inspected repository revision. Saved Hugging Face credentials and `HF_TOKEN` are supported; a token entered in the app is held only for the session and passed to `hf` through its environment.
 
-Several files can download concurrently. Each has a progress panel and **Cancel download**; network progress fills from one side and file reconstruction from the other. Xet compression and deduplication can make those values differ. Cancelled partial files remain available for an immediate resume and are removed on full quit. The floating **Downloads** card provides cancellation, completion dismissal and repository navigation while you use other tabs.
+**Download with** in the Hugging Face card picks how `hf` fetches files. **Auto** lets `hf` choose: Xet for files stored on Xet when `hf` has the `hf_xet` package, otherwise HTTPS. **Xet** requires Xet and refuses to start a download for a file that is not stored on Xet or with an `hf` that has no `hf_xet`. **HTTPS** turns Xet off and downloads whole files. The choice applies to downloads started after it changes.
+
+When the model selected in **Loading** was downloaded from the Hub tab, a **Hub** button next to its state opens its repository in the Hub.
+
+Several files can download concurrently. Each has a progress panel and **Cancel download**; network progress fills from one side and file reconstruction from the other. Xet compression and deduplication can make those values differ; over HTTPS they are the same. Cancelled partial files remain available for an immediate resume and are removed on full quit. The floating **Downloads** card provides cancellation, completion dismissal and repository navigation while you use other tabs.
 
 Memory-fit badges use file sizes and the selected context/GPU-layer settings. Search cards estimate the smallest model GGUF; repository inspection estimates each weight file separately. Projectors and MTP heads are excluded as standalone models; missing metadata shows **Fit unavailable**. The selected local model's fit also accounts for estimated memory held by other loaded models. These are estimates, not compatibility or allocation guarantees.
 

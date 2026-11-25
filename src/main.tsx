@@ -83,7 +83,7 @@ import './styles.css';
 // decoded to 3.7 MB of bitmap for the sidebar.
 const logoUrl = new URL('./logo-96.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; split_mode: string; tensor_split: string; cpu_runtime_path: string; api_port: number; require_api_key: boolean; runtime_port: number; hf_path: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; split_mode: string; tensor_split: string; cpu_runtime_path: string; api_port: number; require_api_key: boolean; runtime_port: number; hf_path: string; download_transport: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
 
 // One loaded model, with the settings it was loaded with.
 type Instance = { verifying: Verifying | null; id: string; name: string; label: string; slot: number; suffix: string; default_suffix: string; api_names: string[]; instance_aliases: string[]; path: string; device: string; runtime_path: string; projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null; ready: boolean; context_size: number; gpu_layers: number; required_bytes: number | null; context: { entries: number; last_flushed: number }; keep_context: boolean; settings: Settings };
@@ -95,7 +95,12 @@ type SavedPreset = { id: string; name: string; questions: unknown; state: string
 type Model = { id: string; downloads: number; likes: number; tags: string[]; fit: Fit | null };
 type ModelFile = { name: string; size?: number; projector: boolean; mtp_head: boolean; fit: Fit | null };
 type Inspection = { repo: string; files: ModelFile[]; sha: string };
-type Session = { authenticated: boolean; account: string | null; cli_available: boolean; token_present: boolean };
+type Session = { authenticated: boolean; account: string | null; cli_available: boolean; xet: string | null; token_present: boolean };
+const TRANSPORTS = [
+  { value: 'auto', label: 'Auto', detail: 'Xet for files stored on Xet when hf has hf_xet, otherwise HTTPS.' },
+  { value: 'xet', label: 'Xet', detail: 'Xet only. A file not stored on Xet, or an hf without hf_xet, is not downloaded.' },
+  { value: 'https', label: 'HTTPS', detail: 'Whole files over HTTPS, without Xet deduplication.' },
+];
 type Result = { answers?: Record<string, { type?: string; choice?: string; score?: number; noul?: number; confidence?: number; probabilities?: Record<string, number> }>; usage?: { input_tokens: number; output_tokens: number }; [key: string]: unknown };
 // The Settings tab's choice for `any-available` when every ready instance is running a request.
 const WHEN_BUSY = [
@@ -104,7 +109,7 @@ const WHEN_BUSY = [
 ] as const;
 // "Wait up to (ms)": the backend accepts 1–600000 (set_wait_ms in runtime.rs).
 const WAIT_MS = { min: 1, max: 600000, step: 1000 };
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', split_mode: 'layer', tensor_split: '', cpu_runtime_path: '', api_port: 11435, require_api_key: false, runtime_port: 11436, hf_path: 'hf', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', split_mode: 'layer', tensor_split: '', cpu_runtime_path: '', api_port: 11435, require_api_key: false, runtime_port: 11436, hf_path: 'hf', download_transport: 'auto', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
 // The form is edited in two places, each saved on its own: the Loading
 // tab's load panel (settings a load uses) and the Runtime tab (build and ports).
 // keep_context is the default a new instance starts with; loaded instances
@@ -404,6 +409,7 @@ function App() {
   const preferenceWrites = useOptimisticWrites<{ prefs: UpdatePrefs }>(showWriteError);
   const shownSetting = <K extends keyof Settings>(key: K, fallback: Settings[K]): Settings[K] =>
     settingWrites.drafts[key] ?? snapshot?.settings[key] ?? fallback;
+  const transport = shownSetting('download_transport', 'auto');
   function changeSetting<K extends keyof Settings>(key: K, value: Settings[K], command: string, args: Record<string, unknown>) {
     if (!desktop) { showWriteError('Launch the desktop app with npm run desktop to use the local backend.'); return; }
     settingWrites.write(key, value, async () => { await invoke(command, args); await refresh(); });
@@ -648,6 +654,16 @@ function App() {
   // Several instances of one file can be loaded; the load bar acts on one, chosen in the panel.
   const { list: selectedInstances, selected: selectedInstance } = instancesOf(instances, settings.model_path, loadTarget);
   const model = modelStatus(settings.model_path, selectedInstance, modelMissing);
+  // The repository the Hub tab downloaded the selected model from, for Loading's Hub button.
+  const [selectedRepo, setSelectedRepo] = useState<{ path: string; repo: string | null } | null>(null);
+  useEffect(() => {
+    const path = model.selected;
+    if (!desktop || !path) return;
+    let live = true;
+    invoke<string | null>('model_repo', { path }).then(repo => { if (live) setSelectedRepo({ path, repo }); }).catch(() => {});
+    return () => { live = false; };
+  }, [model.selected, finishedDownloads]);
+  const hubRepo = selectedRepo && selectedRepo.path === model.selected ? selectedRepo.repo : null;
   // Whether a load now would differ from what this instance was loaded with:
   // the load panel's values, plus the saved build (unsaved Runtime tab edits
   // are not used by a load).
@@ -864,6 +880,7 @@ function App() {
               <div className="hf-card">
                 <strong className="auth-heading"><HuggingFaceLogo size={16}/>{session?.authenticated ? `Connected as ${session.account}` : 'Hugging Face'}</strong>
                 <p>{session && !session.cli_available ? 'hf CLI not found. Install it or set the executable path in Runtime.' : session?.authenticated ? 'Downloads use your Hugging Face session.' : 'Public models work without signing in. Uses HF_TOKEN or your hf auth login session.'}</p>
+                <div className="hf-transport"><span>Download with</span><SegmentedControl label="Download with">{TRANSPORTS.map(option => <button key={option.value} type="button" className={transport === option.value ? 'on' : ''} aria-pressed={transport === option.value} disabled={!desktop} onClick={() => { if (transport !== option.value) void changeSetting('download_transport', option.value, 'set_download_transport', { mode: option.value }); }}>{option.label}</button>)}</SegmentedControl><Reveal open swapKey={`${transport}${session?.cli_available && !session.xet ? '-no-xet' : ''}`}><p>{TRANSPORTS.find(option => option.value === transport)?.detail}{session?.cli_available && !session.xet && transport !== 'https' ? ' This hf has no hf_xet, so ' + (transport === 'xet' ? 'downloads will not start.' : 'it uses HTTPS.') : ''} Applies to downloads started after a change.</p></Reveal></div>
                 <div className="hf-card-actions"><button className="secondary compact" {...busyButton(isBusy('session'))} onClick={() => action('session', async () => setSession(await invoke('hf_session')))}><RefreshCw size={13}/>Check session</button></div>
                 <div className="token-details"><button type="button" className="token-summary" aria-expanded={tokenOpen} aria-controls={tokenFormId} onClick={() => setTokenOpen(open => !open)}><ChevronRight className="disclosure" size={14}/>Use a token for this session</button><Reveal open={tokenOpen} id={tokenFormId}><div className="inline-form"><input type="password" autoComplete="off" aria-label="Hugging Face token" placeholder="hf_… (kept in memory only)" value={token} onChange={e => setToken(e.target.value)}/><button className="secondary compact" {...busyButton(isBusy('token'))} onClick={() => action('token', async () => { await invoke('set_hf_token', { token }); setToken(''); setSession(await invoke('hf_session')); })}>Apply</button></div><button className="ghost" {...busyButton(isBusy('token'))} onClick={() => action('token', async () => { await invoke('set_hf_token', { token: '' }); setSession(await invoke('hf_session')); })}>Use saved login instead</button></Reveal></div>
               </div>
@@ -964,6 +981,7 @@ function App() {
                 <div className="load-identity-icon">{accountFor(model.selected) ? <AuthorLogo author={accountFor(model.selected)} size={40}/> : <Cpu size={20}/>}</div>
                 <div className="model-identity"><small>{selectedInstance ? selectedInstance.ready ? 'Loaded model' : 'Loading model' : 'Selected model'}{model.device && <> · {model.device}</>}</small><span className="identity-line"><strong title={model.selected}>{model.selected ? nameFor(model.selected) ?? basename(model.selected) : 'No model selected'}</strong>{model.selected && <CopyButton value={basename(model.selected)} label="Copy model file name" size={13} onError={copyError}/>}</span></div>
                 <div className="load-identity-state">
+                  <Reveal open={hubRepo}>{hubRepo && <button type="button" className="secondary compact hub-link" title={`Open ${hubRepo} in the Hub`} aria-label={`Open ${hubRepo} in the Hub`} onClick={() => { setTab('hub'); void openRepo(hubRepo); }}><HuggingFaceLogo size={14}/>Hub</button>}</Reveal>
                   <Reveal open={selectedInstances.length > 1}>{selectedInstances.length > 1 && <div className="load-instance"><Select label="Instance" value={selectedInstance?.id ?? ''} options={selectedInstances.map(i => ({ value: i.id, label: `${apiName(i)} · instance ${i.slot}${i.ready ? '' : ' (loading)'}` }))} onChange={setLoadTarget}/></div>}</Reveal>
                   <span className={`chip ${model.ready ? 'success' : ''}`}><span className={`status-dot ${model.ready ? 'green' : model.loaded ? 'amber' : ''}`}/>{showBusy('start') && !model.verifying ? 'Starting…' : model.label}</span>
                 </div>
