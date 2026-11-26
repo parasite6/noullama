@@ -14,6 +14,7 @@ import { TrashIcon as Trash2 } from '@phosphor-icons/react/dist/icons/Trash';
 import { XIcon as X } from '@phosphor-icons/react/dist/icons/X';
 import { AuthorLogo, authorFromPath } from './AuthorLogo';
 import { CopyButton } from './CopyButton';
+import { HuggingFaceLogo } from './HuggingFaceLogo';
 import { ComboInput } from './Select';
 
 // One entry of models.yml, as the editor holds it.
@@ -64,6 +65,8 @@ function ShaRow({ label, sum, status, canRecord, blocked, pending, onRecord, onC
 
 type Props = {
   library: LibraryState | null; loadedPaths: string[]; companions: Companion[]; desktop: boolean; scrollPosition: React.RefObject<LibraryScroll>;
+  // The Hub repository each model was downloaded from by the Hub tab, by path.
+  hubRepos: Record<string, string>; onOpenHub: (repo: string) => void;
   onSave: (entries: LibraryEntry[], revision: number) => Promise<void>;
   onReload: () => Promise<void>; onOpenFile: () => Promise<void>; onOpenBackups: () => Promise<void>;
   onRecordSha: (path: string, slot: Slot) => Promise<void>; onBrowse: () => Promise<string | null>;
@@ -76,12 +79,12 @@ type CompanionGroups = Record<Companion['kind'], CompanionGroup>;
 const emptyRows: LibraryRow[] = [];
 
 const LibraryCard = memo(function LibraryCard({
-  entry, row, loaded, accounts, companions, desktop, edit, remove, pending, run, onBrowse, onRecordSha, onError,
+  entry, row, loaded, hubRepo, accounts, companions, desktop, edit, remove, pending, run, onBrowse, onRecordSha, onError, onOpenHub,
 }: {
-  entry: DraftEntry; row?: LibraryRow; loaded: boolean; accounts: string[]; companions: CompanionGroups;
+  entry: DraftEntry; row?: LibraryRow; loaded: boolean; hubRepo?: string; accounts: string[]; companions: CompanionGroups;
   desktop: boolean; edit: (id: number, change: Partial<LibraryEntry>) => void; remove: (id: number) => void;
   pending: string | null; run: (name: string, task: () => Promise<void>) => Promise<void>;
-} & Pick<Props, 'onBrowse' | 'onRecordSha' | 'onError'>) {
+} & Pick<Props, 'onBrowse' | 'onRecordSha' | 'onError' | 'onOpenHub'>) {
       const account = entry.account || authorFromPath(entry.path);
       return <section className="panel library-entry">
         <div className="library-head">
@@ -94,6 +97,7 @@ const LibraryCard = memo(function LibraryCard({
             {row && Object.values(row.status).some(s => s.hashing) && <span className="chip"><RefreshCw className="spin" size={12}/>Checking sha256</span>}
             {row && Object.values(row.status).some(s => s.mismatch) && <span className="chip warning" title="A file no longer matches its recorded sha256">sha256 changed</span>}
           </span>
+          {hubRepo && <button type="button" className="secondary compact hub-link" title={`Open ${hubRepo} in the Hub`} aria-label={`Open ${hubRepo} in the Hub`} onClick={() => onOpenHub(hubRepo)}><HuggingFaceLogo size={14}/>Hub</button>}
           <button className="icon-button" aria-label={`Remove ${entry.name} from models.yml`} title="Remove from models.yml (the file stays on disk)" onClick={() => remove(entry.id)}><Trash2 size={15}/></button>
         </div>
         <div className="library-fields">
@@ -125,7 +129,7 @@ const LibraryCard = memo(function LibraryCard({
 // The Library tab: every model in models.yml, editable field by field. Saving
 // writes the file (backing up the old one); edits made in a text editor show
 // up here as soon as they are saved.
-export const Library = memo(function Library({ library, loadedPaths, companions, desktop, scrollPosition, onSave, onReload, onOpenFile, onOpenBackups, onRecordSha, onBrowse, onError }: Props) {
+export const Library = memo(function Library({ library, loadedPaths, companions, desktop, scrollPosition, hubRepos, onSave, onReload, onOpenFile, onOpenBackups, onRecordSha, onBrowse, onError, onOpenHub }: Props) {
   // Start from the loaded file, so the first frame already shows the models
   // instead of the empty state collapsing away after an effect fills them in.
   const nextId = useRef(0);
@@ -223,10 +227,10 @@ export const Library = memo(function Library({ library, loadedPaths, companions,
     <LibraryDirty.Provider value={dirty}>
       <LibraryList scrollPosition={scrollPosition} ids={draft.map(entry => entry.id)} renderRow={index => {
         const entry = draft[index];
-        return <LibraryCard entry={entry} row={byPath.get(entry.path)} loaded={loaded.has(entry.path)}
+        return <LibraryCard entry={entry} row={byPath.get(entry.path)} loaded={loaded.has(entry.path)} hubRepo={hubRepos[entry.path]}
           accounts={accounts} companions={groups} desktop={desktop} edit={edit} remove={remove}
           pending={pending?.startsWith('sha:' + entry.id + ':') ? pending : null}
-          run={run} onBrowse={onBrowse} onRecordSha={onRecordSha} onError={onError}/>;
+          run={run} onBrowse={onBrowse} onRecordSha={onRecordSha} onError={onError} onOpenHub={onOpenHub}/>;
       }}/>
     </LibraryDirty.Provider>
     <div className={`save-bar ${dirty ? 'dirty' : ''}`}><Reveal open className="hint" swapKey={String(dirty)}>{dirty ? 'Unsaved changes to models.yml. Saving backs up the current file first.' : 'models.yml is up to date. Edits made in a text editor appear here when saved.'}</Reveal><div className="save-actions"><Reveal open={dirty} className="inline-reveal">{dirty && <button className="ghost" onClick={discard}>Discard</button>}</Reveal><button className={dirty ? 'primary' : 'secondary'} {...busyButton(!!pending, !dirty || !desktop, pending === 'save')} onClick={save}><Save size={14}/>Save models.yml</button></div></div>

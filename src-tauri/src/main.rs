@@ -15,6 +15,7 @@ mod lifecycle;
 mod presets;
 mod runtime;
 mod runtimes;
+mod runtime_updates;
 mod updates;
 
 use runtime::AppState;
@@ -45,6 +46,7 @@ fn main() {
             let state = AppState::with_config_dir(data_dir, app.path().app_config_dir()?)?;
             app.manage(state.clone());
             runtime::start_memory_guard(state.clone());
+            runtime_updates::start(state.clone());
             desktop::install_signal_handler(app.handle().clone());
             tauri::async_runtime::block_on(api::start(state));
             if let Err(error) = desktop::install_tray(app) {
@@ -63,6 +65,8 @@ fn main() {
             runtimes::runtime_releases,
             runtimes::download_runtimes,
             runtimes::download_cpu_runtime,
+            runtime_updates::set_auto_update_runtime,
+            runtime_updates::update_runtime_now,
             devices::runtime_devices,
             runtime::snapshot,
             api_keys::set_require_api_key,

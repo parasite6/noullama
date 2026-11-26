@@ -83,12 +83,12 @@ import './styles.css';
 // decoded to 3.7 MB of bitmap for the sidebar.
 const logoUrl = new URL('./logo-96.png', import.meta.url).href;
 
-type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; split_mode: string; tensor_split: string; cpu_runtime_path: string; api_port: number; require_api_key: boolean; runtime_port: number; hf_path: string; download_transport: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number };
+type Settings = { runtime_path: string; model_path: string; mmproj_path: string; mtp: boolean; mtp_path: string; decision_mode: string; context_size: number; gpu_layers: number; device: string; split_mode: string; tensor_split: string; cpu_runtime_path: string; api_port: number; require_api_key: boolean; runtime_port: number; hf_path: string; download_transport: string; download_dir: string; library_path: string; keep_context: boolean; sha256_check: string; allow_force_fit: boolean; hide_crowded_load_warning: boolean; fall_through_to_other_instances: boolean; any_available_when_busy: string; any_available_wait_ms: number; auto_update_runtime: boolean };
 
 // One loaded model, with the settings it was loaded with.
 type Instance = { verifying: Verifying | null; id: string; name: string; label: string; slot: number; suffix: string; default_suffix: string; api_names: string[]; instance_aliases: string[]; path: string; device: string; runtime_path: string; projector: boolean; mmproj_path: string; mtp: boolean; mtp_path: string; layout: string | null; ready: boolean; context_size: number; gpu_layers: number; required_bytes: number | null; context: { entries: number; last_flushed: number }; keep_context: boolean; settings: Settings };
 type LoadError = { id: string; path: string; slot: number; name: string; message: string };
-type Snapshot = { settings: Settings; running: boolean; ready: boolean; instances: Instance[]; default_model: string | null; routes: ApiRoute[]; library: LibraryState; api_port: number; api_error: string | null; api_notice: string | null; load_errors: LoadError[]; runtime_download: RuntimeDownload; cpu_runtime_download: RuntimeDownload; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; downloads: DownloadState[]; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; model_missing: boolean };
+type Snapshot = { settings: Settings; running: boolean; ready: boolean; instances: Instance[]; default_model: string | null; routes: ApiRoute[]; library: LibraryState; api_port: number; api_error: string | null; api_notice: string | null; load_errors: LoadError[]; runtime_download: RuntimeDownload; cpu_runtime_download: RuntimeDownload; runtime_update: { progress: RuntimeDownload; checked_at: number | null }; quit_confirmation: boolean; startup_warning: string | null; logs: string[]; downloads: DownloadState[]; data_dir: string; download_dir: string; loaded_model: { path: string; device: string; runtime_path: string; projector: boolean; mtp: boolean; layout: string | null } | null; hardware: Hardware | null; model_missing: boolean };
 type Hardware = { ram_bytes: number; vram_bytes: number | null; gpu: string | null; cpu_cores: number };
 type Fit = { level: number; label: string; detail: string; model_bytes: number; required_bytes: number };
 type SavedPreset = { id: string; name: string; questions: unknown; state: string; state_mode: 'text' | 'json' };
@@ -109,7 +109,7 @@ const WHEN_BUSY = [
 ] as const;
 // "Wait up to (ms)": the backend accepts 1–600000 (set_wait_ms in runtime.rs).
 const WAIT_MS = { min: 1, max: 600000, step: 1000 };
-const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', split_mode: 'layer', tensor_split: '', cpu_runtime_path: '', api_port: 11435, require_api_key: false, runtime_port: 11436, hf_path: 'hf', download_transport: 'auto', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000 };
+const defaultSettings: Settings = { runtime_path: '', model_path: '', mmproj_path: '', mtp: false, mtp_path: '', decision_mode: 'auto', context_size: 8192, gpu_layers: 99, device: '', split_mode: 'layer', tensor_split: '', cpu_runtime_path: '', api_port: 11435, require_api_key: false, runtime_port: 11436, hf_path: 'hf', download_transport: 'auto', download_dir: '', library_path: '', keep_context: false, sha256_check: 'once', allow_force_fit: false, hide_crowded_load_warning: false, fall_through_to_other_instances: false, any_available_when_busy: 'reject', any_available_wait_ms: 120000, auto_update_runtime: true };
 // The form is edited in two places, each saved on its own: the Loading
 // tab's load panel (settings a load uses) and the Runtime tab (build and ports).
 // keep_context is the default a new instance starts with; loaded instances
@@ -333,9 +333,18 @@ function App() {
   // The form follows the saved settings, except the group that has unsaved edits.
   const savedSettings = snapshot?.settings ?? null;
   const savedKey = savedSettings ? JSON.stringify(savedSettings) : '';
+  const previousSaved = useRef<Settings | null>(null);
   useEffect(() => {
     if (!savedSettings) return;
-    setSettings(current => ({ ...savedSettings, ...(runtimeFormDirty ? pick(current, RUNTIME_FIELDS) : {}), ...(loadDirty ? pick(current, LOAD_FIELDS) : {}) }));
+    const previous = previousSaved.current;
+    previousSaved.current = savedSettings;
+    setSettings(current => {
+      const kept: Partial<Settings> = runtimeFormDirty ? pick(current, RUNTIME_FIELDS) : {};
+      // A build path the unsaved form never changed follows the saved one, so
+      // saving the form does not point back at a build an update replaced.
+      if (runtimeFormDirty && previous) for (const key of ['runtime_path', 'cpu_runtime_path'] as const) if (current[key] === previous[key]) delete kept[key];
+      return { ...savedSettings, ...kept, ...(loadDirty ? pick(current, LOAD_FIELDS) : {}) };
+    });
   }, [savedKey, runtimeFormDirty, loadDirty]);
   // Editing a group back to its saved values leaves nothing to save.
   useEffect(() => {
@@ -421,6 +430,14 @@ function App() {
   const shownSetting = <K extends keyof Settings>(key: K, fallback: Settings[K]): Settings[K] =>
     settingWrites.drafts[key] ?? snapshot?.settings[key] ?? fallback;
   const transport = shownSetting('download_transport', 'auto');
+  const runtimeUpdate = snapshot?.runtime_update ?? null;
+  const runtimeUpdateLine = (() => {
+    const progress = runtimeUpdate?.progress;
+    if (progress?.active) return progress.total ? `${progress.message} ${Math.min(100, Math.round(progress.downloaded / progress.total * 100))}%` : progress.message;
+    const when = runtimeUpdate?.checked_at ? new Date(runtimeUpdate.checked_at * 1000).toLocaleString() : null;
+    if (!when) return 'Not checked yet.';
+    return progress?.message ? `${progress.message} Checked ${when}.` : `Checked ${when}.`;
+  })();
   function changeSetting<K extends keyof Settings>(key: K, value: Settings[K], command: string, args: Record<string, unknown>) {
     if (!desktop) { showWriteError('Launch the desktop app with npm run desktop to use the local backend.'); return; }
     settingWrites.write(key, value, async () => { await invoke(command, args); await refresh(); });
@@ -555,6 +572,9 @@ function App() {
     if (!desktop) throw new Error('Launch the desktop app with npm run desktop to use the local backend.');
     await invoke(command, args); await refresh();
   }
+  // openRepo reads the current fit settings, so the memoized actions call the latest one.
+  const openRepoRef = useRef(openRepo);
+  openRepoRef.current = openRepo;
   // These commands only use the desktop flag, stable setters, and refresh refs.
   const libraryActions = useMemo(() => ({
     onSave: saveLibrary,
@@ -564,6 +584,7 @@ function App() {
     onRecordSha: (path: string, slot: string) => libraryCommand('record_sha256', { path, slot }),
     onBrowse: () => invoke<string | null>('pick_model_file'),
     onError: copyError,
+    onOpenHub: (repo: string) => { setTab('hub'); void openRepoRef.current(repo); },
   }), [desktop]);
   async function eject(id: string) { await action(`eject:${id}`, async () => { await invoke('unload_model', { id }); }); }
   async function dismissLoadError(id: string) { if (desktop) { await invoke('dismiss_load_error', { id }).catch(() => {}); await refresh().catch(() => {}); } }
@@ -596,7 +617,7 @@ function App() {
     else detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }, [inspection]);
   // The newest request wins: opening another repository while one is still
-  // being read (from the Hub list or Loading's Hub button) replaces it.
+  // being read (from the Hub list or a Library Hub button) replaces it.
   async function openRepo(id: string) {
     if (!desktop) { setNotice({ text: 'Launch the desktop app with npm run desktop to use the local backend.', error: true }); return; }
     const request = ++inspectRequest.current;
@@ -669,6 +690,21 @@ function App() {
   const banner = visibleBanner(notice ?? (!dismissedApiNotice && snapshot?.api_notice ? { text: snapshot.api_notice, error: false } : null) ?? (!dismissedStartup && snapshot?.startup_warning ? { text: snapshot.startup_warning, error: true } : null), snapshot?.api_error, dismissedApi, desktop, previewDismissed);
   const instances = snapshot?.instances ?? noInstances;
   const libraryLoadedPaths = useMemo(() => instances.map(instance => instance.path), [instances]);
+  // The repository the Hub tab downloaded each Library model from, for its Hub button.
+  const libraryPaths = useMemo(() => [...new Set((snapshot?.library?.entries ?? []).map(entry => entry.path))].sort(), [snapshot?.library?.entries]);
+  const libraryPathsKey = libraryPaths.join('\n');
+  const [hubRepos, setHubRepos] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!desktop || !libraryPaths.length) { setHubRepos({}); return; }
+    let live = true;
+    Promise.all(libraryPaths.map(path => invoke<string | null>('model_repo', { path }).then(repo => [path, repo] as const, () => [path, null] as const)))
+      .then(found => {
+        if (!live) return;
+        const next = Object.fromEntries(found.flatMap(([path, repo]) => repo ? [[path, repo]] : []));
+        setHubRepos(current => equalJson(current, next) ? current : next);
+      });
+    return () => { live = false; };
+  }, [desktop, libraryPathsKey, finishedDownloads]);
   const libraryCompanions = useMemo(() => localModels.flatMap((file): Companion[] =>
     file.mtp_head ? [{ path: file.path, kind: 'mtp' }] : isProjector(file.path) ? [{ path: file.path, kind: 'mmproj' }] : []), [localModels]);
   const running = instances.length > 0;
@@ -678,16 +714,6 @@ function App() {
   // Several instances of one file can be loaded; the load bar acts on one, chosen in the panel.
   const { list: selectedInstances, selected: selectedInstance } = instancesOf(instances, settings.model_path, loadTarget);
   const model = modelStatus(settings.model_path, selectedInstance, modelMissing);
-  // The repository the Hub tab downloaded the selected model from, for Loading's Hub button.
-  const [selectedRepo, setSelectedRepo] = useState<{ path: string; repo: string | null } | null>(null);
-  useEffect(() => {
-    const path = model.selected;
-    if (!desktop || !path) return;
-    let live = true;
-    invoke<string | null>('model_repo', { path }).then(repo => { if (live) setSelectedRepo({ path, repo }); }).catch(() => {});
-    return () => { live = false; };
-  }, [model.selected, finishedDownloads]);
-  const hubRepo = selectedRepo && selectedRepo.path === model.selected ? selectedRepo.repo : null;
   // Whether a load now would differ from what this instance was loaded with:
   // the load panel's values, plus the saved build (unsaved Runtime tab edits
   // are not used by a load).
@@ -919,7 +945,7 @@ function App() {
           </div>
         </>}
         {tab === 'runtime' && <>
-          <RuntimeManager currentPath={settings.runtime_path} currentName={runtimeName(settings.runtime_path)} running={running} progress={snapshot?.runtime_download} onRefresh={refresh} onSelect={runtime => edit('runtime_path', runtime.path)}
+          <RuntimeManager updateProgress={snapshot?.runtime_update?.progress} currentPath={settings.runtime_path} currentName={runtimeName(settings.runtime_path)} running={running} progress={snapshot?.runtime_download} onRefresh={refresh} onSelect={runtime => edit('runtime_path', runtime.path)}
             cpuPath={settings.cpu_runtime_path} cpuProgress={snapshot?.cpu_runtime_download} cpuName={settings.cpu_runtime_path ? runtimeName(settings.cpu_runtime_path) : 'No CPU runtime selected'} onSelectCpu={runtime => edit('cpu_runtime_path', runtime.path)}
             cpuChildren={
               <SettingRow label="Path to CPU llama-server" htmlFor="cpu-runtime-path" description="A CPU build's folder or its llama-server." more={'"Use for CPU" above fills this in. Saved with the save bar below.'}>
@@ -959,7 +985,7 @@ function App() {
           <div className={`save-bar ${runtimeFormDirty ? 'dirty' : ''}`}><Reveal open className="hint" swapKey={String(runtimeFormDirty)}>{runtimeFormDirty ? running ? 'You have unsaved changes. Loading a model does not save them, and loaded models keep the build they started with.' : 'You have unsaved changes. Loading a model does not save them.' : running ? 'All changes saved. Loaded models keep the build they started with.' : 'All changes saved.'}</Reveal><button className={runtimeFormDirty ? 'primary' : 'secondary'} {...busyButton(isBusy('save', 'save-load', 'start'), !runtimeFormDirty, isBusy('save'))} onClick={() => action('save', async () => { await saveRuntimeSettings(); setNotice({ text: 'Settings saved.', error: false }); })}>Save settings</button></div>
         </>}
         {tab === 'library' && <Library library={snapshot?.library ?? null} loadedPaths={libraryLoadedPaths}
-          companions={libraryCompanions} desktop={desktop} scrollPosition={libraryScroll} {...libraryActions}/>}
+          companions={libraryCompanions} desktop={desktop} scrollPosition={libraryScroll} hubRepos={hubRepos} {...libraryActions}/>}
         {tab === 'settings' && <>
           <section className="panel settings-panel"><div className="panel-heading"><span><MemoryStick size={16}/> Memory protection</span></div><div className="settings-body">
             <div className="setting-rows">
@@ -985,6 +1011,16 @@ function App() {
                 control={<SegmentedControl label="sha256 check">{SHA_CHECKS.map(option => <button key={option.value} type="button" className={shownSetting('sha256_check', 'once') === option.value ? 'on' : ''} aria-pressed={shownSetting('sha256_check', 'once') === option.value} disabled={!desktop} onClick={() => { if (shownSetting('sha256_check', 'once') !== option.value) void changeSetting('sha256_check', option.value, 'set_sha256_check', { mode: option.value }); }}>{option.label}</button>)}</SegmentedControl>}/>
             </div>
           </div></section>
+          <section className="panel settings-panel"><div className="panel-heading"><span><RefreshCw size={16}/> llama.cpp updates</span></div><div className="settings-body">
+            <div className="setting-rows">
+              <SettingRow label="Update llama.cpp automatically" description="Keeps the nightly and stable builds that Noullama downloaded up to date, and removes each build it replaces."
+                more="Checks at most once a day, starting 10 seconds after launch; a failed check is retried within the hour. For each backend, nightly builds move to the newest nightly and stable builds to the newest stable release, with the same SHA-256 checks as a download from Runtime, whether or not they are selected. A selected build switches to the new build of its channel. Builds you chose by path are left alone. A replaced build is removed within an hour of no loaded model running from it: loaded models keep their build until you reload them."
+                control={<Toggle label={shownSetting('auto_update_runtime', true) ? 'On' : 'Off'} ariaLabel="Update llama.cpp automatically" checked={shownSetting('auto_update_runtime', true)} disabled={!desktop} onChange={value => void changeSetting('auto_update_runtime', value, 'set_auto_update_runtime', { value })}/>}/>
+              <SettingRow label="Last check" descriptionKey={runtimeUpdateLine} description={runtimeUpdateLine}
+                status={runtimeUpdate?.progress.error && !runtimeUpdate.progress.active ? <StatusNote tone="warn">{runtimeUpdate.progress.error}</StatusNote> : undefined} statusKey={runtimeUpdate?.progress.error ?? ''}
+                control={<button className="secondary compact" {...busyButton(isBusy('runtime-update') || !!runtimeUpdate?.progress.active, !desktop)} onClick={() => void action('runtime-update', async () => { await invoke('update_runtime_now'); })}><RefreshCw size={14} className={runtimeUpdate?.progress.active ? 'spin' : ''}/>{runtimeUpdate?.progress.active ? 'Updating…' : 'Check now'}</button>}/>
+            </div>
+          </div></section>
           <section className="panel settings-panel"><div className="panel-heading"><span><FileJson size={16}/> Models file</span></div><div className="settings-body">
             <div className="setting-rows">
               <SettingRow label={<span className="identity-line"><code>{snapshot?.library?.file ?? 'models.yml'}</code>{snapshot?.library?.file && <CopyButton value={snapshot.library.file} label="Copy models.yml path" size={12} onError={copyError}/>}</span>}
@@ -1005,7 +1041,6 @@ function App() {
                 <div className="load-identity-icon">{accountFor(model.selected) ? <AuthorLogo author={accountFor(model.selected)} size={40}/> : <Cpu size={20}/>}</div>
                 <div className="model-identity"><small>{selectedInstance ? selectedInstance.ready ? 'Loaded model' : 'Loading model' : 'Selected model'}{model.device && <> · {model.device}</>}</small><span className="identity-line"><strong title={model.selected}>{model.selected ? nameFor(model.selected) ?? basename(model.selected) : 'No model selected'}</strong>{model.selected && <CopyButton value={basename(model.selected)} label="Copy model file name" size={13} onError={copyError}/>}</span></div>
                 <div className="load-identity-state">
-                  <Reveal open={hubRepo}>{hubRepo && <button type="button" className="secondary compact hub-link" title={`Open ${hubRepo} in the Hub`} aria-label={`Open ${hubRepo} in the Hub`} onClick={() => { setTab('hub'); void openRepo(hubRepo); }}><HuggingFaceLogo size={14}/>Hub</button>}</Reveal>
                   <Reveal open={selectedInstances.length > 1}>{selectedInstances.length > 1 && <div className="load-instance"><Select label="Instance" value={selectedInstance?.id ?? ''} options={selectedInstances.map(i => ({ value: i.id, label: `${apiName(i)} · instance ${i.slot}${i.ready ? '' : ' (loading)'}` }))} onChange={setLoadTarget}/></div>}</Reveal>
                   <span className={`chip ${model.ready ? 'success' : ''}`}><span className={`status-dot ${model.ready ? 'green' : model.loaded ? 'amber' : ''}`}/>{showBusy('start') && !model.verifying ? 'Starting…' : model.label}</span>
                 </div>

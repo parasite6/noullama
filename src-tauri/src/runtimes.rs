@@ -23,6 +23,8 @@ pub struct RuntimeManager {
     pub progress: Mutex<InstallProgress>,
     /// The CPU runtime's own download ("Download the official CPU build").
     pub cpu_progress: Mutex<InstallProgress>,
+    /// Automatic updates of the selected builds (runtime_updates.rs).
+    pub update_progress: Mutex<InstallProgress>,
     /// The one running install, of either kind: one runtime download at a time.
     pub task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -32,6 +34,7 @@ pub struct RuntimeManager {
 pub enum Download {
     Builds,
     Cpu,
+    Update,
 }
 
 impl RuntimeManager {
@@ -39,6 +42,7 @@ impl RuntimeManager {
         match download {
             Download::Builds => &self.progress,
             Download::Cpu => &self.cpu_progress,
+            Download::Update => &self.update_progress,
         }
     }
 }
@@ -113,6 +117,36 @@ fn asset_matches(name: &str, os: &str, arch: &str, backend: &str) -> bool {
     name.ends_with(&suffix)
 }
 
+/// In the error when the newest nightly is still uploading its archives.
+pub const STILL_UPLOADING: &str = "is still uploading its builds";
+
+/// The newest nightly (`b<number>`) release's build for `backend`. Every
+/// nightly gets every build, but a release is published before its CI has
+/// uploaded them all; until this backend's archive is there, this says to
+/// wait instead of offering an older nightly.
+fn newest_nightly(releases: &Value, os: &str, arch: &str, backend: &str) -> Result<RuntimeBuild, String> {
+    let release = releases
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| {
+            !r["draft"].as_bool().unwrap_or(true)
+                && r["tag_name"].as_str().is_some_and(|tag| tag.len() > 1 && tag.starts_with('b') && tag[1..].bytes().all(|b| b.is_ascii_digit()))
+        })
+        .ok_or("No official nightly release was found")?;
+    release_build(release, os, arch, backend, "Nightly".into()).map_err(|error| {
+        // A missing (or still uploading) archive or CUDA runtime, or a digest
+        // GitHub has not computed yet: the upload has not finished.
+        let uploading = error.contains("has no official") || error.contains("no matching CUDA runtime") || error.contains("did not provide a SHA-256 digest");
+        if uploading {
+            let tag = release["tag_name"].as_str().unwrap_or_default();
+            format!("llama.cpp {tag} {STILL_UPLOADING}: its {os}/{arch} {backend} build is not there yet. Try again in a few minutes.")
+        } else {
+            error
+        }
+    })
+}
+
 fn safe_tag(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() < 80
@@ -135,7 +169,9 @@ fn release_build(
     let assets = release["assets"]
         .as_array()
         .ok_or("GitHub returned no release assets")?;
-    let asset = assets.iter().find(|asset| asset["name"].as_str().is_some_and(|name| asset_matches(name, os, arch, backend)))
+    // An archive still uploading has another state and is not offered yet.
+    let uploaded = |asset: &&Value| asset["state"].as_str().is_none_or(|state| state == "uploaded");
+    let asset = assets.iter().filter(uploaded).find(|asset| asset["name"].as_str().is_some_and(|name| asset_matches(name, os, arch, backend)))
         .ok_or_else(|| format!("{tag} has no official {os}/{arch} {backend} build. Choose another backend or a custom runtime."))?;
     let mut selected = vec![asset];
     if backend.starts_with("cuda") {
@@ -145,7 +181,7 @@ fn release_build(
         } else {
             format!("cudart-{name}")
         };
-        let libraries = assets.iter().find(|asset| asset["name"] == companion).ok_or("This CUDA release has no matching CUDA runtime libraries; choose CPU or Vulkan instead")?;
+        let libraries = assets.iter().filter(uploaded).find(|asset| asset["name"] == companion).ok_or("This CUDA release has no matching CUDA runtime libraries; choose CPU or Vulkan instead")?;
         selected.push(libraries);
     }
     let assets = selected.into_iter().map(|asset| {
@@ -205,25 +241,14 @@ async fn plan_releases(state: &AppState, backend: &str) -> Result<RuntimePlan, S
 /// The nightly and stable-fallback builds for `backend`, read from GitHub.
 /// Not kept as the approved plan, so the CPU download cannot replace the
 /// plan shown under "Download a build".
-async fn release_plan(state: &AppState, backend: &str) -> Result<RuntimePlan, String> {
+pub(crate) async fn release_plan(state: &AppState, backend: &str) -> Result<RuntimePlan, String> {
     let os = std::env::consts::OS;
     let arch = platform_arch(std::env::consts::ARCH)?;
     let (releases, stable) = tokio::try_join!(
         github_json(&state, "releases?per_page=30"),
         github_json(&state, "releases/latest")
     )?;
-    let nightly = releases
-        .as_array()
-        .and_then(|releases| {
-            releases.iter().find(|r| {
-                !r["draft"].as_bool().unwrap_or(true)
-                    && r["tag_name"].as_str().is_some_and(|tag| {
-                        tag.starts_with('b') && tag[1..].bytes().all(|b| b.is_ascii_digit())
-                    })
-            })
-        })
-        .ok_or("No official nightly release was found")?;
-    let nightly = release_build(nightly, os, arch, backend, "Nightly".into())?;
+    let nightly = newest_nightly(&releases, os, arch, backend)?;
     // Versioned releases currently link their binary build in the official notes.
     let stable_tag = stable["tag_name"]
         .as_str()
@@ -640,7 +665,7 @@ fn find_server(directory: &Path) -> Option<PathBuf> {
         .map(|r| PathBuf::from(r.path))
 }
 
-async fn install_build(state: &AppState, build: &RuntimeBuild, progress: &Mutex<InstallProgress>) -> Result<LocalRuntime, String> {
+pub(crate) async fn install_build(state: &AppState, build: &RuntimeBuild, progress: &Mutex<InstallProgress>) -> Result<LocalRuntime, String> {
     let root = state.data_dir.join("runtimes");
     tokio::fs::create_dir_all(&root)
         .await
@@ -1109,6 +1134,26 @@ mod tests {
         assert_eq!(release_build(&release, "linux", "x64", "cpu", "Nightly".into()).err().as_deref(), Some("GitHub did not provide a SHA-256 digest for this asset; installation requires a verified archive"));
     }
     #[test]
+    fn a_nightly_still_uploading_says_to_wait() {
+        let release = |tag: &str, names: &[&str], state: &str| json!({"tag_name": tag, "draft": false, "assets": names.iter().map(|name| {
+            let name = name.replace("TAG", tag);
+            json!({"name": name, "size": 123, "state": state, "digest": format!("sha256:{}", "a".repeat(64)), "browser_download_url": format!("https://github.com/ggml-org/llama.cpp/releases/download/{tag}/{name}")})
+        }).collect::<Vec<_>>()});
+        let cuda = ["llama-TAG-bin-ubuntu-cuda-13.5-x64.tar.gz", "cudart-llama-TAG-bin-ubuntu-cuda-13.5-x64.tar.gz"];
+        let complete = release("b12793", &cuda, "uploaded");
+        // Published, CI still uploading: only the CPU build so far.
+        let releases = json!([release("v1.1.0", &[], "uploaded"), release("b12798", &["llama-TAG-bin-ubuntu-x64.tar.gz"], "uploaded"), complete]);
+        assert_eq!(newest_nightly(&releases, "linux", "x64", "cpu").unwrap().tag, "b12798");
+        let wait = newest_nightly(&releases, "linux", "x64", "cuda13").err().unwrap();
+        assert!(wait.contains(STILL_UPLOADING) && wait.contains("b12798") && wait.contains("cuda13"), "{wait}");
+        // The archive is there but still uploading, or its CUDA runtime is missing.
+        for assets in [release("b12798", &cuda, "open"), release("b12798", &cuda[..1], "uploaded")] {
+            assert!(newest_nightly(&json!([assets, release("b12793", &cuda, "uploaded")]), "linux", "x64", "cuda13").err().unwrap().contains(STILL_UPLOADING));
+        }
+        assert_eq!(newest_nightly(&json!([release("b12798", &cuda, "uploaded")]), "linux", "x64", "cuda13").unwrap().tag, "b12798");
+        assert_eq!(newest_nightly(&json!([]), "linux", "x64", "cpu").err().unwrap(), "No official nightly release was found");
+    }
+    #[test]
     fn tar_libraries_are_materialized_without_creating_symlinks() {
         let base = directory();
         let archive = base.join("build.tar.gz");
@@ -1223,6 +1268,29 @@ pub async fn download_cpu_runtime(state: tauri::State<'_, AppState>) -> Result<(
     .await
 }
 
+/// Marks `download` active with the status line `first`, unless another
+/// runtime download (of any kind) is active: one runs at a time. Returns
+/// the lifecycle guard, so a caller can register its task before shutdown
+/// can look for it.
+pub(crate) async fn claim<'a>(state: &'a AppState, download: Download, first: &str) -> Result<tokio::sync::MutexGuard<'a, ()>, String> {
+    let guard = state.lifecycle.lock().await;
+    if state.app.exiting.load(Ordering::SeqCst) {
+        return Err("Noullama is shutting down".into());
+    }
+    let manager = &state.runtimes;
+    let (mut builds, mut cpu, mut update) = (manager.progress.lock().await, manager.cpu_progress.lock().await, manager.update_progress.lock().await);
+    if builds.active || cpu.active || update.active {
+        return Err(if update.active { "llama.cpp is updating; try again when the update finishes" } else { "A runtime download is already active" }.into());
+    }
+    let progress = match download {
+        Download::Builds => &mut *builds,
+        Download::Cpu => &mut *cpu,
+        Download::Update => &mut *update,
+    };
+    *progress = InstallProgress { active: true, message: first.into(), ..Default::default() };
+    Ok(guard)
+}
+
 /// Starts installing the plan that `plan` resolves to, reporting to
 /// `download`'s progress. Only one runtime download runs at a time, of
 /// either kind.
@@ -1232,20 +1300,7 @@ async fn begin_install(
     first: &str,
     plan: impl std::future::Future<Output = Result<RuntimePlan, String>> + Send + 'static,
 ) -> Result<(), String> {
-    let _guard = state.lifecycle.lock().await;
-    if state.app.exiting.load(Ordering::SeqCst) {
-        return Err("Noullama is shutting down".into());
-    }
-    let (mut builds, mut cpu) = (state.runtimes.progress.lock().await, state.runtimes.cpu_progress.lock().await);
-    if builds.active || cpu.active {
-        return Err("A runtime download is already active".into());
-    }
-    let progress = match download {
-        Download::Builds => &mut *builds,
-        Download::Cpu => &mut *cpu,
-    };
-    *progress = InstallProgress { active: true, message: first.into(), ..Default::default() };
-    drop((builds, cpu));
+    let _guard = claim(state, download, first).await?;
     let worker = state.clone();
     let task = tokio::spawn(async move {
         let progress = worker.runtimes.progress_of(download);
@@ -1266,6 +1321,7 @@ async fn begin_install(
                 progress.message = match download {
                     Download::Builds => "Nightly and official fallback are ready. Choose which runtime to use.",
                     Download::Cpu => "CPU builds installed. Choose Use for CPU, then save settings.",
+                    Download::Update => "llama.cpp updated.",
                 }
                 .into()
             }

@@ -36,7 +36,7 @@ function InstallStatus({ progress, label }: { progress?: RuntimeDownload; label:
 // its "CPU runtime" panel (`cpu_runtime_path`, for loads on Device CPU).
 // Both share the build scan; each download has its own progress, and only
 // one runtime download runs at a time.
-export function RuntimeManager({ currentPath, currentName, running, progress, onSelect, onRefresh, children, cpuPath, cpuName, cpuProgress, onSelectCpu, cpuChildren }: { currentPath: string; currentName: string; running: boolean; progress?: RuntimeDownload; onSelect: (runtime: LocalRuntime) => void; onRefresh: () => Promise<void>; children?: React.ReactNode; cpuPath: string; cpuName: string; cpuProgress?: RuntimeDownload; onSelectCpu: (runtime: LocalRuntime) => void; cpuChildren?: React.ReactNode }) {
+export function RuntimeManager({ updateProgress, currentPath, currentName, running, progress, onSelect, onRefresh, children, cpuPath, cpuName, cpuProgress, onSelectCpu, cpuChildren }: { updateProgress?: RuntimeDownload; currentPath: string; currentName: string; running: boolean; progress?: RuntimeDownload; onSelect: (runtime: LocalRuntime) => void; onRefresh: () => Promise<void>; children?: React.ReactNode; cpuPath: string; cpuName: string; cpuProgress?: RuntimeDownload; onSelectCpu: (runtime: LocalRuntime) => void; cpuChildren?: React.ReactNode }) {
   const desktop = isTauri();
   const [scan, setScan] = useState<Scan | null>(null);
   const [backend, setBackendState] = useState(() => savedBackend() ?? 'cpu');
@@ -51,7 +51,8 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
   const [dismissedError, setDismissedError] = useState<string | null>(null);
   const [cpuError, setCpuError] = useState<string | null>(null);
   const [dismissedCpuError, setDismissedCpuError] = useState<string | null>(null);
-  const downloading = !!progress?.active || !!cpuProgress?.active;
+  // An automatic update holds the one runtime download slot too.
+  const downloading = !!progress?.active || !!cpuProgress?.active || !!updateProgress?.active;
   async function discover() {
     setPending('scan'); setError(null);
     try {
@@ -62,6 +63,7 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
   useEffect(() => { if (desktop) void discover(); }, []);
   useEffect(() => { if (desktop && progress?.installed.length && !progress.active) void discover(); }, [progress?.installed.length, progress?.active]);
   useEffect(() => { if (desktop && cpuProgress?.installed.length && !cpuProgress.active) void discover(); }, [cpuProgress?.installed.length, cpuProgress?.active]);
+  useEffect(() => { if (desktop && updateProgress?.installed.length && !updateProgress.active) void discover(); }, [updateProgress?.installed.length, updateProgress?.active]);
   const wasActive = useRef(false);
   useEffect(() => {
     if (wasActive.current && progress && !progress.active && !progress.error && progress.installed.length) onSelect(progress.installed[0]);
@@ -114,6 +116,7 @@ export function RuntimeManager({ currentPath, currentName, running, progress, on
           control={<div className="file-input-row"><Select label="Nightly runtime backend" value={backend} disabled={downloading} busy={!!pending} onChange={value => { setBackend(value); setPlan(null); }} options={(scan?.backends ?? ['cpu']).map(backend => ({ value: backend, label: backendNames[backend] ?? backend }))}/><button className="secondary" {...busyButton(!!pending, !desktop || !scan || downloading, pending === 'releases')} onClick={() => void checkReleases()}><RefreshCw size={14} className={visiblePending === 'releases' ? 'spin' : ''}/>{visiblePending === 'releases' ? 'Checking GitHub…' : 'Check official releases'}</button></div>}/>
         <Reveal open={plan}>{plan && <div className="runtime-download-plan">{[['Nightly (default)', plan.nightly], ['Official stable (fallback)', plan.fallback]].map(([label, value]) => { const build = value as Build; return <div className="runtime-plan-build" key={String(label)}><strong>{String(label)} <span className="pill">{build.release} / {build.tag} / {backendNames[build.backend]}</span></strong>{build.assets.map(asset => <div className="runtime-asset" key={asset.name}><code>{asset.name}</code><span>{size(asset.size)}</span></div>)}</div>; })}<div className="runtime-download-confirm"><span className="hint">{size(plan.total_bytes)} in total. Checked against SHA-256 and extracted locally.</span><button className="primary compact" {...busyButton(!!pending, downloading, pending === 'download')} onClick={() => void download()}><ArrowDownToLine size={14}/>Download nightly + fallback</button></div></div>}</Reveal>
         <Reveal open={cpuProgress?.active}>{cpuProgress?.active && <StatusNote tone="info">One runtime download runs at a time. This one can start when the CPU runtime download below has finished.</StatusNote>}</Reveal>
+        <Reveal open={updateProgress?.active}>{updateProgress?.active && <StatusNote tone="info">llama.cpp is updating ({updateProgress.message}). Downloads can start when it has finished.</StatusNote>}</Reveal>
         <InstallStatus progress={progress} label="Runtime download progress"/>
         <Reveal open={message}>{message && <div className="notice error" role="alert"><span>{message}</span><button aria-label="Dismiss runtime error" onClick={() => { setError(null); setDismissedError(progress?.error ?? null); }}><X size={16}/></button></div>}</Reveal>
       </SettingSection>

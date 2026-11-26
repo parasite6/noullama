@@ -81,6 +81,10 @@ pub struct Settings {
     // value outside it in settings.json counts as the nearest bound).
     // Changed only by set_any_available_wait_ms.
     pub any_available_wait_ms: u64,
+    // Keep the selected llama.cpp builds that Noullama downloaded up to date,
+    // and remove each one it replaces (see runtime_updates.rs). Changed only
+    // by set_auto_update_runtime.
+    pub auto_update_runtime: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -112,6 +116,7 @@ impl Default for Settings {
             fall_through_to_other_instances: false,
             any_available_when_busy: "reject".into(),
             any_available_wait_ms: WAIT_MS_DEFAULT,
+            auto_update_runtime: true,
         }
     }
 }
@@ -420,6 +425,11 @@ impl Instance {
         self.in_flight.load(Ordering::SeqCst) > 0
     }
     /// Turns this instance's Keep context on or off; off empties its history.
+    #[cfg(test)]
+    pub fn set_test_runtime_path(&self, path: &str) {
+        self.model.lock().unwrap().runtime_path = path.into();
+    }
+
     pub async fn set_keep_context(&self, on: bool) {
         let mut history = self.context.lock().await;
         self.keep_context.store(on, Ordering::SeqCst);
@@ -1315,6 +1325,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
     let load_errors = state.load_errors.lock().await.clone();
     let runtime_download = state.runtimes.progress.lock().await.clone();
     let cpu_runtime_download = state.runtimes.cpu_progress.lock().await.clone();
+    let runtime_update = crate::runtime_updates::view(state).await;
     // The probe runs in the background from startup; until it finishes the
     // snapshot reports no hardware rather than waiting on nvidia-smi.
     // The load panel's fit comes from `load_fit`, for its unsaved values.
@@ -1324,7 +1335,7 @@ pub async fn state_snapshot(state: &AppState) -> Result<Value, String> {
         "instances": loaded, "default_model": default.map(|i| i.id.clone()), "routes": routes, "library": library,
         "logs": logs, "downloads": downloads, "loaded_model": loaded_model,
         "download_dir": model_directory(&settings, &state.data_dir),
-        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_errors": load_errors, "runtime_download": runtime_download, "cpu_runtime_download": cpu_runtime_download, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware,
+        "api_port": state.listening_port(), "api_error": api_error, "api_notice": api_notice, "load_errors": load_errors, "runtime_download": runtime_download, "cpu_runtime_download": cpu_runtime_download, "runtime_update": runtime_update, "startup_warning": state.startup_warning, "quit_confirmation":state.app.quit_confirmation.load(std::sync::atomic::Ordering::SeqCst), "data_dir": state.data_dir, "hardware": hardware,
         "model_missing": !settings.model_path.is_empty() && !Path::new(&settings.model_path).is_file()}),
     )
 }
@@ -1353,7 +1364,7 @@ pub async fn save_settings(
 /// switches have their own commands, so a form's copy of them (which can be
 /// stale) is ignored. `keep_context` (the default for new loads) is a load
 /// panel field and is saved from the form.
-const SERVER_OWNED: [&str; 9] = [
+const SERVER_OWNED: [&str; 10] = [
     "model_routes",
     "download_transport",
     "require_api_key",
@@ -1363,6 +1374,7 @@ const SERVER_OWNED: [&str; 9] = [
     "fall_through_to_other_instances",
     "any_available_when_busy",
     "any_available_wait_ms",
+    "auto_update_runtime",
 ];
 
 /// Applies a form's changed fields over the saved settings.

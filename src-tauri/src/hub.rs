@@ -417,7 +417,7 @@ fn scan_local_models(
 }
 
 /// The Hub repository the Hub tab downloaded this model from, or None. The
-/// Loading tab shows a Hub button for it.
+/// Library shows a Hub button for it.
 #[tauri::command]
 pub async fn model_repo(path: String, state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
     let settings = state.settings.lock().await.clone();
