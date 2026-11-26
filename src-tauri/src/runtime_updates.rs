@@ -2,27 +2,35 @@
 //!
 //! Only builds Noullama downloaded itself are updated: the folders in
 //! `<data>/runtimes/<tag>-<backend>` with the `noullama-install.json` that
-//! `install_build` writes, selected or not. A custom build is never touched.
-//! Each channel of each backend is kept current on its own: the nightlies
-//! move to the newest nightly, the stable builds to the newest stable release.
+//! `install_build` writes, selected or not. A build outside that folder is
+//! never touched.
 //!
-//! An update installs the new build, points the settings that named a build
-//! it replaces at it, and marks the replaced folders superseded. A superseded folder is
-//! removed once no loaded model runs from it and no setting names it, so a
-//! model that is loaded keeps its build until it is unloaded.
+//! Each backend has two lines of builds, nightly and stable, and each moves
+//! to its newest release on its own. A folder starts on the line its install
+//! record names; when the other line's newest release has the same tag, the
+//! folder is shared and belongs to both (kept in `runtime-updates.json`,
+//! since the install record keeps the label of the first install). When a
+//! line moves, its older folders leave it; a folder that is on no line any
+//! more is marked superseded and removed once no loaded model runs from it
+//! and no setting names it.
+//!
+//! The selected builds follow their own line: a setting moves to the newest
+//! folder of the line it follows when its folder leaves that line. Every
+//! check finishes such moves, so one that could not be saved is made later.
 
 use crate::runtime::AppState;
-use crate::runtimes::{Download, InstallProgress, RuntimeBuild, RuntimePlan};
+use crate::runtimes::{Download, InstallProgress, ReleaseLines, RuntimeBuild};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     path::{Component, Path, PathBuf},
     sync::atomic::Ordering,
     time::{Duration, SystemTime},
 };
 
-/// How often the selected builds are checked: llama.cpp publishes several
-/// nightlies a day, and each CUDA build is hundreds of megabytes.
+/// How often the builds are checked: llama.cpp publishes several nightlies
+/// a day, and each CUDA build is hundreds of megabytes.
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// The first check waits for startup to settle.
 const FIRST_CHECK: Duration = Duration::from_secs(10);
@@ -34,12 +42,45 @@ const STATE_FILE: &str = "runtime-updates.json";
 const INSTALL_FILE: &str = "noullama-install.json";
 /// Written into a replaced build's folder; the folder is removed when unused.
 const SUPERSEDED: &str = "noullama-superseded";
+const SETTING_FIELDS: [&str; 2] = ["runtime_path", "cpu_runtime_path"];
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Channel {
+    Nightly,
+    Stable,
+}
+
+impl Channel {
+    fn of(build: &RuntimeBuild) -> Self {
+        if build.release == "Nightly" { Channel::Nightly } else { Channel::Stable }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Channel::Nightly => "nightly",
+            Channel::Stable => "stable",
+        }
+    }
+}
+
+/// A setting the updater moved, and the line it follows while it still
+/// names that path.
+#[derive(Clone, Serialize, Deserialize)]
+struct Follow {
+    field: String,
+    path: String,
+    channel: Channel,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Record {
-    /// When the last check finished, in seconds since the Unix epoch.
+    /// When the last complete check finished, in seconds since the Unix epoch.
     checked_at: Option<u64>,
+    /// The lines of folders whose lines differ from their install record,
+    /// by folder name. An empty list: the folder is on no line.
+    lines: BTreeMap<String, Vec<Channel>>,
+    follows: Vec<Follow>,
 }
 
 fn now() -> u64 {
@@ -63,11 +104,21 @@ pub async fn view(state: &AppState) -> Value {
     json!({ "progress": progress, "checked_at": read_record(&state.data_dir).checked_at })
 }
 
-/// A selected managed build: its folder under `<data>/runtimes` and what
+/// A managed build: its folder under `<data>/runtimes` and what
 /// `install_build` recorded about it.
 struct Managed {
     folder: PathBuf,
     build: RuntimeBuild,
+}
+
+impl Managed {
+    fn name(&self) -> String {
+        folder_name(&self.folder)
+    }
+}
+
+fn folder_name(folder: &Path) -> String {
+    folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 fn runtimes_root(data_dir: &Path) -> PathBuf {
@@ -92,6 +143,12 @@ fn managed(root: &Path, selected: &str) -> Option<Managed> {
     Some(Managed { folder, build })
 }
 
+/// Whether `path` lies in a managed build that an update replaced, so the
+/// Runtime tab does not offer it.
+pub(crate) fn is_superseded(root: &Path, path: &str) -> bool {
+    managed(root, path).is_some_and(|m| m.folder.join(SUPERSEDED).exists())
+}
+
 /// Every build Noullama installed that no update has replaced yet.
 fn installed_builds(root: &Path) -> Vec<Managed> {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -106,13 +163,14 @@ fn installed_builds(root: &Path) -> Vec<Managed> {
     builds
 }
 
+/// The lines a build is on: as recorded, else the one its install record names.
+fn lines_of(record: &Record, build: &Managed) -> Vec<Channel> {
+    record.lines.get(&build.name()).cloned().unwrap_or_else(|| vec![Channel::of(&build.build)])
+}
+
 /// A `b<number>` tag's number, for ordering builds; other tags sort first.
 fn build_number(tag: &str) -> u64 {
     tag.strip_prefix('b').and_then(|n| n.parse().ok()).unwrap_or(0)
-}
-
-fn is_nightly(build: &RuntimeBuild) -> bool {
-    build.release == "Nightly"
 }
 
 /// Whether `candidate` replaces `current`: a higher build number, or for
@@ -125,17 +183,17 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-/// The build `current` should move to from `plan`, if there is a newer one
-/// for its channel and backend.
-fn successor<'a>(current: &RuntimeBuild, plan: &'a RuntimePlan) -> Option<&'a RuntimeBuild> {
-    let next = if is_nightly(current) { &plan.nightly } else { &plan.fallback };
+/// The release a line whose newest build is `current` moves to, if it is
+/// newer and for the same backend (a stable release without this backend
+/// falls back to CPU; that is not an update).
+fn successor<'a>(current: &RuntimeBuild, next: &'a RuntimeBuild) -> Option<&'a RuntimeBuild> {
     (next.backend == current.backend && is_newer(&next.tag, &current.tag)).then_some(next)
 }
 
 /// Starts the background checks while automatic updates are on: 10 seconds
-/// after launch and then hourly, a check runs when the last successful one
-/// is a day old. Superseded builds are removed at the same ticks once
-/// nothing uses them, whether or not updates are on.
+/// after launch and then hourly, a check runs when the last complete one is
+/// a day old. Superseded builds are removed at the same ticks once nothing
+/// uses them, whether or not updates are on.
 pub fn start(state: AppState) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FIRST_CHECK).await;
@@ -147,9 +205,9 @@ pub fn start(state: AppState) {
             let mut waiting = false;
             if due && state.settings.lock().await.auto_update_runtime {
                 // Busy with another runtime download: try again next tick.
-                waiting = update(&state, |backend| {
+                waiting = update(&state, true, |backend| {
                     let state = state.clone();
-                    async move { crate::runtimes::release_plan(&state, &backend).await }
+                    async move { crate::runtimes::release_lines(&state, &backend).await }
                 })
                 .await
                 .unwrap_or(false);
@@ -169,119 +227,216 @@ pub async fn set_auto_update_runtime(value: bool, state: tauri::State<'_, AppSta
     .await
 }
 
-/// "Check now": checks and updates the selected builds at once, also when
-/// automatic updates are off. Returns when the check has finished.
+/// "Check now": checks and updates the builds at once, also when automatic
+/// updates are off. Returns when the check has finished.
 #[tauri::command]
 pub async fn update_runtime_now(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let state = state.inner().clone();
     let worker = state.clone();
-    update(&state, move |backend| {
+    update(&state, false, move |backend| {
         let state = worker.clone();
-        async move { crate::runtimes::release_plan(&state, &backend).await }
+        async move { crate::runtimes::release_lines(&state, &backend).await }
     })
     .await?;
     sweep(&state).await;
     Ok(())
 }
 
-/// Checks the installed managed builds against `plan_for(backend)` and
+/// What one check did.
+#[derive(Default)]
+struct Outcome {
+    updated: Vec<String>,
+    /// Lines whose newest nightly is still uploading, as its message.
+    waiting: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Checks the installed managed builds against `lines_for(backend)` and
 /// installs any newer one. Fails only when another runtime download is
-/// running; a failed check is reported in the update's progress. Returns
-/// true when the newest nightly is still uploading, so the check is waiting.
-async fn update<F, Fut>(state: &AppState, plan_for: F) -> Result<bool, String>
+/// running; problems are reported in the update's progress. Returns true
+/// when a newest nightly is still uploading, so the check is waiting.
+/// `automatic`: run by the background checks, which retry such a wait.
+async fn update<F, Fut>(state: &AppState, automatic: bool, lines_for: F) -> Result<bool, String>
 where
     F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<RuntimePlan, String>>,
+    Fut: std::future::Future<Output = Result<ReleaseLines, String>>,
 {
     // The update runs in this task, so the lifecycle lock is not held for it.
     drop(crate::runtimes::claim(state, Download::Update, "Checking for llama.cpp updates…").await?);
     let progress = &state.runtimes.update_progress;
-    let result = check(state, &plan_for, progress).await;
-    // A failed check (offline, rate limited) is tried again at the next tick.
-    if result.is_ok() {
-        write_record(&state.data_dir, &Record { checked_at: Some(now()) });
+    let outcome = check(state, &lines_for, progress).await;
+    let waiting = !outcome.waiting.is_empty();
+    // An incomplete check (offline, rate limited, still uploading) runs again
+    // at the next tick instead of a day later.
+    if outcome.errors.is_empty() && !waiting {
+        let mut record = read_record(&state.data_dir);
+        record.checked_at = Some(now());
+        write_record(&state.data_dir, &record);
+    }
+    let mut parts = Vec::new();
+    if !outcome.updated.is_empty() {
+        parts.push(format!("Updated llama.cpp: {}.", outcome.updated.join(", ")));
+    }
+    for message in &outcome.waiting {
+        let retry = if automatic { format!("Noullama checks again in {} minutes.", UPLOAD_RETRY.as_secs() / 60) } else { "Try again in a few minutes.".into() };
+        parts.push(format!("{} {retry}", message.trim_end_matches(" Try again in a few minutes.")));
+    }
+    if !outcome.errors.is_empty() {
+        parts.push("Some llama.cpp updates did not finish.".into());
+    } else if parts.is_empty() {
+        parts.push("llama.cpp is up to date.".into());
+    }
+    for error in &outcome.errors {
+        state.log(format!("llama.cpp update failed: {error}")).await;
     }
     let mut progress = progress.lock().await;
     progress.active = false;
-    match result {
-        Ok(message) => progress.message = message,
-        // Not a failure: the release is there, its archives are not yet.
-        Err(error) if error.contains(crate::runtimes::STILL_UPLOADING) => {
-            progress.message = format!("{} Noullama checks again in {} minutes.", error.trim_end_matches(" Try again in a few minutes."), UPLOAD_RETRY.as_secs() / 60);
-            return Ok(true);
-        }
-        Err(error) => {
-            progress.message = "The llama.cpp update did not finish.".into();
-            state.log(format!("llama.cpp update failed: {error}")).await;
-            progress.error = Some(error);
-        }
-    }
-    Ok(false)
+    progress.message = parts.join(" ");
+    progress.error = (!outcome.errors.is_empty()).then(|| outcome.errors.join(" "));
+    Ok(waiting)
 }
 
-async fn check<F, Fut>(state: &AppState, plan_for: &F, progress: &tokio::sync::Mutex<InstallProgress>) -> Result<String, String>
+async fn check<F, Fut>(state: &AppState, lines_for: &F, progress: &tokio::sync::Mutex<InstallProgress>) -> Outcome
 where
     F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<RuntimePlan, String>>,
+    Fut: std::future::Future<Output = Result<ReleaseLines, String>>,
 {
     let root = runtimes_root(&state.data_dir);
+    let mut outcome = Outcome::default();
+    let mut record = read_record(&state.data_dir);
     let installed = installed_builds(&root);
-    if installed.is_empty() {
-        return Ok("No llama.cpp build that Noullama downloaded is installed, so there is nothing to update.".into());
-    }
-    // One channel (nightly or stable) of one backend is one line of builds;
-    // each line moves to its newest release.
-    let mut lines: Vec<(String, bool)> = installed.iter().map(|m| (m.build.backend.clone(), is_nightly(&m.build))).collect();
-    lines.sort();
-    lines.dedup();
-    let mut plans: Vec<(String, RuntimePlan)> = Vec::new();
-    let mut updated = Vec::new();
-    for (backend, nightly) in lines {
-        let line: Vec<&Managed> = installed.iter().filter(|m| m.build.backend == backend && is_nightly(&m.build) == nightly).collect();
-        let Some(current) = line.iter().copied().max_by_key(|m| build_number(&m.build.tag)) else {
-            continue;
+    let mut backends: Vec<String> = installed.iter().map(|m| m.build.backend.clone()).collect();
+    backends.sort();
+    backends.dedup();
+    // Each backend, and each line of it, is checked on its own: a failure or
+    // a wait on one does not hold up the others.
+    for backend in backends {
+        progress.lock().await.message = format!("Checking for newer {backend} builds…");
+        let releases = match lines_for(backend.clone()).await {
+            Ok(releases) => releases,
+            Err(error) => {
+                outcome.errors.push(format!("{backend}: {error}"));
+                continue;
+            }
         };
-        if !plans.iter().any(|(b, _)| *b == backend) {
-            progress.lock().await.message = format!("Checking for newer {backend} builds…");
-            plans.push((backend.clone(), plan_for(backend.clone()).await?));
+        for channel in [Channel::Nightly, Channel::Stable] {
+            let installed = installed_builds(&root);
+            let line: Vec<&Managed> = installed.iter().filter(|m| m.build.backend == backend && lines_of(&record, m).contains(&channel)).collect();
+            let Some(current) = line.iter().copied().max_by_key(|m| build_number(&m.build.tag)) else {
+                continue;
+            };
+            let next = match if channel == Channel::Nightly { &releases.nightly } else { &releases.stable } {
+                Ok(next) => next,
+                Err(error) if error.contains(crate::runtimes::STILL_UPLOADING) => {
+                    outcome.waiting.push(error.clone());
+                    continue;
+                }
+                Err(error) => {
+                    outcome.errors.push(format!("{} {backend}: {error}", channel.name()));
+                    continue;
+                }
+            };
+            let Some(next) = successor(&current.build, next) else {
+                continue;
+            };
+            progress.lock().await.total += next.assets.iter().map(|a| a.size).sum::<u64>();
+            let new_build = match crate::runtimes::install_build(state, next, progress).await {
+                Ok(build) => build,
+                Err(error) => {
+                    outcome.errors.push(format!("{} {backend} {}: {error}", channel.name(), next.tag));
+                    continue;
+                }
+            };
+            // The new folder joins the line (it can already be on the other
+            // one, sharing a tag); the line's older folders leave it.
+            let new_name = format!("{}-{}", next.tag, next.backend);
+            let mut joined = managed(&root, &root.join(&new_name).to_string_lossy()).map(|m| lines_of(&record, &m)).unwrap_or_default();
+            if !joined.contains(&channel) {
+                joined.push(channel);
+            }
+            joined.sort();
+            for old in line.iter().filter(|m| m.name() != new_name) {
+                let rest: Vec<Channel> = lines_of(&record, old).into_iter().filter(|c| *c != channel).collect();
+                record.lines.insert(old.name(), rest);
+            }
+            record.lines.insert(new_name, joined);
+            write_record(&state.data_dir, &record);
+            state.log(format!("Updated the {} {backend} llama.cpp build from {} to {}.", channel.name(), current.build.tag, next.tag)).await;
+            progress.lock().await.installed.push(new_build);
+            outcome.updated.push(format!("{} {} → {}", channel.name(), current.build.tag, next.tag));
         }
-        let plan = &plans.iter().find(|(b, _)| *b == backend).unwrap().1;
-        let Some(next) = successor(&current.build, plan) else {
+    }
+    if let Err(error) = settle(state, &root, &mut record).await {
+        outcome.errors.push(error);
+    }
+    outcome
+}
+
+/// Moves each setting whose folder has left the line it follows to that
+/// line's newest folder, then marks the folders that are on no line as
+/// superseded. Runs after every check, so a move that could not be saved
+/// before is made now.
+async fn settle(state: &AppState, root: &Path, record: &mut Record) -> Result<(), String> {
+    let installed = installed_builds(root);
+    let settings = state.settings.lock().await.clone();
+    let mut moves: Vec<(&'static str, String, Channel)> = Vec::new();
+    for (field, path) in SETTING_FIELDS.into_iter().zip([&settings.runtime_path, &settings.cpu_runtime_path]) {
+        let Some(build) = managed(root, path) else {
             continue;
         };
-        progress.lock().await.total += next.assets.iter().map(|a| a.size).sum::<u64>();
-        let new_build = crate::runtimes::install_build(state, next, progress).await?;
-        let new_folder = root.join(format!("{}-{}", next.tag, next.backend));
-        // The newest build of the other channel can share a folder with an
-        // older build of this one (same tag); it is kept.
-        let other = if nightly { &plan.fallback } else { &plan.nightly };
-        let keep = root.join(format!("{}-{}", other.tag, other.backend));
-        let replaced: Vec<PathBuf> = line.iter().map(|m| m.folder.clone()).filter(|f| *f != new_folder && *f != keep).collect();
-        // Point each setting that names a replaced build at the new one.
-        let new_path = new_build.path.clone();
-        crate::runtime::update_settings(state, |s| {
-            for field in [&mut s.runtime_path, &mut s.cpu_runtime_path] {
-                if managed(&root, field).is_some_and(|m| replaced.contains(&m.folder)) {
-                    *field = new_path.clone();
+        let lines = lines_of(record, &build);
+        let follows = record.follows.iter().find(|f| f.field == field && f.path == *path).map(|f| f.channel);
+        // Unknown: the line it is on, or the one its install record names.
+        let channel = follows.unwrap_or_else(|| if lines.len() == 1 { lines[0] } else { Channel::of(&build.build) });
+        if lines.contains(&channel) {
+            continue;
+        }
+        let newest = installed
+            .iter()
+            .filter(|m| m.build.backend == build.build.backend && lines_of(record, m).contains(&channel))
+            .max_by_key(|m| build_number(&m.build.tag));
+        if let Some(server) = newest.and_then(|m| crate::runtimes::find_server(&m.folder)) {
+            moves.push((field, server.to_string_lossy().into_owned(), channel));
+        }
+    }
+    if !moves.is_empty() {
+        let changes = moves.clone();
+        crate::runtime::update_settings(state, move |s| {
+            for (field, path, _) in &changes {
+                match *field {
+                    "runtime_path" => s.runtime_path = path.clone(),
+                    _ => s.cpu_runtime_path = path.clone(),
                 }
             }
             Ok(())
         })
-        .await?;
-        for folder in &replaced {
-            let _ = tokio::fs::write(folder.join(SUPERSEDED), b"").await;
+        .await
+        .map_err(|error| format!("The selected llama.cpp build could not be switched to the new one: {error}"))?;
+        for (field, path, channel) in moves {
+            record.follows.retain(|f| f.field != field);
+            record.follows.push(Follow { field: field.into(), path, channel });
         }
-        let channel = if nightly { "nightly" } else { "stable" };
-        state.log(format!("Updated the {channel} {backend} llama.cpp build from {} to {}.", current.build.tag, next.tag)).await;
-        progress.lock().await.installed.push(new_build);
-        updated.push(format!("{channel} {} → {}", current.build.tag, next.tag));
     }
-    Ok(if updated.is_empty() { "llama.cpp is up to date.".into() } else { format!("Updated llama.cpp: {}.", updated.join(", ")) })
+    // Forget folders that are gone and follows that no longer match.
+    let settings = state.settings.lock().await.clone();
+    record.follows.retain(|f| if f.field == "runtime_path" { settings.runtime_path == f.path } else { settings.cpu_runtime_path == f.path });
+    record.lines.retain(|name, _| root.join(name).join(INSTALL_FILE).is_file());
+    write_record(&state.data_dir, record);
+    for build in installed.iter().filter(|m| lines_of(record, m).is_empty()) {
+        let _ = tokio::fs::write(build.folder.join(SUPERSEDED), b"").await;
+    }
+    Ok(())
+}
+
+/// The real location of `path`, or `path` itself when it cannot be resolved.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Removes superseded build folders that no loaded model runs from and no
-/// setting names. Holds the lifecycle lock, so a load cannot start from a
-/// folder while it is removed.
+/// setting names. Paths are compared as written and resolved, so a symbolic
+/// link into a folder keeps it. Holds the lifecycle lock, so a load cannot
+/// start from a folder while it is removed.
 pub async fn sweep(state: &AppState) {
     let root = runtimes_root(&state.data_dir);
     let Ok(entries) = std::fs::read_dir(&root) else {
@@ -293,14 +448,18 @@ pub async fn sweep(state: &AppState) {
     }
     let _guard = state.lifecycle.lock().await;
     let settings = state.settings.lock().await.clone();
-    let running: Vec<String> = state.instances.lock().await.iter().map(|i| i.model().runtime_path).collect();
+    let mut used: Vec<PathBuf> = state.instances.lock().await.iter().map(|i| PathBuf::from(i.model().runtime_path)).collect();
+    for path in [&settings.runtime_path, &settings.cpu_runtime_path].into_iter().filter(|p| !p.trim().is_empty()) {
+        used.push(PathBuf::from(path.trim()));
+        used.push(crate::runtime::server_binary(path));
+    }
+    let used: Vec<PathBuf> = used.iter().flat_map(|p| [p.clone(), resolved(p)]).collect();
     for folder in candidates {
-        let named = [&settings.runtime_path, &settings.cpu_runtime_path].into_iter().any(|p| managed(&root, p).is_some_and(|m| m.folder == folder));
-        let in_use = running.iter().any(|p| Path::new(p).starts_with(&folder));
-        if named || in_use {
+        let real = resolved(&folder);
+        if used.iter().any(|p| p.starts_with(&folder) || p.starts_with(&real)) {
             continue;
         }
-        let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = folder_name(&folder);
         let target = folder.clone();
         match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(target)).await {
             Ok(Ok(())) => state.log(format!("Removed the replaced llama.cpp build {name}.")).await,
@@ -319,20 +478,13 @@ mod tests {
         RuntimeBuild { release: release.into(), tag: tag.into(), backend: backend.into(), assets: vec![] }
     }
 
-    fn plan(nightly: RuntimeBuild, fallback: RuntimeBuild) -> RuntimePlan {
-        RuntimePlan { id: "p".into(), platform: "test".into(), nightly, fallback, total_bytes: 0 }
-    }
-
     #[test]
-    fn builds_move_within_their_channel_and_backend() {
-        let latest = plan(build("Nightly", "b200", "cuda13"), build("b150", "b150", "cuda13"));
-        assert_eq!(successor(&build("Nightly", "b100", "cuda13"), &latest).unwrap().tag, "b200");
-        assert_eq!(successor(&build("b120", "b120", "cuda13"), &latest).unwrap().tag, "b150");
-        assert!(successor(&build("Nightly", "b200", "cuda13"), &latest).is_none(), "up to date");
-        assert!(successor(&build("Nightly", "b300", "cuda13"), &latest).is_none(), "never downgrades");
+    fn lines_move_within_their_backend_and_never_back() {
+        assert_eq!(successor(&build("Nightly", "b100", "cuda13"), &build("Nightly", "b200", "cuda13")).unwrap().tag, "b200");
+        assert!(successor(&build("Nightly", "b200", "cuda13"), &build("Nightly", "b200", "cuda13")).is_none(), "up to date");
+        assert!(successor(&build("Nightly", "b300", "cuda13"), &build("Nightly", "b200", "cuda13")).is_none(), "never downgrades");
         // A stable release without this backend falls back to CPU; that is not an update.
-        let cpu_fallback = plan(build("Nightly", "b200", "cuda13"), build("b150", "b150", "cpu"));
-        assert!(successor(&build("b120", "b120", "cuda13"), &cpu_fallback).is_none());
+        assert!(successor(&build("b120", "b120", "cuda13"), &build("b150", "b150", "cpu")).is_none());
         assert!(is_newer("v0.9.0", "v0.8.0") && !is_newer("v0.8.0", "v0.8.0"));
     }
 
@@ -344,22 +496,27 @@ mod tests {
         std::fs::create_dir_all(folder.join("package-0/bin")).unwrap();
         std::fs::write(folder.join(INSTALL_FILE), serde_json::to_vec(&build("Nightly", "b100", "cpu")).unwrap()).unwrap();
         std::fs::create_dir_all(root.join("custom")).unwrap();
-        assert_eq!(managed(&root, &folder.join("package-0/bin/llama-server").to_string_lossy()).unwrap().folder, folder);
+        let server = folder.join("package-0/bin/llama-server");
+        assert_eq!(managed(&root, &server.to_string_lossy()).unwrap().folder, folder);
         assert_eq!(managed(&root, &folder.to_string_lossy()).unwrap().build.tag, "b100");
         assert!(managed(&root, &root.join("custom/llama-server").to_string_lossy()).is_none(), "no install record");
         assert!(managed(&root, "/usr/bin/llama-server").is_none());
         assert!(managed(&root, "").is_none());
+        assert!(!is_superseded(&root, &server.to_string_lossy()));
+        std::fs::write(folder.join(SUPERSEDED), b"").unwrap();
+        assert!(is_superseded(&root, &server.to_string_lossy()), "the Runtime tab does not offer a replaced build");
         std::fs::remove_dir_all(base).unwrap();
     }
 
-    #[tokio::test]
-    async fn an_update_switches_the_selection_and_removes_the_old_build_once_unused() {
+    /// A state whose downloads come from a local fixture archive, and a
+    /// maker of CPU builds that download it.
+    async fn fixture() -> (PathBuf, AppState, impl Fn(&str, &str) -> RuntimeBuild) {
         use axum::{body::Body, response::Response, routing::get, Router};
         use sha2::{Digest, Sha256};
         let base = std::env::temp_dir().join(format!("noullama-updates-{}", uuid::Uuid::new_v4()));
         let mut state = AppState::new(base.join("data")).unwrap();
         state.client = state.local_client.clone();
-        // A fixture archive with a llama-server that is never executed.
+        // A llama-server that is never executed.
         let mut bytes = Vec::new();
         {
             let gzip = flate2::write::GzEncoder::new(&mut bytes, flate2::Compression::default());
@@ -373,46 +530,73 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
         let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
-        let fixture = bytes.clone();
-        let router = Router::new().route("/archive", get(move || { let data = fixture.clone(); async move { Response::new(Body::from(data)) } }));
+        let size = bytes.len() as u64;
+        let router = Router::new().route("/archive", get(move || { let data = bytes.clone(); async move { Response::new(Body::from(data)) } }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/archive", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let remote = |release: &str, tag: &str| RuntimeBuild {
+        let remote = move |release: &str, tag: &str| RuntimeBuild {
             release: release.into(),
             tag: tag.into(),
             backend: "cpu".into(),
-            assets: vec![ReleaseAsset { name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"), size: bytes.len() as u64, digest: digest.clone(), url: url.clone() }],
+            assets: vec![ReleaseAsset { name: format!("llama-{tag}-bin-ubuntu-x64.tar.gz"), size, digest: digest.clone(), url: url.clone() }],
         };
+        (base, state, remote)
+    }
+
+    async fn install(state: &AppState, build: &RuntimeBuild) -> String {
         let progress = tokio::sync::Mutex::new(InstallProgress::default());
-        // As after "Download nightly + fallback": a nightly and a stable build,
-        // with the stable one selected and the nightly left unselected.
-        crate::runtimes::install_build(&state, &remote("Nightly", "b100"), &progress).await.unwrap();
-        let old = crate::runtimes::install_build(&state, &remote("b090", "b090"), &progress).await.unwrap();
-        let root = runtimes_root(&state.data_dir);
-        let (old_nightly, old_stable) = (root.join("b100-cpu"), root.join("b090-cpu"));
-        crate::runtime::update_settings(&state, |s| {
-            s.runtime_path = old.path.clone();
+        crate::runtimes::install_build(state, build, &progress).await.unwrap().path
+    }
+
+    async fn select(state: &AppState, path: &str) {
+        let path = path.to_owned();
+        crate::runtime::update_settings(state, move |s| {
+            s.runtime_path = path;
             Ok(())
         })
         .await
         .unwrap();
-        let latest = plan(remote("Nightly", "b200"), remote("b150", "b150"));
-        update(&state, |_| { let latest = latest.clone(); async move { Ok(latest) } }).await.unwrap();
+    }
+
+    /// One check against fixed releases; true when it is waiting.
+    async fn run(state: &AppState, automatic: bool, nightly: Result<RuntimeBuild, String>, stable: Result<RuntimeBuild, String>) -> bool {
+        update(state, automatic, |_| {
+            let lines = ReleaseLines { nightly: nightly.clone(), stable: stable.clone() };
+            async move { Ok(lines) }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn uploading(tag: &str) -> Result<RuntimeBuild, String> {
+        Err(format!("llama.cpp {tag} {}: its linux/x64 cpu build is not there yet. Try again in a few minutes.", crate::runtimes::STILL_UPLOADING))
+    }
+
+    #[tokio::test]
+    async fn both_lines_update_and_replaced_builds_go_once_unused() {
+        let (base, state, remote) = fixture().await;
+        // As after "Download nightly + fallback": a nightly and a stable
+        // build, with the stable one selected and the nightly not.
+        install(&state, &remote("Nightly", "b100")).await;
+        let old = install(&state, &remote("b090", "b090")).await;
+        let root = runtimes_root(&state.data_dir);
+        let (old_nightly, old_stable) = (root.join("b100-cpu"), root.join("b090-cpu"));
+        select(&state, &old).await;
+        assert!(!run(&state, true, Ok(remote("Nightly", "b200")), Ok(remote("b150", "b150"))).await);
         let progress = state.runtimes.update_progress.lock().await.clone();
         assert!(!progress.active && progress.error.is_none(), "{:?}", progress.error);
         assert_eq!(progress.installed.len(), 2, "both the nightly and the stable build are updated");
         let settings = state.settings.lock().await.clone();
-        assert!(settings.runtime_path.contains("b150-cpu"), "the selection follows its own channel: {}", settings.runtime_path);
+        assert!(settings.runtime_path.contains("b150-cpu"), "the selection follows its own line: {}", settings.runtime_path);
         assert!(settings.cpu_runtime_path.is_empty(), "an empty setting stays empty");
-        assert!(Path::new(&settings.runtime_path).is_file());
         assert!(root.join("b200-cpu").join(INSTALL_FILE).is_file(), "the unselected nightly is updated too");
         assert!(old_nightly.join(SUPERSEDED).is_file() && old_stable.join(SUPERSEDED).is_file());
-        assert!(read_record(&state.data_dir).checked_at.is_some());
         let checked = read_record(&state.data_dir).checked_at;
+        assert!(checked.is_some());
         // A model still running from the old build keeps it until it is unloaded.
         let instance = crate::runtime::insert_test_instance(&state, "/models/a.gguf", true).await;
-        instance.set_test_runtime_path(&old.path);
+        instance.set_test_runtime_path(&old);
         sweep(&state).await;
         assert!(old_stable.exists(), "a build a loaded model runs from is kept");
         assert!(!old_nightly.exists(), "an unused replaced build is removed");
@@ -420,23 +604,87 @@ mod tests {
         sweep(&state).await;
         assert!(!old_stable.exists(), "the replaced build is removed once nothing uses it");
         // Up to date: nothing changes and nothing is marked.
-        update(&state, |_| { let latest = latest.clone(); async move { Ok(latest) } }).await.unwrap();
+        run(&state, true, Ok(remote("Nightly", "b200")), Ok(remote("b150", "b150"))).await;
         assert_eq!(state.runtimes.update_progress.lock().await.message, "llama.cpp is up to date.");
         assert!(!root.join("b200-cpu").join(SUPERSEDED).exists() && !root.join("b150-cpu").join(SUPERSEDED).exists());
-        // A failed check is reported and does not count as a check.
-        write_record(&state.data_dir, &Record { checked_at: checked });
-        update(&state, |_| async { Err::<RuntimePlan, String>("offline".into()) }).await.unwrap();
-        assert_eq!(state.runtimes.update_progress.lock().await.error.as_deref(), Some("offline"));
+        // GitHub unreadable: reported, and not counted as a check.
+        let mut record = read_record(&state.data_dir);
+        record.checked_at = checked;
+        write_record(&state.data_dir, &record);
+        update(&state, true, |_| async { Err::<ReleaseLines, String>("offline".into()) }).await.unwrap();
+        assert_eq!(state.runtimes.update_progress.lock().await.error.as_deref(), Some("cpu: offline"));
         assert_eq!(read_record(&state.data_dir).checked_at, checked);
-        // The newest nightly still uploading: waiting, not failed, and not a check.
-        let uploading = format!("llama.cpp b300 {}: its linux/x64 cpu build is not there yet. Try again in a few minutes.", crate::runtimes::STILL_UPLOADING);
-        assert!(update(&state, |_| { let e = uploading.clone(); async move { Err::<RuntimePlan, String>(e) } }).await.unwrap(), "waiting");
+        // The newest nightly still uploading does not hold up the stable line,
+        // and the check waits instead of failing.
+        assert!(run(&state, true, uploading("b300"), Ok(remote("b160", "b160"))).await, "waiting");
         let waiting = state.runtimes.update_progress.lock().await.clone();
         assert!(waiting.error.is_none() && waiting.message.ends_with("Noullama checks again in 10 minutes."), "{}", waiting.message);
+        assert!(state.settings.lock().await.runtime_path.contains("b160-cpu"), "the stable line moved meanwhile");
         assert_eq!(read_record(&state.data_dir).checked_at, checked);
+        // Check now does not promise a retry it does not schedule.
+        assert!(run(&state, false, uploading("b300"), Ok(remote("b160", "b160"))).await);
+        assert!(state.runtimes.update_progress.lock().await.message.ends_with("Try again in a few minutes."));
         // Another runtime download blocks a check.
         state.runtimes.progress.lock().await.active = true;
-        assert!(update(&state, |_| { let latest = latest.clone(); async move { Ok(latest) } }).await.is_err());
+        assert!(update(&state, true, |_| async { Err::<ReleaseLines, String>("unused".into()) }).await.is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stable_selection_stays_stable_when_it_shares_a_nightly_folder() {
+        let (base, state, remote) = fixture().await;
+        let root = runtimes_root(&state.data_dir);
+        install(&state, &remote("Nightly", "b100")).await;
+        select(&state, &install(&state, &remote("b090", "b090")).await).await;
+        // The new stable release is the nightly already installed: its folder
+        // is reused (its install record still says Nightly) and now on both lines.
+        run(&state, true, Ok(remote("Nightly", "b100")), Ok(remote("Official v2", "b100"))).await;
+        assert!(state.settings.lock().await.runtime_path.contains("b100-cpu"));
+        assert!(root.join("b090-cpu").join(SUPERSEDED).is_file());
+        // The nightly line moves on; the stable selection stays.
+        run(&state, true, Ok(remote("Nightly", "b120")), Ok(remote("Official v2", "b100"))).await;
+        assert!(state.settings.lock().await.runtime_path.contains("b100-cpu"), "a stable selection does not drift to a nightly");
+        assert!(!root.join("b100-cpu").join(SUPERSEDED).exists(), "still the stable line's build");
+        // The next stable release moves it, and the shared folder leaves both lines.
+        run(&state, true, Ok(remote("Nightly", "b120")), Ok(remote("Official v3", "b110"))).await;
+        assert!(state.settings.lock().await.runtime_path.contains("b110-cpu"));
+        assert!(root.join("b100-cpu").join(SUPERSEDED).is_file());
+        assert!(!root.join("b120-cpu").join(SUPERSEDED).exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_could_not_be_saved_is_made_by_the_next_check() {
+        let (base, state, remote) = fixture().await;
+        let root = runtimes_root(&state.data_dir);
+        select(&state, &install(&state, &remote("Nightly", "b100")).await).await;
+        // Settings that fail validation make the save fail.
+        state.settings.lock().await.api_port = 11436;
+        run(&state, true, Ok(remote("Nightly", "b200")), Err("no stable".into())).await;
+        assert!(state.runtimes.update_progress.lock().await.error.as_deref().unwrap_or_default().contains("could not be switched"));
+        assert!(state.settings.lock().await.runtime_path.contains("b100-cpu"));
+        assert!(!root.join("b100-cpu").join(SUPERSEDED).exists(), "kept while selected");
+        state.settings.lock().await.api_port = 11435;
+        run(&state, true, Ok(remote("Nightly", "b200")), Err("no stable".into())).await;
+        assert!(state.settings.lock().await.runtime_path.contains("b200-cpu"), "the next check finishes the switch");
+        assert!(root.join("b100-cpu").join(SUPERSEDED).is_file());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_symbolic_link_into_a_replaced_build_keeps_it() {
+        let (base, state, remote) = fixture().await;
+        let root = runtimes_root(&state.data_dir);
+        let server = install(&state, &remote("Nightly", "b100")).await;
+        std::fs::write(root.join("b100-cpu").join(SUPERSEDED), b"").unwrap();
+        let link = base.join("my-llama-server");
+        std::os::unix::fs::symlink(&server, &link).unwrap();
+        select(&state, &link.to_string_lossy()).await;
+        sweep(&state).await;
+        assert!(root.join("b100-cpu").exists(), "the selected link resolves into it");
+        select(&state, "").await;
+        sweep(&state).await;
+        assert!(!root.join("b100-cpu").exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 }

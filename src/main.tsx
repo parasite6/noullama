@@ -509,7 +509,11 @@ function App() {
   async function saveGroup(keys: readonly (keyof Settings)[]) {
     setSavingGroup(true);
     try {
-      await invoke('save_settings', { settings: pick(settings, keys) });
+      // Only the fields edited here: a field the form never changed keeps
+      // the saved value, even if it changed since the last snapshot (an
+      // automatic llama.cpp update switching the selected build).
+      const changed = savedSettings ? keys.filter(key => settings[key] !== savedSettings[key]) : keys;
+      await invoke('save_settings', { settings: pick(settings, changed) });
       await refresh();
     } finally {
       setSavingGroup(false);
@@ -704,7 +708,8 @@ function App() {
         setHubRepos(current => equalJson(current, next) ? current : next);
       });
     return () => { live = false; };
-  }, [desktop, libraryPathsKey, finishedDownloads]);
+    // Opening Library looks again, so a file replaced in place loses its link.
+  }, [desktop, libraryPathsKey, finishedDownloads, tab === 'library']);
   const libraryCompanions = useMemo(() => localModels.flatMap((file): Companion[] =>
     file.mtp_head ? [{ path: file.path, kind: 'mtp' }] : isProjector(file.path) ? [{ path: file.path, kind: 'mmproj' }] : []), [localModels]);
   const running = instances.length > 0;
@@ -1014,7 +1019,7 @@ function App() {
           <section className="panel settings-panel"><div className="panel-heading"><span><RefreshCw size={16}/> llama.cpp updates</span></div><div className="settings-body">
             <div className="setting-rows">
               <SettingRow label="Update llama.cpp automatically" description="Keeps the nightly and stable builds that Noullama downloaded up to date, and removes each build it replaces."
-                more="Checks at most once a day, starting 10 seconds after launch; a failed check is retried within the hour. For each backend, nightly builds move to the newest nightly and stable builds to the newest stable release, with the same SHA-256 checks as a download from Runtime, whether or not they are selected. A selected build switches to the new build of its channel. Builds you chose by path are left alone. A replaced build is removed within an hour of no loaded model running from it: loaded models keep their build until you reload them."
+                more="Checks at most once a day, starting 10 seconds after launch; a failed check is retried within the hour. For each backend, nightly builds move to the newest nightly and stable builds to the newest stable release, with the same SHA-256 checks as a download from Runtime, whether or not they are selected. A selected build switches to the new build of its channel. Builds outside Noullama's runtimes folder are never updated or removed. A replaced build is removed within an hour of no loaded model running from it: loaded models keep their build until you reload them."
                 control={<Toggle label={shownSetting('auto_update_runtime', true) ? 'On' : 'Off'} ariaLabel="Update llama.cpp automatically" checked={shownSetting('auto_update_runtime', true)} disabled={!desktop} onChange={value => void changeSetting('auto_update_runtime', value, 'set_auto_update_runtime', { value })}/>}/>
               <SettingRow label="Last check" descriptionKey={runtimeUpdateLine} description={runtimeUpdateLine}
                 status={runtimeUpdate?.progress.error && !runtimeUpdate.progress.active ? <StatusNote tone="warn">{runtimeUpdate.progress.error}</StatusNote> : undefined} statusKey={runtimeUpdate?.progress.error ?? ''}

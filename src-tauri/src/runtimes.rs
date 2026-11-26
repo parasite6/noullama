@@ -242,13 +242,45 @@ async fn plan_releases(state: &AppState, backend: &str) -> Result<RuntimePlan, S
 /// Not kept as the approved plan, so the CPU download cannot replace the
 /// plan shown under "Download a build".
 pub(crate) async fn release_plan(state: &AppState, backend: &str) -> Result<RuntimePlan, String> {
+    let lines = release_lines(state, backend).await?;
+    let (nightly, fallback) = (lines.nightly?, lines.stable?);
+    let total_bytes = nightly
+        .assets
+        .iter()
+        .chain(&fallback.assets)
+        .map(|a| a.size)
+        .sum();
+    Ok(RuntimePlan {
+        id: uuid::Uuid::new_v4().to_string(),
+        platform: format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
+        nightly,
+        fallback,
+        total_bytes,
+    })
+}
+
+/// The newest nightly and the latest stable build for `backend`, each with
+/// its own outcome: a nightly still uploading does not hide the stable
+/// build. Fails as a whole only when GitHub cannot be read.
+pub(crate) struct ReleaseLines {
+    pub nightly: Result<RuntimeBuild, String>,
+    pub stable: Result<RuntimeBuild, String>,
+}
+
+pub(crate) async fn release_lines(state: &AppState, backend: &str) -> Result<ReleaseLines, String> {
     let os = std::env::consts::OS;
     let arch = platform_arch(std::env::consts::ARCH)?;
     let (releases, stable) = tokio::try_join!(
         github_json(&state, "releases?per_page=30"),
         github_json(&state, "releases/latest")
     )?;
-    let nightly = newest_nightly(&releases, os, arch, backend)?;
+    let nightly = newest_nightly(&releases, os, arch, backend);
+    let stable = stable_build(state, &stable, os, arch, backend).await;
+    Ok(ReleaseLines { nightly, stable })
+}
+
+/// The latest stable release's build for `backend` (see `release_plan`).
+async fn stable_build(state: &AppState, stable: &Value, os: &str, arch: &str, backend: &str) -> Result<RuntimeBuild, String> {
     // Versioned releases currently link their binary build in the official notes.
     let stable_tag = stable["tag_name"]
         .as_str()
@@ -257,7 +289,7 @@ pub(crate) async fn release_plan(state: &AppState, backend: &str) -> Result<Runt
     // The fallback is the latest official (stable) release, built for the same
     // backend as the nightly. Only if that release has no build for it does the
     // fallback use the plain CPU (Metal on macOS) build, so there is always one.
-    let linked = match release_build(&stable, os, arch, backend, stable_tag.clone()) {
+    let linked = match release_build(stable, os, arch, backend, stable_tag.clone()) {
         Ok(_) => None,
         Err(_) => {
             let body = stable["body"].as_str().unwrap_or_default();
@@ -270,35 +302,24 @@ pub(crate) async fn release_plan(state: &AppState, backend: &str) -> Result<Runt
             }
         }
     };
-    let official = linked.as_ref().unwrap_or(&stable);
+    let official = linked.as_ref().unwrap_or(stable);
     let label = if linked.is_some() { format!("Official {stable_tag}") } else { stable_tag.clone() };
     let basic = if os == "macos" { "metal" } else { "cpu" };
-    let fallback = release_build(official, os, arch, backend, label.clone())
+    release_build(official, os, arch, backend, label.clone())
         .or_else(|_| release_build(official, os, arch, basic, label.clone()))
-        .map_err(|_| "Official release has no platform binaries or linked binary build".to_owned())?;
-    let total_bytes = nightly
-        .assets
-        .iter()
-        .chain(&fallback.assets)
-        .map(|a| a.size)
-        .sum();
-    let plan = RuntimePlan {
-        id: uuid::Uuid::new_v4().to_string(),
-        platform: format!("{os} / {}", std::env::consts::ARCH),
-        nightly,
-        fallback,
-        total_bytes,
-    };
-    Ok(plan)
+        .map_err(|_| "Official release has no platform binaries or linked binary build".to_owned())
 }
 
 #[tauri::command]
 pub async fn discover_runtimes(state: tauri::State<'_, AppState>) -> Result<Value, String> {
     let settings = state.settings.lock().await.clone();
     let managed = state.data_dir.join("runtimes");
+    let managed_root = managed.clone();
     tokio::task::spawn_blocking(move || {
         let roots = discovery_roots(&settings, managed, std::env::var_os("PATH"));
-        let (local, warnings) = scan_runtimes(roots, 12_000);
+        let (mut local, warnings) = scan_runtimes(roots, 12_000);
+        // A build an update replaced is removed once unused; it is not offered.
+        local.retain(|runtime| !crate::runtime_updates::is_superseded(&managed_root, &runtime.path));
         json!({"platform":format!("{} / {}",std::env::consts::OS,std::env::consts::ARCH), "backends": if cfg!(target_os="macos") { vec!["metal"] } else { vec!["cpu","vulkan","cuda12","cuda13"] }, "local":local,"warnings":warnings})
     }).await.map_err(|e| e.to_string())
 }
@@ -657,7 +678,7 @@ async fn fetch_asset(state: &AppState, asset: &ReleaseAsset, target: &Path, prog
     Ok(())
 }
 
-fn find_server(directory: &Path) -> Option<PathBuf> {
+pub(crate) fn find_server(directory: &Path) -> Option<PathBuf> {
     scan_runtimes(vec![(directory.to_path_buf(), 5, "managed")], 20_000)
         .0
         .into_iter()
