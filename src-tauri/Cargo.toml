@@ -1,6 +1,6 @@
 [package]
 name = "noullama"
-version = "0.5.3"
+version = "0.5.4"
 description = "Local inference for decision models"
 license = "AGPL-3.0-only"
 edition = "2021"

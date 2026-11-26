@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "noullama"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "axum",
  "base64 0.22.1",
