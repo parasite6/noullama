@@ -302,7 +302,7 @@ answer = decision["refund"]
 print(answer.value)  # 0.97: the chance the answer is yes
 ```
 
-The [Python client guide](python/README.md) covers question types, answers, API keys and errors.
+The [Python client guide](python/README.md) covers question types, answers, API keys and errors. The package is on [PyPI](https://pypi.org/project/noullama/).
 
 ## Safety checks
 

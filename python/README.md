@@ -10,7 +10,14 @@ Python 3.10 or newer. It has no dependencies.
 python -m pip install noullama
 ```
 
-Using `python -m pip` makes sure the package goes into the same Python that runs your script.
+Using `python -m pip` makes sure the package goes into the same Python that runs your script. The package is on [PyPI](https://pypi.org/project/noullama/).
+
+To upgrade, and to check which version you have:
+
+```sh
+python -m pip install --upgrade noullama
+python -c "import noullama; print(noullama.__version__)"
+```
 
 ## Quick start
 
