@@ -23,7 +23,7 @@ def to_data_url(image: str | bytes | PathLike) -> str:
         mime = "image/webp"
     if mime is None and path is not None:
         mime, _ = mimetypes.guess_type(str(path))
-    if mime is None:
+    if mime is None or not mime.startswith(("image/", "audio/")):
         name = str(path) if path is not None else "bytes"
         raise ValueError(f"Can't tell the image type of {name}; pass a data: URL instead.")
 

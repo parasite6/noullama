@@ -35,6 +35,12 @@ class ImageTests(unittest.TestCase):
     def test_data_url_passthrough(self):
         self.assertEqual(to_data_url("data:image/png;base64,AAAA"), "data:image/png;base64,AAAA")
 
+    def test_text_file_is_not_an_image(self):
+        path = self.tmp / "receipt.txt"
+        path.write_text("Receipt 123", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"Can't tell the image type of .*receipt\.txt"):
+            to_data_url(path)
+
     def test_unknown_raises(self):
         with self.assertRaises(ValueError):
             to_data_url(b"???")
