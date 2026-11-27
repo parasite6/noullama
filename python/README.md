@@ -1,21 +1,26 @@
 # Noullama Python client
 
+Ask a model loaded in Noullama questions from your own Python code.
+
 ## Install
 
-Use Python 3.10 or newer. The client has no runtime dependencies.
+Python 3.10 or newer. It has no dependencies.
 
 ```sh
-pip install "git+https://github.com/parasite6/noullama#subdirectory=python"
+python -m pip install "git+https://github.com/parasite6/noullama#subdirectory=python"
 ```
+
+Using `python -m pip` makes sure the package goes into the same Python that runs your script.
 
 ## Quick start
 
-Open Noullama and load a decision model. Replace `d1-2B-Q8_0` with the model name or alias shown in the Local API tab. Use `any-available` to send the request to any free, ready instance.
+Open Noullama and load a model first.
 
 ```python
 from noullama import Choice, Client, Noul, Score
 
 nl = Client()
+
 decision = nl.decide(
     model="d1-2B-Q8_0",
     state="I was charged twice. Please refund the duplicate payment.",
@@ -32,80 +37,98 @@ decision = nl.decide(
         "refund": Noul(instructions="Is the customer asking for a refund?"),
     },
 )
+
 answer = decision["route"]
-print(answer.value)
-probabilities = answer.probabilities
-confidence = answer.confidence
+print(answer.value)          # billing
+print(answer.probabilities)  # {'billing': 0.98, 'technical': 0.02}
+print(answer.confidence)     # 0.98
+print(decision.nl_time)      # 0.84  (seconds the whole decision took)
 ```
 
-## How `Client()` works
+- **`model`:** the model's name or alias as shown in the app's Local API tab. Use `any-available` for any free model.
+- **`state`:** the text (or dict or list) you're asking about.
+- **`questions`:** each question gets a name you choose (`"route"` above). You use that name to read its answer.
+- **`decision`, `answer` and `nl`** are ordinary variable names. Call them whatever you like.
 
-The client stores the base URL, an optional API key, and the request timeout, which defaults to 900 seconds. Creating it sends no request. It looks up the URL and key once, in this order.
+## Questions
 
-1. The keyword arguments `base_url=` and `api_key=`.
-2. The environment variables `NOULLAMA_URL` and `NOULLAMA_API_KEY`.
-3. The same names in a `.env` file in the current directory.
-4. The default URL `http://127.0.0.1:11435` and no API key.
+There are three types. Every question needs `instructions`, which can't be empty.
 
-When **Require API key** is on in Noullama, put the key in your environment or `.env`.
+**`Choice`: pick one option.** Each option is a name, plus an optional description that helps the model understand it. You get back the name.
+
+```python
+Choice(instructions="Which team?", billing="Charges and refunds", technical="App errors")
+Choice(instructions="Which team?", billing=None, technical=None)   # no descriptions
+```
+
+**`Score`: pick a level on a scale.** List the levels lowest first, 2 to 10 of them. You get back the level's number, counting from 0.
+
+```python
+Score(instructions="How urgent?", levels=["Can wait", "This week", "Today", "Immediately"])
+```
+
+**`Noul`: yes or no.** You get back the chance that the answer is yes, from 0 to 1.
+
+```python
+Noul(instructions="Is this a refund request?")
+Noul(instructions="Is this a refund request?", true="asks for money back")  # optional descriptions
+```
+
+## Answers
+
+Every answer has the same three fields:
+
+| Field | Choice | Score | Noul |
+| --- | --- | --- | --- |
+| `.value` | the picked option, e.g. `"billing"` | the picked level, e.g. `2.0` | chance of yes, e.g. `0.93` |
+| `.probabilities` | chance per option | chance per level (`"0"`, `"1"`, …) | `{"false": 0.07, "true": 0.93}` |
+| `.confidence` | how sure the model is, 0 to 1 | same | same |
+
+Native models only send the yes chance for `Noul`, so the client works out `.probabilities` and `.confidence` from it.
+
+Native and Winnow models count `Score` and `confidence` differently. Native models give the most likely level and its chance. Winnow models give a weighted average level and an entropy-based confidence. The client shows what the model sends.
+
+The decision as a whole has these:
+
+- **`decision.nl_time`:** seconds from sending the request to getting the full reply. All questions share one request, so there's one time per decision.
+- **`decision.model` and `decision.usage`:** the model name and token counts.
+- **`decision.raw` and `answer.raw`:** the untouched reply, for anything else, such as a Score's `legend`.
+
+## Settings and the API key
+
+`Client()` finds the app's address and your API key, then waits. It sends nothing until you call it. It checks these places in order and uses the first value it finds:
+
+1. Arguments: `Client(base_url="http://127.0.0.1:11440", api_key="da-noul-...")`
+2. Environment variables `NOULLAMA_URL` and `NOULLAMA_API_KEY`
+3. A `.env` file in the folder you run from, with the same names
+4. Defaults: `http://127.0.0.1:11435` and no key
+
+You only need a key when **Require API key** is on in the app. Keep it out of your code with a `.env` file:
 
 ```dotenv
 NOULLAMA_API_KEY=da-noul-...
 ```
 
-You can paste the URL from the Local API tab into `NOULLAMA_URL`, including its `/v1` suffix.
+The address can be pasted from the Local API tab as is, `/v1` included. The key never appears in printouts or error messages.
 
-```text
-your script                Client                              Noullama app
-nl.decide(model=...) -->   converts Choice/Noul/Score to JSON
-                           adds the key if set
-                           POST /v1/systemone             -->  runs the questions
-                           reads the reply                 <--  sends back JSON
-                           wraps each answer as
-                           .value/.probabilities/.confidence
-decision["route"]    <--   returns the Decision
-```
-
-Create one client before a loop and call `nl.decide(...)` on it for each item. Use `nl.health()` to check the gateway or `nl.models()` to list ready model names. Call `nl.wait_until_ready(model="d1-2B-Q8_0")` to wait for a specific name, or omit `model` to wait for any model.
-
-If the model has an image projector, pass paths, bytes, or data URLs in `images=`. Winnow models accept text only.
-
-## Answers
-
-| Field | Choice | Score | Noul |
-| --- | --- | --- | --- |
-| `.value` | Selected option key | Gateway score | Probability of true |
-| `.probabilities` | Probability by option key | Probability by level index (`"0"`, `"1"`, …) | Probability by `"false"` and `"true"` |
-| `.confidence` | Gateway confidence | Gateway confidence | Gateway confidence, or the higher of the two probabilities |
-
-For a yes/no answer with true probability `p`, the client fills in missing probabilities as `{"false": 1 - p, "true": p}` and missing confidence as `max(p, 1 - p)`. For Choice and Score, missing probabilities or confidence are `None`.
-
-On the native model observed for this client, score is the most likely level index and confidence is the top option's probability. Winnow gives a probability-weighted score and computes confidence as `1 - entropy / ln(number of options)`. The client keeps the numbers the gateway sends.
-
-Use `answer.raw` to read fields such as the native Score `legend`. Use `decision.raw` for the complete response, or `decision.model` and `decision.usage` for those fields directly.
-
-`decision.nl_time` is how long the decision took, in seconds: from sending the request to reading the full response. All questions in one `decide()` call share one request, so there is one time per decision, not per answer.
+Make one client and reuse it, for example in a loop:
 
 ```python
-decision = nl.decide(...)
-print(decision.nl_time)  # 0.84
+nl = Client()
+for email in inbox:
+    decision = nl.decide(model="d1-2B-Q8_0", state=email, questions=questions)
 ```
+
+## More
+
+- **`nl.models()`:** the model names you can use right now.
+- **`nl.health()`:** whether the app is up and a model is ready.
+- **`nl.wait_until_ready(model="d1-2B-Q8_0", timeout=60)`:** waits until that model is ready. Leave out `model` to wait for any model.
+- **Images:** pass `images=["receipt.png"]` to `decide()`. This only works with models that have a vision projector. Winnow models are text only.
 
 ## Errors
 
-Gateway exceptions derive from `NoullamaError` and carry `.status` and `.message`. If a gateway error echoes the configured API key, the client replaces it with `***`.
-
-| Status | Exception | When |
-| --- | --- | --- |
-| 400 | `BadRequest` | Invalid request or missing model |
-| 401 | `AuthError` | Missing, unknown, or expired key |
-| 403 | `Forbidden` | Key cannot access this model, or the Host or Origin check failed |
-| 404 | `UnknownModel` | The gateway does not know that name |
-| 409 | `AmbiguousModel` | The name reaches more than one model |
-| 503 | `ModelUnavailable` | Model is unloaded or loading, no instance is available for `any-available`, or the gateway cannot read its key file |
-| 502 | `InferenceFailed` | The model call failed |
-| Other or plain-text HTTP error | `NoullamaError` | For example, an oversized request (413) or wrong content type (415) |
-| Connection refused | `NotRunning` | The gateway is down at the configured URL |
+Each problem has its own exception, so you can catch the ones you care about:
 
 ```python
 from noullama import Client, ModelUnavailable, NotRunning, Noul
@@ -122,11 +145,23 @@ except ModelUnavailable:
     print("That model isn't loaded yet")
 ```
 
-`wait_until_ready()` retries `NotRunning` and `ModelUnavailable` and raises a built-in `TimeoutError` if its deadline expires. Other gateway errors surface immediately.
+| Exception | Meaning |
+| --- | --- |
+| `NotRunning` | The app isn't open, or isn't at that address |
+| `ModelUnavailable` | The model isn't loaded, is still loading, or every model is busy |
+| `UnknownModel` | No model has that name (names are case-sensitive) |
+| `AmbiguousModel` | The name matches more than one model |
+| `BadRequest` | Something in the request is wrong. The message says what |
+| `AuthError` | The API key is missing, wrong or expired |
+| `Forbidden` | The API key isn't allowed to use this model |
+| `InferenceFailed` | The model failed while answering |
+| `NoullamaError` | The base class of all of the above; catches everything |
 
-## Tested against
+Every exception has `.message` (the app's own wording) and `.status` (the HTTP status code).
 
-Noullama 0.5.4 response fixtures.
+## Tested with
+
+Noullama 0.5.4.
 
 ## License
 
