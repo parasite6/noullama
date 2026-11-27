@@ -299,7 +299,8 @@ Use the dependency-free Python client to ask a loaded model for decisions.
 ```python
 from noullama import Client, Noul
 decision = Client().decide(model="any-available", state="Please refund my payment.", questions={"refund": Noul(instructions="Is this a refund request?")})
-print(decision["refund"].value)
+answer = decision["refund"]
+print(answer.value)
 ```
 
 See the [Python client guide](python/README.md) for installation and examples.
