@@ -151,3 +151,49 @@ class ClientTests(unittest.TestCase):
             gw.reply("POST", "/v1/systemone", 200, NATIVE)
             client.decide(model="m", state="s", questions={})
             self.assertNotIn("images", gw.requests[-1]["body"])
+
+    def test_waits_for_named_model(self):
+        with FakeGateway() as gw:
+            gw.reply("GET", "/v1/models", 200, {"data": []})
+            gw.reply("GET", "/v1/models", 200, {"data": [{"id": "d1"}]})
+            Client(base_url=gw.url).wait_until_ready(model="d1", timeout=5, interval=0.01)
+            self.assertEqual(sum(r["path"] == "/v1/models" for r in gw.requests), 2)
+
+    def test_waits_for_any_model(self):
+        with FakeGateway() as gw:
+            gw.reply("GET", "/health", 200, {"model_ready": False})
+            gw.reply("GET", "/health", 200, {"model_ready": True})
+            Client(base_url=gw.url).wait_until_ready(timeout=5, interval=0.01)
+
+    def test_times_out(self):
+        with FakeGateway() as gw:
+            for _ in range(100):
+                gw.reply("GET", "/v1/models", 200, {"data": []})
+            with self.assertRaises(TimeoutError):
+                Client(base_url=gw.url).wait_until_ready(model="d1", timeout=0.1, interval=0.01)
+
+    def test_not_running_is_retried_then_times_out(self):
+        with self.assertRaises(TimeoutError):
+            Client(base_url=f"http://127.0.0.1:{free_port()}").wait_until_ready(timeout=0.1, interval=0.01)
+
+    def test_auth_error_raised_at_once(self):
+        with FakeGateway() as gw:
+            gw.reply("GET", "/health", 401, {"error": {"message": "Unknown API key.", "code": 401}})
+            with self.assertRaises(AuthError):
+                Client(base_url=gw.url).wait_until_ready(timeout=5)
+
+    def test_model_unavailable_is_retried(self):
+        with FakeGateway() as gw:
+            gw.reply("GET", "/health", 503, {"error": {"message": "Still loading."}})
+            gw.reply("GET", "/health", 200, {"model_ready": True})
+            Client(base_url=gw.url).wait_until_ready(timeout=5, interval=0.01)
+            self.assertEqual(len(gw.requests), 2)
+
+    def test_poll_request_is_capped_by_remaining_time(self):
+        client = Client(timeout=900.0)
+        with patch("noullama.client.urlopen", side_effect=TimeoutError) as request:
+            with self.assertRaisesRegex(TimeoutError, r"d1 was not ready after 0\.1 seconds\."):
+                client.wait_until_ready(model="d1", timeout=0.1)
+        self.assertGreater(request.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(request.call_args.kwargs["timeout"], 0.1)
+        self.assertEqual(client.timeout, 900.0)
