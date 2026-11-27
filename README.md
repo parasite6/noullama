@@ -292,6 +292,18 @@ print(json.loads(response.choices[0].message.content)["answers"])
 
 Native clients can supply an `images` array of `data:image/...;base64,...` URLs to `/v1/systemone` when the selected model has a projector. Gateway request bodies are limited to 16 MiB. Multi-select, extraction, estimates, boxes and video are not supported by this integration.
 
+### Python client
+
+Use the dependency-free Python client to ask a loaded model for decisions.
+
+```python
+from noullama import Client, Noul
+decision = Client().decide(model="any-available", state="Please refund my payment.", questions={"refund": Noul(instructions="Is this a refund request?")})
+print(decision["refund"].value)
+```
+
+See the [Python client guide](python/README.md) for installation and examples.
+
 ## Updates
 
 **Updates** in the sidebar shows the installed version and checks GitHub. A newer eligible release changes the entry to **Update to [version]**.
@@ -337,5 +349,5 @@ Noullama is in early beta:
 
 ## License
 
-Noullama is free software, licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`). Copyright (C) 2026 parasite6.
-Code is AGPL-3.0. The Noullama name and logos are not covered; see TRADEMARK.md.
+The Python client in `python/` is MIT-licensed. The rest of Noullama is AGPL-3.0.
+See the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`) and [trademark policy](TRADEMARK.md). Copyright (C) 2026 parasite6.
