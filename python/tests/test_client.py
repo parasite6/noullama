@@ -1,6 +1,7 @@
 import os
 import socket
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -96,6 +97,19 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(NotRunning) as cm:
             c.health()
         self.assertNotIn("da-noul-secret", str(cm.exception))
+
+    def test_invalid_url_redacts_key_from_error_and_traceback(self):
+        key = "da-noul-invalid-url"
+        client = Client(base_url=f"http://127.0.0.1:1/{key} path", api_key=key)
+        try:
+            client.health()
+        except NoullamaError as error:
+            self.assertIn("***", str(error))
+            self.assertNotIn(key, str(error))
+            self.assertNotIn(key, "".join(traceback.format_exception(error)))
+            self.assertTrue(error.__suppress_context__)
+        else:
+            self.fail("The invalid URL should raise NoullamaError.")
 
     def test_non_ascii_state_round_trips(self):
         with FakeGateway() as gw:

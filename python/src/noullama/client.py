@@ -2,6 +2,7 @@ import errno
 import json
 import time
 from collections.abc import Mapping
+from http.client import InvalidURL
 from os import PathLike
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -110,6 +111,17 @@ class Client:
     def _redact(self, message: str) -> str:
         return message.replace(self._api_key, "***") if self._api_key else message
 
+    def _open(self, method: str, path: str, body: dict | None, timeout: float):
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        request = Request(self.base_url + path, data=data, headers=headers, method=method)
+        return _OPENER.open(request, timeout=timeout)
+
     def _request(
         self,
         method: str,
@@ -119,21 +131,12 @@ class Client:
         timeout: float | None = None,
     ) -> dict:
         timeout = self.timeout if timeout is None else timeout
-        headers = {}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        data = None
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-
         timeout_message = self._redact(
             f"No response from {self.base_url} within {timeout} seconds."
         )
         try:
-            request = Request(self.base_url + path, data=data, headers=headers, method=method)
             try:
-                with _OPENER.open(request, timeout=timeout) as response:
+                with self._open(method, path, body, timeout) as response:
                     payload = response.read()
             except HTTPError as error:
                 with error:
@@ -163,6 +166,6 @@ class Client:
             raise NoullamaError(self._redact(str(error))) from None
         except TimeoutError:
             raise _RequestTimeout(timeout_message) from None
-        except ValueError as error:
+        except (InvalidURL, ValueError) as error:
             raise NoullamaError(self._redact(str(error))) from None
         return json.loads(payload)
