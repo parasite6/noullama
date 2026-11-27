@@ -4,13 +4,24 @@ import time
 from collections.abc import Mapping
 from os import PathLike
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .answers import Decision
 from .config import DEFAULT_URL, normalize_base_url, resolve
 from .errors import ModelUnavailable, NotRunning, NoullamaError, error_for
 from .images import to_data_url
 from .questions import Choice, Noul, Score, question_dict
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    def http_error_302(self, request, response, code, message, headers):
+        # Let urllib's default error handler raise HTTPError for the original response.
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+_OPENER = build_opener(_NoRedirects())
 
 
 class _RequestTimeout(NoullamaError):
@@ -122,10 +133,15 @@ class Client:
         try:
             request = Request(self.base_url + path, data=data, headers=headers, method=method)
             try:
-                with urlopen(request, timeout=timeout) as response:
+                with _OPENER.open(request, timeout=timeout) as response:
                     payload = response.read()
             except HTTPError as error:
                 with error:
+                    if 300 <= error.code < 400:
+                        raise NoullamaError(
+                            "Noullama answered with a redirect to another address; check NOULLAMA_URL.",
+                            error.code,
+                        ) from None
                     text = error.read().decode("utf-8", errors="replace")
                 try:
                     message = json.loads(text)["error"]["message"]

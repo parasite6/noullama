@@ -9,8 +9,8 @@ class FakeGateway:
         self.requests = []
         self._replies = defaultdict(deque)
 
-    def reply(self, method: str, path: str, status: int, body: dict | str):
-        self._replies[method, path].append((status, body))
+    def reply(self, method: str, path: str, status: int, body: dict | str, *, headers=None):
+        self._replies[method, path].append((status, body, headers or {}))
 
     def __enter__(self):
         gateway = self
@@ -33,10 +33,11 @@ class FakeGateway:
                 })
 
                 replies = gateway._replies[self.command, self.path]
+                headers = {}
                 if self.command == "POST" and not valid_type:
                     status, body = 415, "Expected application/json"
                 elif replies:
-                    status, body = replies.popleft()
+                    status, body, headers = replies.popleft()
                 elif self.command == "GET" and self.path == "/health":
                     status, body = 200, {
                         "status": "ok", "service": "noullama", "api_port": 0, "model_ready": True,
@@ -49,6 +50,8 @@ class FakeGateway:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(payload)
 

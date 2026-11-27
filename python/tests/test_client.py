@@ -72,6 +72,19 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(cm.exception.status, 413)
         self.assertIn("length limit", str(cm.exception))
 
+    def test_redirect_does_not_reach_target(self):
+        with FakeGateway() as gateway, FakeGateway() as target:
+            gateway.reply("GET", "/health", 302, "", headers={"Location": target.url + "/health"})
+            client = Client(base_url=gateway.url, api_key="da-noul-test")
+            with self.assertRaises(NoullamaError) as error:
+                client.health()
+            self.assertEqual(target.requests, [])
+            self.assertEqual(error.exception.status, 302)
+            self.assertEqual(
+                str(error.exception),
+                "Noullama answered with a redirect to another address; check NOULLAMA_URL.",
+            )
+
     def test_not_running(self):
         port = free_port()
         with self.assertRaises(NotRunning):
@@ -133,7 +146,7 @@ class ClientTests(unittest.TestCase):
 
     def test_socket_timeout(self):
         url = "http://127.0.0.1:11435"
-        with patch("noullama.client.urlopen", side_effect=TimeoutError):
+        with patch("noullama.client._OPENER.open", side_effect=TimeoutError):
             with self.assertRaises(NoullamaError) as cm:
                 Client(base_url=url, timeout=0.1).health()
         self.assertEqual(str(cm.exception), f"No response from {url} within 0.1 seconds.")
@@ -191,7 +204,7 @@ class ClientTests(unittest.TestCase):
 
     def test_poll_request_is_capped_by_remaining_time(self):
         client = Client(timeout=900.0)
-        with patch("noullama.client.urlopen", side_effect=TimeoutError) as request:
+        with patch("noullama.client._OPENER.open", side_effect=TimeoutError) as request:
             with self.assertRaisesRegex(TimeoutError, r"d1 was not ready after 0\.1 seconds\."):
                 client.wait_until_ready(model="d1", timeout=0.1)
         self.assertGreater(request.call_args.kwargs["timeout"], 0)
