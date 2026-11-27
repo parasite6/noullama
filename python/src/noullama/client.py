@@ -1,12 +1,14 @@
 import errno
 import json
 from collections.abc import Mapping
+from os import PathLike
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .answers import Decision
 from .config import DEFAULT_URL, normalize_base_url, resolve
 from .errors import NotRunning, NoullamaError, error_for
+from .images import to_data_url
 from .questions import Choice, Noul, Score, question_dict
 
 
@@ -39,7 +41,7 @@ class Client:
         model: str,
         state: str | dict | list,
         questions: Mapping[str, Choice | Score | Noul | dict],
-        images: list | None = None,
+        images: list[str | bytes | PathLike] | None = None,
         winnow_temperature: float | None = None,
     ) -> Decision:
         body = {
@@ -48,7 +50,7 @@ class Client:
             "questions": {name: question_dict(question) for name, question in questions.items()},
         }
         if images is not None:
-            body["images"] = images
+            body["images"] = [to_data_url(image) for image in images]
         if winnow_temperature is not None:
             body["winnow"] = {"temperature": winnow_temperature}
         return Decision.from_raw(self._request("POST", "/v1/systemone", body))

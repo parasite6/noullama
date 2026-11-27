@@ -137,3 +137,17 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(NoullamaError) as cm:
                 Client(base_url=url, timeout=0.1).health()
         self.assertEqual(str(cm.exception), f"No response from {url} within 0.1 seconds.")
+
+    def test_decide_encodes_images(self):
+        from noullama.images import to_data_url
+        from test_images import PNG
+
+        with FakeGateway() as gw:
+            client = Client(base_url=gw.url)
+            gw.reply("POST", "/v1/systemone", 200, NATIVE)
+            client.decide(model="m", state="s", questions={}, images=[PNG])
+            self.assertEqual(gw.requests[-1]["body"]["images"], [to_data_url(PNG)])
+
+            gw.reply("POST", "/v1/systemone", 200, NATIVE)
+            client.decide(model="m", state="s", questions={})
+            self.assertNotIn("images", gw.requests[-1]["body"])
