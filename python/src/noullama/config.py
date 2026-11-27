@@ -7,7 +7,7 @@ DEFAULT_URL = "http://127.0.0.1:11435"
 
 def read_dotenv(path: Path) -> dict[str, str]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeError):
         return {}
 

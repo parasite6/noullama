@@ -37,6 +37,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(read_dotenv(p), {"NOULLAMA_API_KEY": "da-noul-a=b#c", "NOULLAMA_URL": "http://x:1"})
         self.assertEqual(read_dotenv(self.tmp / "nope"), {})
 
+    def test_dotenv_keeps_first_key_after_bom(self):
+        path = self.write_env("\ufeffNOULLAMA_API_KEY=da-noul-test\n")
+        self.assertEqual(read_dotenv(path), {"NOULLAMA_API_KEY": "da-noul-test"})
+
     def test_dotenv_not_exported(self):
         resolve("NOULLAMA_API_KEY", None, environ={}, dotenv=self.write_env("NOULLAMA_API_KEY=k\n"))
         self.assertNotIn("NOULLAMA_API_KEY", os.environ)
