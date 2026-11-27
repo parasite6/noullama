@@ -1,1 +1,1 @@
-### Report All Security Inquiries [Here](https://github.com/parasite6/noullama/security/advisories/new)
+### Report All Security Inquiries [Here](https://github.com/Noullama/noullama/security/advisories/new)

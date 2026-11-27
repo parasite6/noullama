@@ -7,7 +7,7 @@ Ask a model loaded in Noullama questions from your own Python code.
 Python 3.10 or newer. It has no dependencies.
 
 ```sh
-python -m pip install "git+https://github.com/parasite6/noullama#subdirectory=python"
+python -m pip install "git+https://github.com/Noullama/noullama#subdirectory=python"
 ```
 
 Using `python -m pip` makes sure the package goes into the same Python that runs your script.

@@ -50,7 +50,7 @@ curl -fsSL https://noullama.dev/install.sh | sh
 The script:
 
 - picks the `.deb` or `.rpm` for your package manager (apt, dnf or zypper)
-- downloads it from the [latest release](https://github.com/parasite6/noullama/releases/latest)
+- downloads it from the [latest release](https://github.com/Noullama/noullama/releases/latest)
 - refuses to install unless it matches the SHA-256 GitHub publishes
 - installs it with `sudo`, or tells you when you're already up to date
 
@@ -285,7 +285,7 @@ print(json.loads(response.choices[0].message.content)["answers"])
 Ask a loaded model questions from Python. Python 3.10+, no dependencies.
 
 ```sh
-python -m pip install "git+https://github.com/parasite6/noullama#subdirectory=python"
+python -m pip install "git+https://github.com/Noullama/noullama#subdirectory=python"
 ```
 
 ```python
@@ -380,7 +380,7 @@ You need:
 - GTK 3, WebKitGTK 4.1 and the other [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux)
 
 ```sh
-git clone https://github.com/parasite6/noullama.git
+git clone https://github.com/Noullama/noullama.git
 cd noullama
 npm ci
 npm run desktop          # run in development
@@ -420,7 +420,7 @@ cargo test --manifest-path src-tauri/Cargo.toml \
 - The OpenAI-compatible endpoint is a decision adapter, not a chat API.
 - Playground input is kept only in saved presets, and Keep context is lost on restart.
 
-[Report a bug](https://github.com/parasite6/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/parasite6/noullama/issues/new?template=feature_request.md).
+[Report a bug](https://github.com/Noullama/noullama/issues/new?template=bug_report.md) or [request a feature](https://github.com/Noullama/noullama/issues/new?template=feature_request.md).
 
 ## License
 

@@ -5,7 +5,7 @@ use tauri::{utils::config::BundleType, AppHandle, Manager};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
 
-const RELEASES_URL: &str = "https://api.github.com/repos/parasite6/noullama/releases?per_page=100";
+const RELEASES_URL: &str = "https://api.github.com/repos/Noullama/noullama/releases?per_page=100";
 const MANIFEST_NAME: &str = "latest.json";
 /// Points the check at one manifest instead of GitHub, for testing updates
 /// against a local server. The package signature is still verified.

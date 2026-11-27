@@ -30,4 +30,4 @@ You may fork and modify the code under the terms of the AGPL-3.0. Before you dis
 
 ## Permission and reports
 
-To ask for permission, or to report misuse of the Noullama Marks, open an issue at <https://github.com/parasite6/noullama/issues>.
+To ask for permission, or to report misuse of the Noullama Marks, open an issue at <https://github.com/Noullama/noullama/issues>.
