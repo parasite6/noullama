@@ -7,7 +7,7 @@ Ask a model loaded in Noullama questions from your own Python code.
 Python 3.10 or newer. It has no dependencies.
 
 ```sh
-python -m pip install "git+https://github.com/Noullama/noullama#subdirectory=python"
+python -m pip install noullama
 ```
 
 Using `python -m pip` makes sure the package goes into the same Python that runs your script.
@@ -165,4 +165,4 @@ Noullama 0.5.4.
 
 ## License
 
-The Python client is [MIT-licensed](LICENSE). The rest of Noullama is AGPL-3.0.
+The Python client is [MIT-licensed](https://github.com/Noullama/noullama/blob/sanctuary/python/LICENSE). The rest of Noullama is AGPL-3.0.

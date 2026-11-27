@@ -4,11 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "noullama"
-version = "0.1.0"
+dynamic = ["version"]
+description = "Ask decision models loaded in Noullama questions from Python."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "parasite6" }]
+keywords = ["noullama", "llama.cpp", "decision models", "classification", "local llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://noullama.dev"
+Source = "https://github.com/Noullama/noullama/tree/sanctuary/python"
+Issues = "https://github.com/Noullama/noullama/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "noullama.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+noullama = ["py.typed"]

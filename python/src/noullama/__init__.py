@@ -1,3 +1,5 @@
+__version__ = "0.2.0"
+
 from .answers import Answer, Decision
 from .client import Client
 from .errors import (
@@ -14,6 +16,7 @@ from .errors import (
 from .questions import Choice, Noul, Score
 
 __all__ = [
+    "__version__",
     "Answer",
     "Choice",
     "Client",

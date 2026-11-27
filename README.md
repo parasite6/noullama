@@ -285,7 +285,7 @@ print(json.loads(response.choices[0].message.content)["answers"])
 Ask a loaded model questions from Python. Python 3.10+, no dependencies.
 
 ```sh
-python -m pip install "git+https://github.com/Noullama/noullama#subdirectory=python"
+python -m pip install noullama
 ```
 
 ```python
