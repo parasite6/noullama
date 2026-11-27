@@ -42,6 +42,19 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(r["headers"]["Authorization"], "Bearer da-noul-secret")
             self.assertEqual(d["route"].value, "billing")
 
+    def test_proxy_settings_are_ignored(self):
+        # The gateway listens on 127.0.0.1 only, so a proxy can never reach it
+        # and would see the API key. Reload so import-time proxy lookup is covered too.
+        import importlib
+        import noullama.client as client_module
+        with FakeGateway() as gw, FakeGateway() as proxy:
+            with patch.dict(os.environ, {"HTTP_PROXY": proxy.url, "http_proxy": proxy.url}):
+                reloaded = importlib.reload(client_module)
+                self.addCleanup(importlib.reload, client_module)
+                reloaded.Client(base_url=gw.url, api_key="da-noul-secret").health()
+            self.assertEqual(proxy.requests, [])
+            self.assertEqual(gw.requests[-1]["path"], "/health")
+
     def test_no_auth_header_without_key(self):
         with FakeGateway() as gw:
             Client(base_url=gw.url).health()

@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from http.client import HTTPException
 from os import PathLike
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .answers import Decision
 from .config import DEFAULT_URL, normalize_base_url, resolve
@@ -22,7 +22,9 @@ class _NoRedirects(HTTPRedirectHandler):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
-_OPENER = build_opener(_NoRedirects())
+# No proxies: the gateway listens on 127.0.0.1 only, so a proxy can't reach it
+# and would see the API key.
+_OPENER = build_opener(ProxyHandler({}), _NoRedirects())
 
 
 class _RequestTimeout(NoullamaError):
