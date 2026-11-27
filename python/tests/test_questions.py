@@ -37,3 +37,21 @@ class QuestionTests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 make(None)
             make({"question": "x"})  # dicts and lists with content are fine
+
+    def test_descriptions_cannot_be_blank(self):
+        for make in (lambda d: Choice(instructions="x", billing=d, technical=None),
+                     lambda d: Choice(instructions="x", criteria={"billing": d, "technical": None}),
+                     lambda d: Score(instructions="x", levels=[d, "Now"]),
+                     lambda d: Noul(instructions="x", true=d)):
+            for blank in ("", "   ", "\n"):
+                with self.assertRaises(ValueError) as cm:
+                    make(blank)
+                self.assertIn("None", str(cm.exception))
+        # None still means "no description"
+        self.assertIsNone(Choice(instructions="x", billing=None, technical=None).to_dict()["criteria"]["billing"])
+        self.assertNotIn("criteria", Noul(instructions="x", true=None).to_dict())
+
+    def test_blank_description_names_the_option(self):
+        with self.assertRaises(ValueError) as cm:
+            Choice(instructions="x", billing="ok", technical="")
+        self.assertIn("technical", str(cm.exception))

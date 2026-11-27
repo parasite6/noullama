@@ -52,7 +52,7 @@ print(decision.nl_time)      # 0.025  (seconds the whole decision took)
 
 ## Questions
 
-There are three types. Every question needs `instructions`, which can't be empty.
+There are three types. Every question needs `instructions`, which can't be empty. Descriptions are optional: use `None` for no description. An empty one like `technical=""` is an error, so a forgotten description doesn't slip through.
 
 **`Choice`: pick one option.** Each option is a name, plus an optional description that helps the model understand it. You get back the name.
 

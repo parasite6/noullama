@@ -10,6 +10,12 @@ def _check_instructions(instructions) -> None:
         raise ValueError("instructions can't be empty.")
 
 
+def _check_description(name: str, description) -> None:
+    # None means "no description"; an empty or blank text is almost always a slip.
+    if isinstance(description, str) and not description.strip():
+        raise ValueError(f"{name} has an empty description; write one, or use None for none.")
+
+
 class Choice:
     def __init__(
         self,
@@ -23,6 +29,8 @@ class Choice:
         _check_instructions(instructions)
         self.instructions = instructions
         self.criteria = options if criteria is None else criteria
+        for name, description in self.criteria.items():
+            _check_description(name, description)
 
     def to_dict(self) -> dict:
         return {"type": "choice", "instructions": self.instructions, "criteria": self.criteria}
@@ -35,6 +43,8 @@ class Score:
 
     def __post_init__(self):
         _check_instructions(self.instructions)
+        for index, level in enumerate(self.levels):
+            _check_description(f"Level {index}", level)
 
     def to_dict(self) -> dict:
         return {"type": "score", "instructions": self.instructions, "criteria": self.levels}
@@ -48,6 +58,8 @@ class Noul:
 
     def __post_init__(self):
         _check_instructions(self.instructions)
+        _check_description("true", self.true)
+        _check_description("false", self.false)
 
     def to_dict(self) -> dict:
         result = {"type": "noul", "instructions": self.instructions}
