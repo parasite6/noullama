@@ -73,6 +73,32 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(cm.exception.status, 413)
         self.assertIn("length limit", str(cm.exception))
 
+    def test_non_json_success_is_a_noullama_error(self):
+        with FakeGateway() as gw:
+            gw.reply("GET", "/health", 200, "<html>da-noul-test</html>")
+            with self.assertRaises(NoullamaError) as error:
+                Client(base_url=gw.url, api_key="da-noul-test").health()
+            self.assertEqual(error.exception.status, 200)
+            self.assertEqual(str(error.exception), "Noullama sent a response that isn't JSON (status 200).")
+            self.assertTrue(error.exception.__suppress_context__)
+
+    def test_truncated_response_is_a_noullama_error(self):
+        with FakeGateway() as gw:
+            gw.reply("GET", "/health", 200, "short", headers={"Content-Length": "100"})
+            with self.assertRaises(NoullamaError) as error:
+                Client(base_url=gw.url).health()
+            self.assertTrue(error.exception.__suppress_context__)
+
+    def test_response_read_os_error_is_redacted(self):
+        key = "da-noul-read-error"
+        with patch("noullama.client._OPENER.open") as opening:
+            response = opening.return_value.__enter__.return_value
+            response.read.side_effect = OSError(f"Failed while reading {key}")
+            with self.assertRaises(NoullamaError) as error:
+                Client(api_key=key).health()
+            self.assertEqual(str(error.exception), "Failed while reading ***")
+            self.assertTrue(error.exception.__suppress_context__)
+
     def test_redirect_does_not_reach_target(self):
         with FakeGateway() as gateway, FakeGateway() as target:
             gateway.reply("GET", "/health", 302, "", headers={"Location": target.url + "/health"})

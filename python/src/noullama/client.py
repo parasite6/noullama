@@ -2,7 +2,7 @@ import errno
 import json
 import time
 from collections.abc import Mapping
-from http.client import InvalidURL
+from http.client import HTTPException
 from os import PathLike
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -140,6 +140,7 @@ class Client:
             try:
                 with self._open(method, path, body, timeout) as response:
                     payload = response.read()
+                    status = response.getcode()
             except HTTPError as error:
                 with error:
                     if 300 <= error.code < 400:
@@ -168,6 +169,10 @@ class Client:
             raise NoullamaError(self._redact(str(error))) from None
         except TimeoutError:
             raise _RequestTimeout(timeout_message) from None
-        except (InvalidURL, ValueError) as error:
+        except (HTTPException, OSError, ValueError) as error:
             raise NoullamaError(self._redact(str(error))) from None
-        return json.loads(payload)
+        try:
+            return json.loads(payload)
+        except ValueError:
+            message = f"Noullama sent a response that isn't JSON (status {status})."
+            raise NoullamaError(self._redact(message), status) from None

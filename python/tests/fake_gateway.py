@@ -49,8 +49,7 @@ class FakeGateway:
                 payload = (json.dumps(body) if isinstance(body, dict) else body).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(payload)))
-                for name, value in headers.items():
+                for name, value in {"Content-Length": str(len(payload)), **headers}.items():
                     self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(payload)
