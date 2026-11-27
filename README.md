@@ -7,7 +7,7 @@
 <p align="center"><a href="https://noullama.dev">noullama.dev</a></p>
 <p align="center">A local workbench and API for decision models using llama.cpp</p>
 
-[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Requirements](#requirements) · [Runtime](#runtime) · [Memory protection](#memory-protection) · [Models and Library](#models-and-library) · [Playground](#playground) · [Images](#images) · [Multi-token prediction](#multi-token-prediction) · [Winnow models](#winnow-models) · [Local API](#local-api) · [Updates](#updates) · [Data and verification](#data-and-verification) · [Current limits](#current-limits)
+[Quick start](#quick-start) · [Cheat sheet](#cheat-sheet) · [Requirements](#requirements) · [Runtime](#runtime) · [Memory protection](#memory-protection) · [Models and Library](#models-and-library) · [Playground](#playground) · [Images](#images) · [Multi-token prediction](#multi-token-prediction) · [Winnow models](#winnow-models) · [Local API](#local-api) · [Python client](#python-client) · [Updates](#updates) · [Data and verification](#data-and-verification) · [Current limits](#current-limits)
 
 ## Quick start
 
@@ -292,18 +292,29 @@ print(json.loads(response.choices[0].message.content)["answers"])
 
 Native clients can supply an `images` array of `data:image/...;base64,...` URLs to `/v1/systemone` when the selected model has a projector. Gateway request bodies are limited to 16 MiB. Multi-select, extraction, estimates, boxes and video are not supported by this integration.
 
-### Python client
+## Python client
 
-Use the dependency-free Python client to ask a loaded model for decisions.
+Ask a loaded model questions from Python. Python 3.10+, no dependencies.
+
+```sh
+python -m pip install "git+https://github.com/parasite6/noullama#subdirectory=python"
+```
 
 ```python
 from noullama import Client, Noul
-decision = Client().decide(model="any-available", state="Please refund my payment.", questions={"refund": Noul(instructions="Is this a refund request?")})
+
+nl = Client()
+decision = nl.decide(
+    model="any-available",
+    state="Please refund my payment.",
+    questions={"refund": Noul(instructions="Is this a refund request?")},
+)
+
 answer = decision["refund"]
-print(answer.value)
+print(answer.value)  # 0.97: the chance the answer is yes
 ```
 
-See the [Python client guide](python/README.md) for installation and examples.
+The [Python client guide](python/README.md) covers question types, answers, API keys and errors.
 
 ## Updates
 
