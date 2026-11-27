@@ -26,3 +26,14 @@ class QuestionTests(unittest.TestCase):
         self.assertIs(question_dict(raw), raw)
         with self.assertRaises(TypeError):
             question_dict("not a question")
+
+    def test_instructions_cannot_be_empty(self):
+        for make in (lambda i: Choice(instructions=i, a=None, b=None),
+                     lambda i: Score(instructions=i, levels=["a", "b"]),
+                     lambda i: Noul(instructions=i)):
+            for empty in ("", "   ", {}, []):
+                with self.assertRaises(ValueError):
+                    make(empty)
+            with self.assertRaises(TypeError):
+                make(None)
+            make({"question": "x"})  # dicts and lists with content are fine
