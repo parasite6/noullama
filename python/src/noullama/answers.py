@@ -31,11 +31,13 @@ class Decision:
     model: str | None
     usage: dict | None
     raw: dict
+    nl_time: float | None = None
+    """Seconds from sending the request to reading the full response."""
 
     @classmethod
-    def from_raw(cls, raw: dict) -> "Decision":
+    def from_raw(cls, raw: dict, *, nl_time: float | None = None) -> "Decision":
         answers = {name: Answer.from_raw(answer) for name, answer in raw["answers"].items()}
-        return cls(answers, raw.get("model"), raw.get("usage"), raw)
+        return cls(answers, raw.get("model"), raw.get("usage"), raw, nl_time)
 
     def __getitem__(self, name: str) -> Answer:
         return self.answers[name]

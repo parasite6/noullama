@@ -42,6 +42,18 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(r["headers"]["Authorization"], "Bearer da-noul-secret")
             self.assertEqual(d["route"].value, "billing")
 
+    def test_decide_records_nl_time(self):
+        with FakeGateway() as gw:
+            gw.reply("POST", "/v1/systemone", 200, NATIVE)
+            gw.reply("POST", "/v1/systemone", 200, NATIVE)
+            client = Client(base_url=gw.url)
+            with patch("noullama.client.time.perf_counter", side_effect=[10.0, 10.25]):
+                decision = client.decide(model="m", state="s", questions={"q": Noul(instructions="x")})
+            self.assertEqual(decision.nl_time, 0.25)
+            real = client.decide(model="m", state="s", questions={"q": Noul(instructions="x")})
+            self.assertIsInstance(real.nl_time, float)
+            self.assertGreaterEqual(real.nl_time, 0)
+
     def test_proxy_settings_are_ignored(self):
         # The gateway listens on 127.0.0.1 only, so a proxy can never reach it
         # and would see the API key. Reload so import-time proxy lookup is covered too.

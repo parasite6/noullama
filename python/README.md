@@ -84,6 +84,13 @@ On the native model observed for this client, score is the most likely level ind
 
 Use `answer.raw` to read fields such as the native Score `legend`. Use `decision.raw` for the complete response, or `decision.model` and `decision.usage` for those fields directly.
 
+`decision.nl_time` is how long the decision took, in seconds: from sending the request to reading the full response. All questions in one `decide()` call share one request, so there is one time per decision, not per answer.
+
+```python
+decision = nl.decide(...)
+print(decision.nl_time)  # 0.84
+```
+
 ## Errors
 
 Gateway exceptions derive from `NoullamaError` and carry `.status` and `.message`. If a gateway error echoes the configured API key, the client replaces it with `***`.

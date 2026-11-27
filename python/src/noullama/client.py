@@ -76,7 +76,9 @@ class Client:
             body["images"] = [to_data_url(image) for image in images]
         if winnow_temperature is not None:
             body["winnow"] = {"temperature": winnow_temperature}
-        return Decision.from_raw(self._request("POST", "/v1/systemone", body))
+        started = time.perf_counter()
+        raw = self._request("POST", "/v1/systemone", body)
+        return Decision.from_raw(raw, nl_time=time.perf_counter() - started)
 
     def wait_until_ready(
         self,
