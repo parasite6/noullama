@@ -42,7 +42,7 @@ answer = decision["route"]
 print(answer.value)          # billing
 print(answer.probabilities)  # {'billing': 0.98, 'technical': 0.02}
 print(answer.confidence)     # 0.98
-print(decision.nl_time)      # 0.84  (seconds the whole decision took)
+print(decision.nl_time)      # 0.025  (seconds the whole decision took)
 ```
 
 - **`model`:** the model's name or alias as shown in the app's Local API tab. Use `any-available` for any free model.
