@@ -86,23 +86,25 @@ class Client:
         deadline = time.monotonic() + timeout
         while (remaining := deadline - time.monotonic()) > 0:
             request_timeout = min(self.timeout, remaining)
+            ready = False
             try:
                 if model is None:
                     ready = self._request("GET", "/health", timeout=request_timeout)["model_ready"]
                 else:
                     ready = model in self._model_ids(timeout=request_timeout)
-                if ready and time.monotonic() <= deadline:
-                    return
             except (NotRunning, ModelUnavailable):
                 pass
             except _RequestTimeout:
-                if request_timeout < remaining:
+                if request_timeout < remaining and time.monotonic() < deadline:
                     raise
                 break
 
             remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(interval, remaining))
+            if remaining <= 0:
+                break
+            if ready:
+                return
+            time.sleep(min(interval, remaining))
 
         raise TimeoutError(
             self._redact(f"{model or 'A model'} was not ready after {timeout} seconds.")

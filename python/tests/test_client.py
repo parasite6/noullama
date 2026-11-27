@@ -191,6 +191,7 @@ class ClientTests(unittest.TestCase):
             gw.reply("GET", "/health", 200, {"model_ready": False})
             gw.reply("GET", "/health", 200, {"model_ready": True})
             Client(base_url=gw.url).wait_until_ready(timeout=5, interval=0.01)
+            self.assertEqual([request["path"] for request in gw.requests], ["/health", "/health"])
 
     def test_times_out(self):
         with FakeGateway() as gw:
@@ -200,8 +201,32 @@ class ClientTests(unittest.TestCase):
                 Client(base_url=gw.url).wait_until_ready(model="d1", timeout=0.1, interval=0.01)
 
     def test_not_running_is_retried_then_times_out(self):
-        with self.assertRaises(TimeoutError):
-            Client(base_url=f"http://127.0.0.1:{free_port()}").wait_until_ready(timeout=0.1, interval=0.01)
+        client = Client()
+        with patch("noullama.client.time") as clock:
+            clock.monotonic.side_effect = [0, 0, 0, 0.5, 1]
+            with patch.object(client, "_request", side_effect=NotRunning("Offline")) as request:
+                with self.assertRaises(TimeoutError):
+                    client.wait_until_ready(timeout=1, interval=0.5)
+            self.assertEqual(request.call_count, 2)
+            clock.sleep.assert_called_once_with(0.5)
+
+    def test_ready_at_deadline_times_out_without_another_poll(self):
+        with FakeGateway() as gw, patch("noullama.client.time") as clock:
+            clock.monotonic.side_effect = [0, 0, 1]
+            with self.assertRaises(TimeoutError):
+                Client(base_url=gw.url).wait_until_ready(timeout=1)
+            self.assertEqual([request["path"] for request in gw.requests], ["/health"])
+            clock.sleep.assert_not_called()
+
+    def test_short_socket_timeout_after_deadline_raises_readiness_timeout(self):
+        client = Client(timeout=0.5)
+        with patch("noullama.client.time") as clock:
+            clock.monotonic.side_effect = [0, 0, 2]
+            with patch("noullama.client._OPENER.open", side_effect=TimeoutError) as request:
+                with self.assertRaises(TimeoutError):
+                    client.wait_until_ready(timeout=1)
+            request.assert_called_once()
+            clock.sleep.assert_not_called()
 
     def test_auth_error_raised_at_once(self):
         with FakeGateway() as gw:
