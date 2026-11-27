@@ -87,6 +87,15 @@ class Client:
             url = address["url"]
             key = address.get("api_key", _UNSET)
             timeout_value = address.get("timeout", _UNSET)
+            if key is not _UNSET and key is not None and not isinstance(key, str):
+                raise TypeError(f'The api_key for "{name}" must be a string or None, not {type(key).__name__}.')
+            if timeout_value is not _UNSET:
+                if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
+                    raise TypeError(
+                        f'The timeout for "{name}" must be a number of seconds, not {type(timeout_value).__name__}.'
+                    )
+                if not timeout_value > 0:
+                    raise ValueError(f'The timeout for "{name}" must be more than 0 seconds.')
         else:
             url = address
         if not isinstance(url, str):
@@ -171,7 +180,7 @@ class Client:
             body["winnow"] = {"temperature": winnow_temperature}
         started = time.perf_counter()
         raw = self._request("POST", "/v1/systemone", body)
-        return Decision.from_raw(raw, nl_time=time.perf_counter() - started)
+        return Decision.from_raw(raw, nl_time=time.perf_counter() - started, questions=body["questions"])
 
     def wait_until_ready(
         self,

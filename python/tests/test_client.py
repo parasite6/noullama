@@ -42,6 +42,14 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(r["headers"]["Authorization"], "Bearer da-noul-secret")
             self.assertEqual(d["route"].value, "billing")
 
+    def test_decide_gives_score_labels_from_the_sent_levels(self):
+        with FakeGateway() as gw:
+            gw.reply("POST", "/v1/systemone", 200, {"answers": {"t": {"type": "score", "score": 1.0}}})
+            d = Client(base_url=gw.url).decide(model="m", state="s", questions={
+                "t": Score(instructions="How bad?", levels=["Can wait", "Keep watching", "Notify seniors"]),
+            })
+            self.assertEqual(d["t"].label, "Keep watching")
+
     def test_decide_records_nl_time(self):
         with FakeGateway() as gw:
             gw.reply("POST", "/v1/systemone", 200, NATIVE)
@@ -397,6 +405,10 @@ class NamedAddressTests(unittest.TestCase):
             ({"a": 11440}, TypeError, '"a"'),
             ({"a": {"api_key": "k"}}, ValueError, '"url"'),
             ({"a": {"url": "http://x", "key": "k"}}, ValueError, "key"),
+            ({"a": {"url": "http://x", "api_key": 123}}, TypeError, 'api_key for "a"'),
+            ({"a": {"url": "http://x", "timeout": "60"}}, TypeError, 'timeout for "a"'),
+            ({"a": {"url": "http://x", "timeout": True}}, TypeError, 'timeout for "a"'),
+            ({"a": {"url": "http://x", "timeout": 0}}, ValueError, 'timeout for "a"'),
         ]
         for servers, error, text in cases:
             with self.subTest(servers=servers), self.assertRaisesRegex(error, text):

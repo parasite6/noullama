@@ -83,13 +83,16 @@ Noul(instructions="Is this a refund request?", true="asks for money back")  # op
 
 ## Answers
 
-Every answer has the same three fields:
+Every answer has the same four fields:
 
 | Field | Choice | Score | Noul |
 | --- | --- | --- | --- |
 | `.value` | the picked option, e.g. `"billing"` | the picked level, e.g. `2.0` | chance of yes, e.g. `0.93` |
 | `.probabilities` | chance per option | chance per level (`"0"`, `"1"`, …) | `{"false": 0.07, "true": 0.93}` |
 | `.confidence` | how sure the model is, 0 to 1 | same | same |
+| `.label` | the picked option, same as `.value` | the most likely level's text, e.g. `"Today"` | `None` |
+
+`.label` saves looking a Score's level up yourself: `print(answer.label)` instead of `levels[int(answer.value)]`. It comes from the levels you sent, and is `None` for a level you left as `None`. For Winnow models, whose `.value` is a weighted average, it's the level with the highest chance.
 
 Native models only send the yes chance for `Noul`, so the client works out `.probabilities` and `.confidence` from it.
 
@@ -100,6 +103,7 @@ The decision as a whole has these:
 - **`decision.nl_time`:** seconds from sending the request to getting the full reply. All questions share one request, so there's one time per decision.
 - **`decision.model` and `decision.usage`:** the model name and token counts.
 - **`decision.raw` and `answer.raw`:** the untouched reply, for anything else, such as a Score's `legend`.
+- **`decision.nl_all_vals()`:** everything at once as a plain dict: the model, usage and `nl_time`, plus every field of every answer (the reply's own fields, such as `legend`, along with `type`, `value`, `probabilities`, `confidence` and `label`). Nothing is rounded. These are the same as on the answer, so a `Noul`'s `probabilities` and `confidence` are the ones the client works out when the model doesn't send them, and they replace any reply field with the same name (as `nl_time` does at the top). Use `print(decision.nl_all_vals())` to see it all, or `json.dumps(...)` to save it. Changing the dict doesn't change the decision.
 
 ## Images
 
@@ -118,7 +122,7 @@ decision = nl.decide(
 ```
 
 - **What you can pass:** a file path (a string or a `Path`), raw `bytes`, or a `data:image/...;base64,...` URL, which is sent as is. A list can hold several.
-- **Image types:** PNG, JPEG, GIF, BMP and WebP are recognised from their contents, so the file extension doesn't matter.
+- **Image types:** PNG, JPEG, GIF, BMP and WebP are recognised from their contents, whatever the file is called. Anything else is sent by its file extension (such as `.tiff`) without checking what's inside, so a wrongly named file reaches the model and fails there.
 - **The model needs a projector:** turn on **Multimodal projector** on the Loading tab before loading the model. Winnow (Prompt layout) models are text only and answer with an error.
 - **Not remembered:** Keep context doesn't keep images. Each call only sees the images you pass to it.
 - **Errors:** a file the client can't recognise raises `ValueError` before anything is sent.
@@ -176,12 +180,12 @@ The client blocks while it waits for an answer. In async code (FastAPI, a Discor
 import asyncio
 
 async def classify(email):
-    return await asyncio.to_thread(nl.decide, model="any-available", state=email, questions=questions)
+    return await asyncio.to_thread(nl.decide, model="d1-2B-Q8_0", state=email, questions=questions)
 
 decisions = await asyncio.gather(*(classify(email) for email in inbox))
 ```
 
-Each loaded model answers one request at a time and queues the rest, so sending many at once is only faster with several models or instances loaded.
+Each loaded model answers one request at a time and queues the rest, so sending many at once is only faster with several models or instances loaded. `any-available` doesn't queue: when every instance is busy it answers 503 (`ModelUnavailable`), unless **When every instance is busy** in Settings is set to **Wait for one**.
 
 ## More
 
