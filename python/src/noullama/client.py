@@ -31,22 +31,114 @@ class _RequestTimeout(NoullamaError):
     pass
 
 
+_UNSET = object()
+_ADDRESS_FIELDS = {"url", "api_key", "timeout"}
+
+Address = str | Mapping[str, object]
+
+
 class Client:
     def __init__(
         self,
+        addresses: Mapping[str, Address] | None = None,
         *,
         base_url: str | None = None,
         api_key: str | None = None,
         timeout: float = 900.0,
     ):
-        url = resolve("NOULLAMA_URL", base_url)
-        self.base_url = normalize_base_url(DEFAULT_URL if url is None else url)
-        self._api_key = resolve("NOULLAMA_API_KEY", api_key)
         self.timeout = timeout
+        self._name = None
+        self._clients: dict[str, Client] = {}
+        if addresses is None:
+            url = resolve("NOULLAMA_URL", base_url)
+            self.base_url = normalize_base_url(DEFAULT_URL if url is None else url)
+            self._api_key = resolve("NOULLAMA_API_KEY", api_key)
+            return
+
+        if not isinstance(addresses, Mapping):
+            raise TypeError(
+                "Client() takes a dict of names and addresses, such as "
+                'Client({"gpu": "http://127.0.0.1:11440/v1"}); for one address use base_url=...'
+            )
+        if base_url is not None:
+            raise TypeError("Pass either a dict of addresses or base_url, not both.")
+        if not addresses:
+            raise ValueError("The dict of addresses needs at least one name.")
+        self.base_url = None
+        self._api_key = None
+        shared_key = resolve("NOULLAMA_API_KEY", api_key)
+        for name, address in addresses.items():
+            self._clients[name] = type(self)._named(name, address, shared_key, timeout)
+
+    @classmethod
+    def _named(cls, name, address, shared_key, timeout) -> "Client":
+        if not isinstance(name, str):
+            raise TypeError(f"Address names must be strings, not {type(name).__name__}.")
+        if not name:
+            raise ValueError("An address name can't be empty.")
+        key = timeout_value = _UNSET
+        if isinstance(address, Mapping):
+            unknown = set(address) - _ADDRESS_FIELDS
+            if unknown:
+                fields = ", ".join(sorted(map(str, unknown)))
+                raise ValueError(f'Address "{name}" has unknown field(s): {fields}. Use url, api_key and timeout.')
+            if "url" not in address:
+                raise ValueError(f'Address "{name}" needs a "url".')
+            url = address["url"]
+            key = address.get("api_key", _UNSET)
+            timeout_value = address.get("timeout", _UNSET)
+        else:
+            url = address
+        if not isinstance(url, str):
+            raise TypeError(f'The address for "{name}" must be a URL string, not {type(url).__name__}.')
+        if not url.strip():
+            raise ValueError(f'The address for "{name}" is empty.')
+
+        client = cls.__new__(cls)
+        client._name = name
+        client._clients = {}
+        client.base_url = normalize_base_url(url.strip())
+        client._api_key = shared_key if key is _UNSET else key
+        client.timeout = timeout if timeout_value is _UNSET else timeout_value
+        return client
+
+    @property
+    def names(self) -> list[str]:
+        return list(self._clients)
+
+    def items(self):
+        return self._clients.items()
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._clients
+
+    def __getitem__(self, name: str) -> "Client":
+        if not self._clients:
+            raise KeyError(
+                f"{name!r}: this client has no named addresses. "
+                'Make one with Client({"gpu": "http://127.0.0.1:11440/v1", ...}).'
+            )
+        try:
+            return self._clients[name]
+        except KeyError:
+            raise KeyError(f"{name!r} is not one of this client's addresses: {', '.join(self._clients)}.") from None
 
     def __repr__(self) -> str:
+        if self._clients:
+            return f"Client({self.names!r}, timeout={self.timeout!r})"
         key = "***" if self._api_key else None
-        return f"Client(base_url={self._redact(self.base_url)!r}, api_key={key!r}, timeout={self.timeout!r})"
+        name = "" if self._name is None else f"name={self._name!r}, "
+        return f"Client({name}base_url={self._redact(self.base_url)!r}, api_key={key!r}, timeout={self.timeout!r})"
+
+    def _need_address(self) -> None:
+        if self._clients:
+            first = next(iter(self._clients))
+            raise TypeError(
+                f'This client has several addresses; pick one first, such as nl["{first}"].decide(...).'
+            )
+
+    def _url_hint(self, verb: str) -> str:
+        return f"{verb} NOULLAMA_URL" if self._name is None else f'check the address for "{self._name}"'
 
     def health(self) -> dict:
         return self._request("GET", "/health")
@@ -67,6 +159,7 @@ class Client:
         images: list[str | bytes | PathLike] | None = None,
         winnow_temperature: float | None = None,
     ) -> Decision:
+        self._need_address()
         body = {
             "model": model,
             "state": state,
@@ -87,6 +180,7 @@ class Client:
         timeout: float = 60.0,
         interval: float = 0.5,
     ) -> None:
+        self._need_address()
         deadline = time.monotonic() + timeout
         while (remaining := deadline - time.monotonic()) > 0:
             request_timeout = min(self.timeout, remaining)
@@ -136,6 +230,7 @@ class Client:
         *,
         timeout: float | None = None,
     ) -> dict:
+        self._need_address()
         timeout = self.timeout if timeout is None else timeout
         timeout_message = self._redact(
             f"No response from {self.base_url} within {timeout} seconds."
@@ -149,7 +244,7 @@ class Client:
                 with error:
                     if 300 <= error.code < 400:
                         raise NoullamaError(
-                            "Noullama answered with a redirect to another address; check NOULLAMA_URL.",
+                            f"Noullama answered with a redirect to another address; {self._url_hint("check")}.",
                             error.code,
                         ) from None
                     text = error.read().decode("utf-8", errors="replace")
@@ -163,9 +258,10 @@ class Client:
         except URLError as error:
             reason = error.reason
             if isinstance(reason, OSError) and reason.errno == errno.ECONNREFUSED:
+                where = "" if self._name is None else f' ("{self._name}")'
                 message = (
-                    f"Noullama is not running at {self.base_url}. "
-                    "Open the app, or set NOULLAMA_URL."
+                    f"Noullama is not running at {self.base_url}{where}. "
+                    f"Open the app, or {self._url_hint('set')}."
                 )
                 raise NotRunning(self._redact(message)) from None
             if isinstance(reason, TimeoutError):

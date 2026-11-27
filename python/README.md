@@ -101,6 +101,28 @@ The decision as a whole has these:
 - **`decision.model` and `decision.usage`:** the model name and token counts.
 - **`decision.raw` and `answer.raw`:** the untouched reply, for anything else, such as a Score's `legend`.
 
+## Images
+
+Pass `images` to `decide()`. The model reads them together with `state`:
+
+```python
+decision = nl.decide(
+    model="your-vision-model",
+    state="A customer sent this photo with their refund request.",
+    questions={
+        "item": Choice(instructions="What is in the photo?", receipt=None, product=None, other=None),
+        "damaged": Noul(instructions="Does the item look damaged?"),
+    },
+    images=["receipt.png"],
+)
+```
+
+- **What you can pass:** a file path (a string or a `Path`), raw `bytes`, or a `data:image/...;base64,...` URL, which is sent as is. A list can hold several.
+- **Image types:** PNG, JPEG, GIF, BMP and WebP are recognised from their contents, so the file extension doesn't matter.
+- **The model needs a projector:** turn on **Multimodal projector** on the Loading tab before loading the model. Winnow (Prompt layout) models are text only and answer with an error.
+- **Not remembered:** Keep context doesn't keep images. Each call only sees the images you pass to it.
+- **Errors:** a file the client can't recognise raises `ValueError` before anything is sent.
+
 ## Settings and the API key
 
 `Client()` finds the app's address and your API key, then waits. It sends nothing until you call it. It checks these places in order and uses the first value it finds:
@@ -126,12 +148,46 @@ for email in inbox:
     decision = nl.decide(model="d1-2B-Q8_0", state=email, questions=questions)
 ```
 
+## Several Noullama apps
+
+To reach more than one app, give `Client` a dict of names and addresses. Each name gives you an ordinary client:
+
+```python
+nl = Client({
+    "gpu":    "http://127.0.0.1:11440/v1",
+    "laptop": "http://127.0.0.1:11441/v1",
+    "vision": "http://127.0.0.1:11442/v1",
+})
+
+nl["gpu"].decide(model="triage", state=email, questions=questions)
+nl["vision"].decide(model="reader", state="A photo of a receipt.", questions=questions, images=["receipt.png"])
+```
+
+- **One shared key:** every address uses the `api_key=` argument, else `NOULLAMA_API_KEY`, the same way as above. `NOULLAMA_URL` is not used.
+- **Its own key or timeout:** give that address a dict instead, such as `"vision": {"url": "http://127.0.0.1:11442/v1", "api_key": os.environ["VISION_KEY"], "timeout": 60}`. Use `"api_key": None` for an app that needs no key.
+- **Pick a name first:** `nl.decide(...)` on the whole set is an error. Call `nl["gpu"].decide(...)`, or keep `gpu = nl["gpu"]` and reuse it.
+- **Look around:** `nl.names` lists the names, `"gpu" in nl` checks one, and `for name, client in nl.items():` loops over them. A name that isn't there raises `KeyError` listing the ones that are.
+
+## Async code
+
+The client blocks while it waits for an answer. In async code (FastAPI, a Discord bot, `asyncio`), run it in a thread so the rest of your program keeps going:
+
+```python
+import asyncio
+
+async def classify(email):
+    return await asyncio.to_thread(nl.decide, model="any-available", state=email, questions=questions)
+
+decisions = await asyncio.gather(*(classify(email) for email in inbox))
+```
+
+Each loaded model answers one request at a time and queues the rest, so sending many at once is only faster with several models or instances loaded.
+
 ## More
 
 - **`nl.models()`:** the model names you can use right now.
 - **`nl.health()`:** whether the app is up and a model is ready.
 - **`nl.wait_until_ready(model="d1-2B-Q8_0", timeout=60)`:** waits until that model is ready. Leave out `model` to wait for any model.
-- **Images:** pass `images=["receipt.png"]` to `decide()`. This only works with models that have a vision projector. Winnow models are text only.
 
 ## Errors
 

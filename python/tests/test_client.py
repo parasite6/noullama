@@ -300,3 +300,121 @@ class ClientTests(unittest.TestCase):
         self.assertGreater(request.call_args.kwargs["timeout"], 0)
         self.assertLessEqual(request.call_args.kwargs["timeout"], 0.1)
         self.assertEqual(client.timeout, 900.0)
+
+
+class NamedAddressTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(temp.name)
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_each_name_reaches_its_own_address(self):
+        with FakeGateway() as gpu, FakeGateway() as vision:
+            gpu.reply("POST", "/v1/systemone", 200, NATIVE)
+            vision.reply("POST", "/v1/systemone", 200, NATIVE)
+            nl = Client({"gpu": gpu.url + "/v1", "vision": vision.url})
+            questions = {"q": Noul(instructions="x")}
+            nl["gpu"].decide(model="a", state="s", questions=questions)
+            nl["vision"].decide(model="b", state="s", questions=questions)
+            self.assertEqual([r["body"]["model"] for r in gpu.requests], ["a"])
+            self.assertEqual([r["body"]["model"] for r in vision.requests], ["b"])
+            self.assertEqual(nl["gpu"].base_url, gpu.url)
+
+    def test_same_client_is_returned_for_a_name(self):
+        nl = Client({"gpu": "http://127.0.0.1:11440"})
+        self.assertIs(nl["gpu"], nl["gpu"])
+        self.assertIs(type(nl["gpu"]), type(nl))
+
+    def test_names_and_items(self):
+        nl = Client({"gpu": "http://127.0.0.1:11440", "cpu": "http://127.0.0.1:11441"})
+        self.assertEqual(nl.names, ["gpu", "cpu"])
+        self.assertEqual([(name, c.base_url) for name, c in nl.items()],
+                         [("gpu", "http://127.0.0.1:11440"), ("cpu", "http://127.0.0.1:11441")])
+        self.assertIn("gpu", nl)
+        self.assertNotIn("gpuu", nl)
+
+    def test_unknown_name_lists_the_names(self):
+        nl = Client({"gpu": "http://127.0.0.1:11440", "cpu": "http://127.0.0.1:11441"})
+        with self.assertRaises(KeyError) as cm:
+            nl["gpuu"]
+        self.assertIn("gpuu", str(cm.exception))
+        self.assertIn("gpu, cpu", str(cm.exception))
+
+    def test_single_address_client_has_no_names(self):
+        nl = Client(base_url="http://127.0.0.1:11440")
+        self.assertEqual(nl.names, [])
+        with self.assertRaisesRegex(KeyError, "no named addresses"):
+            nl["gpu"]
+
+    def test_top_level_calls_ask_for_a_name(self):
+        nl = Client({"gpu": "http://127.0.0.1:1"})
+        with patch("noullama.client._OPENER.open") as request:
+            for call in (nl.health, nl.models, lambda: nl.wait_until_ready(timeout=1),
+                         lambda: nl.decide(model="m", state="s", questions={"q": Noul(instructions="x")})):
+                with self.assertRaisesRegex(TypeError, r'nl\["gpu"\]'):
+                    call()
+            request.assert_not_called()
+
+    def test_shared_key_from_argument_env_and_dotenv(self):
+        with FakeGateway() as gw:
+            Client({"a": gw.url}, api_key="arg-key")["a"].health()
+            os.environ["NOULLAMA_API_KEY"] = "env-key"
+            Client({"a": gw.url})["a"].health()
+            del os.environ["NOULLAMA_API_KEY"]
+            Path(".env").write_text("NOULLAMA_API_KEY=dotenv-key\n")
+            Client({"a": gw.url})["a"].health()
+            self.assertEqual([r["headers"]["Authorization"] for r in gw.requests],
+                             ["Bearer arg-key", "Bearer env-key", "Bearer dotenv-key"])
+
+    def test_per_address_key_and_timeout(self):
+        with FakeGateway() as gw:
+            os.environ["NOULLAMA_API_KEY"] = "shared"
+            nl = Client({
+                "own": {"url": gw.url, "api_key": "own-key", "timeout": 5},
+                "none": {"url": gw.url, "api_key": None},
+                "shared": gw.url,
+            }, timeout=30)
+            for name in ("own", "none", "shared"):
+                nl[name].health()
+            headers = [r["headers"].get("Authorization") for r in gw.requests]
+            self.assertEqual(headers, ["Bearer own-key", None, "Bearer shared"])
+            self.assertEqual((nl["own"].timeout, nl["shared"].timeout), (5, 30))
+
+    def test_named_addresses_ignore_noullama_url(self):
+        os.environ["NOULLAMA_URL"] = "http://127.0.0.1:9999"
+        self.assertEqual(Client({"a": "http://127.0.0.1:11440"})["a"].base_url, "http://127.0.0.1:11440")
+
+    def test_bad_address_tables(self):
+        cases = [
+            ({}, ValueError, "at least one"),
+            ({"": "http://x"}, ValueError, "name"),
+            ({1: "http://x"}, TypeError, "name"),
+            ({"a": ""}, ValueError, '"a"'),
+            ({"a": 11440}, TypeError, '"a"'),
+            ({"a": {"api_key": "k"}}, ValueError, '"url"'),
+            ({"a": {"url": "http://x", "key": "k"}}, ValueError, "key"),
+        ]
+        for servers, error, text in cases:
+            with self.subTest(servers=servers), self.assertRaisesRegex(error, text):
+                Client(servers)
+        with self.assertRaisesRegex(TypeError, "base_url"):
+            Client({"a": "http://x"}, base_url="http://y")
+        with self.assertRaisesRegex(TypeError, "dict"):
+            Client("http://127.0.0.1:11435")
+
+    def test_not_running_names_the_address(self):
+        port = free_port()
+        with self.assertRaises(NotRunning) as cm:
+            Client({"gpu": f"http://127.0.0.1:{port}"})["gpu"].health()
+        self.assertIn('"gpu"', str(cm.exception))
+        self.assertNotIn("NOULLAMA_URL", str(cm.exception))
+
+    def test_keys_never_leak_in_repr(self):
+        nl = Client({"a": {"url": "http://127.0.0.1:1", "api_key": "da-noul-secret"}})
+        self.assertNotIn("da-noul-secret", repr(nl))
+        self.assertNotIn("da-noul-secret", repr(nl["a"]))
+        self.assertIn("'a'", repr(nl))
