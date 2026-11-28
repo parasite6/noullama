@@ -102,7 +102,7 @@ class ClientTests(unittest.TestCase):
         with FakeGateway() as gw:
             gw.reply("POST", "/v1/systemone", 413, "Failed to buffer the request body: length limit exceeded")
             with self.assertRaises(NoullamaError) as cm:
-                Client(base_url=gw.url).decide(model="m", state="s", questions={})
+                Client(base_url=gw.url).decide(model="m", state="s", questions={"q": Noul(instructions="x")})
             self.assertEqual(cm.exception.status, 413)
         self.assertIn("length limit", str(cm.exception))
 
@@ -188,7 +188,7 @@ class ClientTests(unittest.TestCase):
     def test_constructor_defaults_and_keyword_only(self):
         client = Client()
         self.assertEqual(client.base_url, "http://127.0.0.1:11435")
-        self.assertEqual(client.timeout, 900.0)
+        self.assertEqual(client.timeout, 120.0)
         with self.assertRaises(TypeError):
             Client("http://127.0.0.1:11435")
 
@@ -231,11 +231,11 @@ class ClientTests(unittest.TestCase):
         with FakeGateway() as gw:
             client = Client(base_url=gw.url)
             gw.reply("POST", "/v1/systemone", 200, NATIVE)
-            client.decide(model="m", state="s", questions={}, images=[PNG])
+            client.decide(model="m", state="s", questions={"q": Noul(instructions="x")}, images=[PNG])
             self.assertEqual(gw.requests[-1]["body"]["images"], [to_data_url(PNG)])
 
             gw.reply("POST", "/v1/systemone", 200, NATIVE)
-            client.decide(model="m", state="s", questions={})
+            client.decide(model="m", state="s", questions={"q": Noul(instructions="x")})
             self.assertNotIn("images", gw.requests[-1]["body"])
 
     def test_waits_for_named_model(self):
@@ -430,3 +430,44 @@ class NamedAddressTests(unittest.TestCase):
         self.assertNotIn("da-noul-secret", repr(nl))
         self.assertNotIn("da-noul-secret", repr(nl["a"]))
         self.assertIn("'a'", repr(nl))
+
+
+class ClientCheckTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_empty_questions_fail_before_sending(self):
+        with patch("noullama.client._OPENER.open") as request:
+            with self.assertRaisesRegex(ValueError, "at least one question"):
+                Client().decide(model="m", state="s", questions={})
+            request.assert_not_called()
+
+    def test_url_must_be_http(self):
+        for url in ("ftp://127.0.0.1:11435", "127.0.0.1:11435", "localhost"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "http://"):
+                Client(base_url=url)
+        with self.assertRaisesRegex(ValueError, '"gpu".*http://'):
+            Client({"gpu": "ftp://x"})
+        os.environ["NOULLAMA_URL"] = "ftp://x"
+        with self.assertRaisesRegex(ValueError, "NOULLAMA_URL"):
+            Client()
+        Client(base_url="https://127.0.0.1:11435")
+        Client(base_url="HTTP://127.0.0.1:11435")
+
+    def test_url_error_hides_the_key(self):
+        key = "da-noul-secret"
+        with self.assertRaises(ValueError) as cm:
+            Client(base_url=f"ftp://{key}@x", api_key=key)
+        self.assertNotIn(key, str(cm.exception))
+
+    def test_context_manager(self):
+        with Client() as nl:
+            self.assertEqual(nl.base_url, "http://127.0.0.1:11435")
+        with Client({"a": "http://127.0.0.1:1"}) as nl:
+            self.assertIn("a", nl)
+
+    def test_default_timeout_is_two_minutes(self):
+        self.assertEqual(Client().timeout, 120.0)
+        self.assertEqual(Client({"a": "http://x"})["a"].timeout, 120.0)

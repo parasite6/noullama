@@ -40,6 +40,11 @@ class Choice:
             raise problem[0](problem[1])
         self.instructions = instructions
         self.criteria = options if criteria is None else criteria
+        if len(self.criteria) < 2:
+            raise ValueError(
+                f"Choice needs at least two options to pick from; it has {len(self.criteria)}. "
+                'Add them like Choice(instructions="...", billing=None, technical=None).'
+            )
         for name, description in self.criteria.items():
             if _blank(description):
                 raise ValueError(
@@ -60,6 +65,20 @@ class Score:
     def __post_init__(self):
         if problem := _instructions_problem("Score", self.instructions):
             raise problem[0](problem[1])
+        if not 2 <= len(self.levels) <= 10:
+            raise ValueError(
+                f"Score needs 2 to 10 levels, lowest first; it has {len(self.levels)}. "
+                "For more options without an order, use Choice."
+            )
+        seen = {}
+        for index, level in enumerate(self.levels):
+            if isinstance(level, str) and level in seen:
+                raise ValueError(
+                    f'Score levels {seen[level]} and {index} are both "{level}". '
+                    "Give each level its own text, or None."
+                )
+            if isinstance(level, str):
+                seen[level] = index
         for index, level in enumerate(self.levels):
             if _blank(level):
                 raise ValueError(

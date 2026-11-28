@@ -55,3 +55,25 @@ class QuestionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             Choice(instructions="x", billing="ok", technical="")
         self.assertIn("technical", str(cm.exception))
+
+
+class QuestionSizeTests(unittest.TestCase):
+    def test_choice_needs_two_options(self):
+        for options in ({}, {"a": None}):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, "at least two options"):
+                Choice(instructions="x", criteria=options)
+        with self.assertRaisesRegex(ValueError, "at least two options"):
+            Choice(instructions="x")
+        Choice(instructions="x", a=None, b=None)
+
+    def test_score_needs_two_to_ten_levels(self):
+        for count in (0, 1, 11):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "2 to 10 levels"):
+                Score(instructions="x", levels=[f"level {i}" for i in range(count)])
+        Score(instructions="x", levels=["a", "b"])
+        Score(instructions="x", levels=[f"level {i}" for i in range(10)])
+
+    def test_score_levels_must_differ(self):
+        with self.assertRaisesRegex(ValueError, 'levels 0 and 2 are both "a"'):
+            Score(instructions="x", levels=["a", "b", "a"])
+        Score(instructions="x", levels=[None, None, "c"])

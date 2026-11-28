@@ -37,6 +37,16 @@ _ADDRESS_FIELDS = {"url", "api_key", "timeout"}
 Address = str | Mapping[str, object]
 
 
+def _check_scheme(url: str | None, source: str) -> None:
+    if url is None:
+        return
+    if not url.strip().lower().startswith(("http://", "https://")):
+        # The URL itself is left out: it may hold an API key.
+        raise ValueError(
+            f"{source} must start with http:// or https://, such as http://127.0.0.1:11435/v1."
+        )
+
+
 class Client:
     def __init__(
         self,
@@ -44,13 +54,14 @@ class Client:
         *,
         base_url: str | None = None,
         api_key: str | None = None,
-        timeout: float = 900.0,
+        timeout: float = 120.0,
     ):
         self.timeout = timeout
         self._name = None
         self._clients: dict[str, Client] = {}
         if addresses is None:
             url = resolve("NOULLAMA_URL", base_url)
+            _check_scheme(url, "base_url" if base_url is not None else "NOULLAMA_URL")
             self.base_url = normalize_base_url(DEFAULT_URL if url is None else url)
             self._api_key = resolve("NOULLAMA_API_KEY", api_key)
             return
@@ -102,6 +113,7 @@ class Client:
             raise TypeError(f'The address for "{name}" must be a URL string, not {type(url).__name__}.')
         if not url.strip():
             raise ValueError(f'The address for "{name}" is empty.')
+        _check_scheme(url.strip(), f'The address for "{name}"')
 
         client = cls.__new__(cls)
         client._name = name
@@ -110,6 +122,13 @@ class Client:
         client._api_key = shared_key if key is _UNSET else key
         client.timeout = timeout if timeout_value is _UNSET else timeout_value
         return client
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        # Each request opens and closes its own connection, so there's nothing to close.
+        return None
 
     @property
     def names(self) -> list[str]:
@@ -169,6 +188,8 @@ class Client:
         winnow_temperature: float | None = None,
     ) -> Decision:
         self._need_address()
+        if not questions:
+            raise ValueError("decide() needs at least one question in questions={...}.")
         body = {
             "model": model,
             "state": state,

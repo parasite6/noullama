@@ -61,14 +61,14 @@ print(decision.nl_time)      # 0.025  (seconds the whole decision took)
 
 There are three types. Every question needs `instructions`, which can't be empty. Descriptions are optional: use `None` for no description. An empty one like `technical=""` is an error, so a forgotten description doesn't slip through.
 
-**`Choice`: pick one option.** Each option is a name, plus an optional description that helps the model understand it. You get back the name.
+**`Choice`: pick one option.** Each option is a name, plus an optional description that helps the model understand it. It needs at least two options. You get back the name.
 
 ```python
 Choice(instructions="Which team?", billing="Charges and refunds", technical="App errors")
 Choice(instructions="Which team?", billing=None, technical=None)   # no descriptions
 ```
 
-**`Score`: pick a level on a scale.** List the levels lowest first, 2 to 10 of them. You get back the level's number, counting from 0.
+**`Score`: pick a level on a scale.** List the levels lowest first, 2 to 10 of them, each with its own text (or `None`). You get back the level's number, counting from 0.
 
 ```python
 Score(instructions="How urgent?", levels=["Can wait", "This week", "Today", "Immediately"])
@@ -151,6 +151,11 @@ nl = Client()
 for email in inbox:
     decision = nl.decide(model="d1-2B-Q8_0", state=email, questions=questions)
 ```
+
+`with Client() as nl:` works too. There's nothing to close, because each call opens and closes its own connection.
+
+- **Timeout:** each call waits up to 120 seconds for an answer, the same as Noullama waits for a model. Raise it for slow work such as large images: `Client(timeout=600)`.
+- **Address check:** an address must start with `http://` or `https://`. Anything else fails at once, when you make the client.
 
 ## Several Noullama apps
 
